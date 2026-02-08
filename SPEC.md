@@ -166,6 +166,31 @@ The site ID is NOT embedded in the HLC. It travels alongside it in every operati
 - On receiving remote HLC: `wallMs = max(local_hlc.wallMs, remote_hlc.wallMs, Date.now())`. Counter = if all three wallMs are equal, `max(local_counter, remote_counter) + 1`, else if two tied at max, winner's `counter + 1`, else 0.
 - Reject if `wallMs` drifts more than 60 seconds ahead of `Date.now()`. This bounds clock skew.
 
+### 5.1 Invariants Required For LWW Safety
+
+LWW merge is deterministic by `(hlc, site)` ordering. To preserve convergence, we rely on these invariants:
+
+- `siteId` is globally unique and persisted for the lifetime of the replica.
+- Local HLC state is persisted durably and reused after restart.
+- Each local write gets a fresh HLC from `clock.now()` (no manual reuse).
+- For a given operation identity `(table, key, col, site, hlc)`, payload is immutable.
+
+If these hold, equal `(hlc, site)` means "same logical write event", so merge order does not matter. If they do not hold, left-bias on equal `(hlc, site)` can make merges order-dependent.
+
+Common ways this invariant can fail in practice:
+
+- Site ID collision (cloned disk image, copied config, or manual override).
+- Restart after losing persisted clock state (counter/last wall clock rollback).
+- Restoring old VM/container snapshot without clock-state fencing.
+- Corrupt import/replay that injects two payloads with the same `(site, hlc)`.
+
+Engine-side enforcement to build:
+
+- Persist `siteId` and last emitted packed HLC atomically before acking writes.
+- On startup, load last emitted HLC and reject any new local write that is not strictly greater.
+- Add an ingest conflict check keyed by `(table, key, col, site, hlc)`: if payload hash differs, reject and surface corruption.
+- Add metrics/logging for invariant violations and quarantine offending deltas.
+
 ---
 
 ## 6. Binary Format: MessagePack Everywhere
@@ -317,6 +342,8 @@ Last-Writer-Wins. Stores a single value with an HLC timestamp and site ID.
 **State:** `{ hlc, site, value }`
 
 **Merge:** Compare HLC. Higher HLC wins. If HLCs are equal, higher site ID (lexicographic) wins.
+
+Important invariant: if both HLC and site are equal, the write identity is the same and the payload must also be equal. If a different payload appears for the same `(site, hlc)` identity, that is data corruption and must be rejected by validation logic.
 
 **Op payload (`val` field in EncodedOp):** The new value directly. The HLC and site come from the op's own `hlc` and `site` fields.
 

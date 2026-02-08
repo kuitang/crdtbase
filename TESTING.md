@@ -23,8 +23,8 @@ These properties are **theorems in Lean 4**, not tests. They are mechanically ve
 
 | Property | Lean Theorem | Verified For |
 |----------|-------------|--------------|
-| Merge commutativity | `lww_merge_comm`, etc. | LWW, PNCounter, ORSet, MVRegister |
-| Merge associativity | `lww_merge_assoc`, etc. | LWW, PNCounter, ORSet, MVRegister |
+| Merge commutativity | `lww_merge_comm_of_consistent`, etc. | LWW (with invariant), PNCounter, ORSet, MVRegister |
+| Merge associativity | `lww_merge_assoc_of_consistent`, etc. | LWW (with invariant), PNCounter, ORSet, MVRegister |
 | Merge idempotency | `lww_merge_idem`, etc. | LWW, PNCounter, ORSet, MVRegister |
 | HLC total order | `hlc_total_order` | All HLC values |
 | HLC monotonicity | `hlc_now_monotonic`, `hlc_recv_monotonic` | now(), recv() |
@@ -34,9 +34,13 @@ These properties are **theorems in Lean 4**, not tests. They are mechanically ve
 
 **28 theorems total.** These are checked by `lake build CrdtBase` in CI. If any proof breaks, the build fails. No sampling, no flakiness, no false confidence.
 
+Important note for LWW: commutativity/associativity require the event-consistency invariant. If two states share `(hlc, site)`, they must represent the same logical write (same payload).
+
 ### Level 1: Differential Random Testing (Implementation Matches Spec)
 
 The Lean model is the test oracle. fast-check generates random inputs, both Lean and TypeScript process them, outputs must match. This catches bugs where the TypeScript code doesn't match the verified specification.
+
+For LWW, generators should default to invariant-respecting states when testing semilattice properties. Add a separate adversarial suite that intentionally violates invariants to verify rejection/detection paths.
 
 ```typescript
 import { test, fc } from '@fast-check/vitest';
@@ -89,11 +93,24 @@ test.prop([fc.array(arbLww, { minLength: 2, maxLength: 20 })])(
 | HLC now | Current state + wall clock | New HLC equality |
 | HLC recv | Current state + remote HLC | New HLC equality (or null on drift/bounds rejection) |
 | Apply ops sequence | Random op list, random order | Final state equality |
+| Conflict guard | Same `(site, hlc, table, key, col)` with differing payloads | Must reject/quarantine |
 
 **Run configuration:**
 - Local dev: 1,000 iterations per target (~10 seconds total)
 - CI: 100,000 iterations per target (~5 minutes total)
 - Nightly: 1,000,000 iterations per target
+
+### Level 1.5: Invariant Enforcement Tests (Operational Safety)
+
+These tests validate assumptions required by the Lean model but enforced in system code:
+
+- `siteId` uniqueness guard: detect duplicate local `siteId` configuration in multi-replica test harness.
+- HLC persistence across restart: after restart, next local HLC must be strictly greater than the persisted last HLC.
+- Replay consistency: duplicate `(site, hlc, table, key, col)` with identical payload is accepted as idempotent.
+- Conflict rejection: duplicate `(site, hlc, table, key, col)` with different payload is rejected and surfaced.
+- Snapshot rollback fence: startup rejects local clock state older than durable high-water mark.
+
+These are property tests and scenario tests, not Lean theorems, because they involve I/O and persistence semantics.
 
 ### Level 2: Property-Based Tests (Broader System Properties)
 

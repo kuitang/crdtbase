@@ -44,7 +44,16 @@ export class LeanDrtClient {
     return new Promise((resolve, reject) => {
       this.pending.push({
         resolve: (line) => {
-          resolve(JSON.parse(line) as T);
+          try {
+            const parsed = JSON.parse(line) as T & { error?: string };
+            if (typeof parsed.error === 'string') {
+              reject(new Error(parsed.error));
+              return;
+            }
+            resolve(parsed);
+          } catch (error) {
+            reject(error instanceof Error ? error : new Error(String(error)));
+          }
         },
         reject,
       });

@@ -44,27 +44,36 @@ def fromLww (l : LwwRegister Json) : LwwJson :=
 
 def handleLine (line : String) : Except String String := do
   let json ← Json.parse line
-  let cmd ← fromJson? LwwMergeCmd json
+  let cmd : LwwMergeCmd ← fromJson? json
   if cmd.type != "lww_merge" then
     throw s!"unsupported command: {cmd.type}"
   let a ← toLww cmd.a
   let b ← toLww cmd.b
+  if Hlc.compareWithSite (a.hlc, a.site) (b.hlc, b.site) = .eq && a.val != b.val then
+    throw "conflicting LWW event identity: same (hlc, site) with different payloads"
   let result := LwwRegister.merge a b
   let out : LwwMergeResult := { result := fromLww result }
-  pure (Json.toString (toJson out))
+  pure ((toJson out).compress)
+
+def emitLine (line : String) : IO Unit := do
+  let stdout ← IO.getStdout
+  stdout.putStr line
+  stdout.putStr "\n"
+  stdout.flush
 
 partial def loop (stdin : IO.FS.Stream) : IO Unit := do
-  if (← stdin.isEof) then
+  let line ← stdin.getLine
+  if line.isEmpty then
     pure ()
   else
-    let line ← stdin.getLine
-    let trimmed := line.trim
+    let trimmed := line.trimAscii
     if trimmed.isEmpty then
       loop stdin
     else
-      match handleLine trimmed with
-      | Except.ok out => IO.println out
-      | Except.error err => throw <| IO.userError err
+      match handleLine trimmed.copy with
+      | Except.ok out => emitLine out
+      | Except.error err =>
+          emitLine <| (Json.mkObj [("error", toJson err)]).compress
       loop stdin
 
 def main : IO Unit := do

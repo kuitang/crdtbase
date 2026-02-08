@@ -31,3 +31,34 @@ export function compareWithSite(a: Hlc, aSite: string, b: Hlc, bSite: string): n
   if (aSite === bSite) return 0;
   return aSite > bSite ? 1 : -1;
 }
+
+export function assertHlcStrictlyIncreases(previous: Hlc | null, candidate: Hlc): void {
+  if (previous !== null && compareHlc(candidate, previous) <= 0) {
+    throw new Error('HLC monotonicity violation: candidate timestamp is not strictly greater');
+  }
+}
+
+export class PersistedHlcFence {
+  private highWater: Hlc | null;
+
+  constructor(initial: Hlc | null = null) {
+    this.highWater = initial;
+  }
+
+  loadPersisted(highWater: Hlc | null): void {
+    this.highWater = highWater;
+  }
+
+  assertNext(candidate: Hlc): void {
+    assertHlcStrictlyIncreases(this.highWater, candidate);
+  }
+
+  commit(candidate: Hlc): void {
+    this.assertNext(candidate);
+    this.highWater = candidate;
+  }
+
+  snapshot(): Hlc | null {
+    return this.highWater;
+  }
+}

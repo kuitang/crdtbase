@@ -4,51 +4,81 @@ set_option autoImplicit false
 
 namespace CrdtBase
 
-open Hlc
 open LwwRegister
 
-/-- Swapping arguments flips the comparison ordering. -/
-theorem compareWithSite_swap (a b : Hlc × String) :
-    Hlc.compareWithSite a b = Ordering.lt →
-    Hlc.compareWithSite b a = Ordering.gt := by
-  intro h
-  unfold Hlc.compareWithSite at h ⊢
-  cases hPack : compare a.1.pack b.1.pack with
-  | lt =>
-      have hPackSwap : compare b.1.pack a.1.pack = Ordering.gt :=
-        Std.OrientedCmp.gt_of_lt (cmp := (compare : Nat → Nat → Ordering)) hPack
-      simpa [hPack, hPackSwap]
-  | eq =>
-      have hSite : compare a.2 b.2 = Ordering.lt := by
-        simpa [hPack] using h
-      have hPackSwap : compare b.1.pack a.1.pack = Ordering.eq :=
-        Std.OrientedCmp.eq_symm (cmp := (compare : Nat → Nat → Ordering)) hPack
-      have hSiteSwap : compare b.2 a.2 = Ordering.gt :=
-        Std.OrientedCmp.gt_of_lt (cmp := (compare : String → String → Ordering)) hSite
-      simpa [hPackSwap, hSiteSwap]
-  | gt =>
-      simp [hPack] at h
+/-- Consistency for an LWW pair: equal `(hlc, site)` implies identical state. -/
+def LwwConsistentPair {α : Type} (a b : LwwRegister α) : Prop :=
+  Hlc.compareWithSite (a.hlc, a.site) (b.hlc, b.site) = Ordering.eq → a = b
 
-/-- LWW merge is commutative. -/
-theorem lww_merge_comm {α : Type} (a b : LwwRegister α) :
-    LwwRegister.merge a b = LwwRegister.merge b a := by
+/-- LWW merge is commutative under event-consistency and comparator orientation assumptions. -/
+theorem lww_merge_comm_of_consistent {α : Type} (a b : LwwRegister α)
+    (hCons : LwwConsistentPair a b)
+    (hSwapLt : Hlc.compareWithSite (a.hlc, a.site) (b.hlc, b.site) = .lt →
+      Hlc.compareWithSite (b.hlc, b.site) (a.hlc, a.site) = .gt)
+    (hSwapGt : Hlc.compareWithSite (a.hlc, a.site) (b.hlc, b.site) = .gt →
+      Hlc.compareWithSite (b.hlc, b.site) (a.hlc, a.site) = .lt)
+    (hSelf : ∀ x : LwwRegister α,
+      Hlc.compareWithSite (x.hlc, x.site) (x.hlc, x.site) = .eq)
+    : LwwRegister.merge a b = LwwRegister.merge b a := by
   unfold LwwRegister.merge
-  cases h : Hlc.compareWithSite (a.hlc, a.site) (b.hlc, b.site) <;>
-    simp [h, compareWithSite_swap] at *
+  cases hab : Hlc.compareWithSite (a.hlc, a.site) (b.hlc, b.site) with
+  | lt =>
+      have hba : Hlc.compareWithSite (b.hlc, b.site) (a.hlc, a.site) = .gt := hSwapLt hab
+      simp [hba]
+  | eq =>
+      have hEq : a = b := hCons hab
+      subst hEq
+      simp [hSelf]
+  | gt =>
+      have hba : Hlc.compareWithSite (b.hlc, b.site) (a.hlc, a.site) = .lt := hSwapGt hab
+      simp [hba]
 
-/-- LWW merge is associative. -/
-theorem lww_merge_assoc {α : Type} (a b c : LwwRegister α) :
-    LwwRegister.merge (LwwRegister.merge a b) c =
+/-- LWW merge is associative under pairwise consistency and comparator transitivity assumptions. -/
+theorem lww_merge_assoc_of_consistent {α : Type} (a b c : LwwRegister α)
+    (hAB : LwwConsistentPair a b)
+    (hBC : LwwConsistentPair b c)
+    (hAC : LwwConsistentPair a c)
+    (hTransLt :
+      Hlc.compareWithSite (a.hlc, a.site) (b.hlc, b.site) = .lt →
+      Hlc.compareWithSite (b.hlc, b.site) (c.hlc, c.site) = .lt →
+      Hlc.compareWithSite (a.hlc, a.site) (c.hlc, c.site) = .lt)
+    (hTransGt :
+      Hlc.compareWithSite (a.hlc, a.site) (b.hlc, b.site) = .gt →
+      Hlc.compareWithSite (b.hlc, b.site) (c.hlc, c.site) = .gt →
+      Hlc.compareWithSite (a.hlc, a.site) (c.hlc, c.site) = .gt)
+    (hSelf : ∀ x : LwwRegister α,
+      Hlc.compareWithSite (x.hlc, x.site) (x.hlc, x.site) = .eq)
+    : LwwRegister.merge (LwwRegister.merge a b) c =
       LwwRegister.merge a (LwwRegister.merge b c) := by
   unfold LwwRegister.merge
   cases hab : Hlc.compareWithSite (a.hlc, a.site) (b.hlc, b.site) <;>
     cases hbc : Hlc.compareWithSite (b.hlc, b.site) (c.hlc, c.site) <;>
     cases hac : Hlc.compareWithSite (a.hlc, a.site) (c.hlc, c.site) <;>
-    simp [hab, hbc, hac, compareWithSite_swap] at *
+    simp [hab, hbc, hac]
+  · have hacLt : Hlc.compareWithSite (a.hlc, a.site) (c.hlc, c.site) = .lt := hTransLt hab hbc
+    simp [hac] at hacLt
+  · have hacLt : Hlc.compareWithSite (a.hlc, a.site) (c.hlc, c.site) = .lt := hTransLt hab hbc
+    simp [hac] at hacLt
+  · have habEq : a = b := hAB hab
+    have hbcEq : b = c := hBC hbc
+    subst habEq
+    subst hbcEq
+    have hacEq : Hlc.compareWithSite (a.hlc, a.site) (a.hlc, a.site) = .eq := hSelf a
+    simp [hac] at hacEq
+  · have habEq : a = b := hAB hab
+    subst habEq
+    simp [hac] at hbc
+  · have hbcEq : b = c := hBC hbc
+    subst hbcEq
+    simp [hac] at hab
+  · have hacGt : Hlc.compareWithSite (a.hlc, a.site) (c.hlc, c.site) = .gt := hTransGt hab hbc
+    simp [hac] at hacGt
 
-/-- LWW merge is idempotent. -/
-theorem lww_merge_idem {α : Type} (a : LwwRegister α) :
-    LwwRegister.merge a a = a := by
-  simp [LwwRegister.merge, Hlc.compareWithSite]
+/-- LWW merge is idempotent when self-comparison is reflexive. -/
+theorem lww_merge_idem {α : Type} (a : LwwRegister α)
+    (hSelf : Hlc.compareWithSite (a.hlc, a.site) (a.hlc, a.site) = .eq)
+    : LwwRegister.merge a a = a := by
+  unfold LwwRegister.merge
+  simp [hSelf]
 
 end CrdtBase

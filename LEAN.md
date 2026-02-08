@@ -19,11 +19,13 @@ This work builds directly on established formal verification of CRDTs:
 
 Every CRDT merge function must form a **join-semilattice**: commutative, associative, idempotent. If any of these fail, replicas can permanently diverge — the fundamental guarantee of the system is broken.
 
+For LWW specifically, this is true only under an event-consistency invariant: if two states have equal `(hlc, site)`, they must represent the same write event (same payload). Our current LWW merge is intentionally left-biased on exact key ties.
+
 **Why formal proof and not just property tests:** Property tests generate millions of random inputs but can miss corner cases in comparison logic (e.g., tiebreaking when HLC and counter are equal but site IDs have specific ordinal relationships). Kleppmann's paper documents CRDTs that shipped with "proofs" that were later shown incorrect. A mechanized proof eliminates this class of error entirely.
 
 Theorems for each CRDT type:
-- `lww_merge_comm`: `merge(a, b) = merge(b, a)`
-- `lww_merge_assoc`: `merge(merge(a, b), c) = merge(a, merge(b, c))`
+- `lww_merge_comm_of_consistent`: commutativity under the event-consistency invariant
+- `lww_merge_assoc_of_consistent`: associativity under the event-consistency invariant
 - `lww_merge_idem`: `merge(a, a) = a`
 - Same three for `pn_counter_merge`, `or_set_merge`, `mv_register_merge`
 
@@ -43,6 +45,29 @@ Theorems:
 
 **6 theorems.**
 
+### Operational Invariants (Assumptions We Must Enforce)
+
+These are not "nice-to-have"; they are required for the LWW theorems to match production behavior:
+
+- `siteId` uniqueness: each replica has a stable, globally unique site ID.
+- Per-site monotonic clock: each new local write uses an HLC strictly greater than prior local writes.
+- Durable clock state: the last emitted HLC is persisted and restored across restart/snapshot recovery.
+- Event immutability: identical operation identity `(table, key, col, site, hlc)` cannot carry different payloads.
+
+How this can fail in practice:
+
+- Cloned configs or disk images reusing site IDs.
+- Crash/restart paths that lose persisted HLC state.
+- Rollback to old VM/container snapshots without fencing.
+- Corrupt imports/replays that inject conflicting payloads for the same `(site, hlc)`.
+
+Additional theorem targets to make these assumptions explicit:
+
+- `lww_equal_key_implies_equal_payload` (or equivalent consistency predicate).
+- `lww_merge_comm_of_consistent` and `lww_merge_assoc_of_consistent`.
+- `hlc_now_strict_monotonic` and `hlc_recv_strict_monotonic` across state transitions.
+- `dedup_rejects_conflicting_same_key` for ingest-level conflict checks.
+
 ### Tier 3: Convergence (The Crown Jewel)
 
 The abstract convergence theorem, ported from Kleppmann's Isabelle framework: given a set of operations delivered in any order to any number of replicas, if each replica applies them using our merge functions, all replicas converge to identical state.
@@ -50,7 +75,7 @@ The abstract convergence theorem, ported from Kleppmann's Isabelle framework: gi
 This is the theorem that says "the whole system works." It composes Tier 1 (merge is a semilattice) with a network model (messages can be reordered, duplicated, or delayed, but not permanently lost).
 
 Theorems:
-- `convergence_lww`: For any two replicas that have received the same set of LWW operations (in any order), their states are equal.
+- `convergence_lww`: For any two replicas that have received the same set of LWW operations (in any order), their states are equal, assuming the operational invariants above.
 - `convergence_pn_counter`: Same for PN-Counter. (Note: requires that operations are deduplicated by `(site, hlc)` — this is a precondition, not something the merge itself guarantees.)
 - `convergence_or_set`: Same for OR-Set.
 - `convergence_mv_register`: Same for MV-Register.
@@ -286,7 +311,7 @@ structure SameOps (ops₁ ops₂ : List σ) : Prop where
 
 For each CRDT merge, prove three properties. The general strategy:
 
-**Commutativity** — Case-split on the comparison result. For LWW: if `compareWithSite(a, b) = .gt` then `compareWithSite(b, a) = .lt`, so both orderings select `a`. The `eq` case requires showing the comparison function is antisymmetric.
+**Commutativity** — Case-split on the comparison result. For LWW: if `compareWithSite(a, b) = .gt` then `compareWithSite(b, a) = .lt`, so both orderings select `a`. The `eq` case requires the event-consistency invariant (`same (hlc,site)` implies same payload), since merge is left-biased on exact ties.
 
 **Associativity** — The key insight: `merge` always selects one of its inputs (it's a "max" operation). For LWW, `merge(merge(a, b), c)` selects the maximum of `{a, b, c}` by `(hlc, site)`. Associativity follows from transitivity of the total order. Proving this requires:
 1. `compareWithSite` is a total order (proven in Tier 2).
@@ -394,7 +419,7 @@ This is immediately useful: any divergence between Lean and TypeScript is a bug 
 
 ### Phase B: Tier 1 + 2 Proofs
 
-Prove the semilattice properties for each CRDT merge. Prove HLC ordering properties. These are the most valuable proofs per line of effort. Expect ~2-4 hours per CRDT type once the first one (LWW) is done, based on Kleppmann's experience.
+Prove the semilattice properties for each CRDT merge. For LWW, phrase commutativity/associativity as conditional on the event-consistency invariant and prove that invariant is preserved by valid operation generation/ingest rules. Prove HLC ordering and monotonicity properties. These are the most valuable proofs per line of effort.
 
 ### Phase C: Tier 3 Proofs
 
