@@ -7,7 +7,7 @@
     "test": "vitest run",
     "test:all": "npm run lean:build && vitest run",
     "test:watch": "vitest",
-    "lean:build": "cd lean && lake build && lake build CrdtBaseDRT"
+    "lean:build": "cd lean && lake build CrdtBase.Crdt.Lww.Props CrdtBase.Crdt.PnCounter.Props CrdtBase.Crdt.OrSet.Props CrdtBase.Crdt.MvRegister.Props CrdtBaseDRT"
   },
   "devDependencies": {
     "@fast-check/vitest": "^0.1.4",

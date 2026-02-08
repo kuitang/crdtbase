@@ -4,6 +4,9 @@ import fc from 'fast-check';
 import { HLC_LIMITS, PersistedHlcFence, assertHlcStrictlyIncreases } from '../../src/core/hlc';
 import { mergeLww } from '../../src/core/crdt/lww';
 import { LwwConflictGuard } from '../../src/core/crdt/lwwConflictGuard';
+import { applyPnCounterDelta } from '../../src/core/crdt/pnCounter';
+import { mergeOrSet } from '../../src/core/crdt/orSet';
+import { mergeMvRegister } from '../../src/core/crdt/mvRegister';
 import { arbHlc, arbScalar, arbSiteId } from './arbitraries';
 
 describe('LWW invariant enforcement', () => {
@@ -76,4 +79,55 @@ describe('HLC monotonic fence', () => {
     expect(() => fence.commit(next)).toThrow(/monotonicity violation/);
     expect(() => fence.commit(initial)).toThrow(/monotonicity violation/);
   });
+});
+
+describe('PN-Counter invariant enforcement', () => {
+  test.prop([
+    arbSiteId(),
+    fc.oneof(
+      fc.integer({ min: -1_000_000, max: -1 }),
+      fc.constant(Number.NaN),
+      fc.constant(Number.POSITIVE_INFINITY),
+      fc.constant(Number.NEGATIVE_INFINITY),
+    ),
+  ])('counter delta rejects invalid amounts', (site, amount) => {
+    const initial = { inc: {}, dec: {} };
+    expect(() => applyPnCounterDelta(initial, site, 'inc', amount)).toThrow(
+      /finite non-negative/,
+    );
+  });
+});
+
+describe('OR-Set invariant enforcement', () => {
+  test.prop([arbHlc(), arbSiteId(), fc.tuple(arbScalar(), arbScalar())])(
+    'merge rejects conflicting payloads for same add-tag',
+    (hlc, site, [leftVal, rightVal]) => {
+      fc.pre(!Object.is(leftVal, rightVal));
+      const a = {
+        elements: [{ val: leftVal, tag: { addHlc: hlc, addSite: site } }],
+        tombstones: [],
+      };
+      const b = {
+        elements: [{ val: rightVal, tag: { addHlc: hlc, addSite: site } }],
+        tombstones: [],
+      };
+      expect(() => mergeOrSet(a, b)).toThrow(/conflicting OR-Set add tag identity/);
+    },
+  );
+});
+
+describe('MV-Register invariant enforcement', () => {
+  test.prop([arbHlc(), arbSiteId(), fc.tuple(arbScalar(), arbScalar())])(
+    'merge rejects conflicting payloads for same (hlc, site)',
+    (hlc, site, [leftVal, rightVal]) => {
+      fc.pre(!Object.is(leftVal, rightVal));
+      const a = {
+        values: [{ val: leftVal, hlc, site }],
+      };
+      const b = {
+        values: [{ val: rightVal, hlc, site }],
+      };
+      expect(() => mergeMvRegister(a, b)).toThrow(/conflicting MV-Register event identity/);
+    },
+  );
 });
