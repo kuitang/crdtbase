@@ -96,27 +96,32 @@ Implementations: `OpfsStorageAdapter` (browser), `FsStorageAdapter` (Node).
 
 ```typescript
 interface ReplicatedLog {
-  /** Append a batch of operations to this site's log. Returns the new position. */
+  /** Append a batch of operations to this site's log. Returns the new seq. */
   append(entry: LogEntry): Promise<LogPosition>;
 
-  /** Read all entries from a given site since a position. */
+  /** Read all entries from a given site since a seq. */
   readSince(siteId: string, since: LogPosition): Promise<LogEntry[]>;
 
   /** List all site IDs that have written to this log. */
   listSites(): Promise<string[]>;
 
-  /** Get the latest log position for a site. Returns 0n if no entries. */
+  /** Get the latest log seq for a site. Returns 0 if no entries. */
   getHead(siteId: string): Promise<LogPosition>;
 }
 
-type LogPosition = bigint;
+/** Per-site log sequence number (a.k.a. seq). */
+type LogPosition = number | string;
 
 interface LogEntry {
   siteId: string;
-  hlc: bigint;           // HLC timestamp (packed, see §5)
-  pos: LogPosition;      // assigned by the log
+  hlc: bigint;           // HLC timestamp (packed, see §5) — NOT the log position
+  seq: LogPosition;      // per-site sequence number assigned by the log
   ops: CrdtOp[];         // the operations in this batch
 }
+
+`LogPosition` is the per-site sequence number (`seq`). `append()` assigns the next `seq` for the site and returns it; callers persist that value to resume `readSince()` calls. Use a `number` while `seq <= 2^53`, otherwise encode the `seq` as a decimal string.
+
+The HLC is carried in each `LogEntry` for merge semantics and conflict resolution. It is not the log position and is never used for `readSince()` or bookmarks.
 ```
 
 Implementations: `MemoryReplicatedLog` (in-process), `HttpReplicatedLog` (client for memory-server), `TigrisReplicatedLog` (S3-based).
@@ -182,7 +187,7 @@ A delta file is a single MessagePack-encoded object:
 type DeltaFile = {
   v: 1;                       // format version
   site: string;               // site ID that produced this delta
-  seq: number;                // monotonic sequence number within this site
+  seq: number | string;       // per-site log position (number, or string if > 2^53)
   hlc_min: string;            // hex-encoded bigint, earliest HLC in this delta
   hlc_max: string;            // hex-encoded bigint, latest HLC in this delta
   ops: EncodedOp[];           // array of operations
@@ -201,9 +206,11 @@ type EncodedOp = {
 
 HLCs are hex strings (e.g., `"0x18e4a2b3c0010003"`) rather than raw bigints because MessagePack's integer type is 64-bit signed, which can't represent the full HLC range without ambiguity across languages. Hex strings are unambiguous, human-readable in dumps, and trivially parsed with `BigInt(hexStr)`.
 
-File naming convention: `deltas/{siteId}_{seq:010}.delta.bin`
+`DeltaFile.seq` is the authoritative log position for replication; bookmarks and `readSince()` use this value (as a number or decimal string).
 
-Example: `deltas/a1b2c3d4_0000000001.delta.bin`
+File naming convention: `deltas/{siteId}/{seq:010}.delta.bin`
+
+Example: `deltas/a1b2c3d4/0000000001.delta.bin`
 
 ### 6.2 Segment File
 
@@ -321,7 +328,7 @@ Positive-Negative Counter. Two maps of `siteId → count`.
 
 **Op payload:** `{ d: "inc" | "dec", n: number }` — direction and amount. Applied by: `state[d][op.site] = (state[d][op.site] ?? 0) + n`.
 
-Note: ops are not idempotent for PN-Counters. The engine must deduplicate ops by `(site, hlc)` before applying. The ReplicatedLog guarantees this via positional ordering — an op at position N from site X is applied exactly once.
+Note: ops are not idempotent for PN-Counters. The engine must deduplicate ops by `(site, hlc)` before applying. The ReplicatedLog guarantees this via seq ordering — an op at seq N from site X is applied exactly once.
 
 ### 7.3 OR-Set (tag = 3)
 
@@ -508,29 +515,29 @@ sync_push():
 ```
 sync_pull():
   1. For each known remote site (from ReplicatedLog.listSites()):
-     a. Read local bookmark: "What LogPosition did I last sync from this site?"
-        (Stored in StorageAdapter at "sync/{siteId}.bookmark")
-     b. Call ReplicatedLog.readSince(siteId, bookmark)
+     a. Read local last seq: "What seq did I last sync from this site?"
+        (Stored in StorageAdapter at "sync/{siteId}.seq")
+     b. Call ReplicatedLog.readSince(siteId, lastSeq) and receive entries with `seq > lastSeq`
      c. For each LogEntry received:
         - Apply ops to local state (CRDT merge)
-        - Update bookmark
+        - Update last seq
   2. Also check for updated manifest from SnapshotStore (if using compaction):
      a. getManifest()
      b. If manifest.version > local version:
         - Download any new/changed segment files
         - Update local manifest cache
-        - Fast-forward bookmarks based on manifest.sites_compacted
+        - Fast-forward last seqs based on manifest.sites_compacted
 ```
 
 ### 10.3 Conflict Between Deltas and Segments
 
 A client may have both:
-- A locally-applied delta from site X at position 5
-- A segment that was compacted including site X up to position 7
+- A locally-applied delta from site X at seq 5
+- A segment that was compacted including site X up to seq 7
 
 This is fine. CRDT merge is idempotent for state-based types (LWW, OR-Set, MV-Register). For PN-Counter, the segment contains the compacted counter state (max per site), and applying the same increment op twice would be wrong. Therefore:
 
-**Rule:** When a new manifest is loaded, discard any locally-cached deltas from sites whose bookmark is ≤ `manifest.sites_compacted[siteId]`. The segment already includes those ops. Only apply deltas with positions strictly greater than the compacted position.
+**Rule:** When a new manifest is loaded, discard any locally-cached deltas from sites whose last seq is ≤ `manifest.sites_compacted[siteId]`. The segment already includes those ops. Only apply deltas with seqs strictly greater than the compacted seq.
 
 ---
 
@@ -544,7 +551,7 @@ compact():
   2. Read schema from SnapshotStore
   3. List all sites from ReplicatedLog
   4. For each site:
-     a. Read all entries since manifest.sites_compacted[site] (or 0n if first run)
+    a. Read all entries since manifest.sites_compacted[site] (or 0 if first run)
      b. Collect all ops
   5. For each table in schema:
      a. Group ops by partition key value
@@ -579,10 +586,10 @@ An HTTP server holding all state in memory (or backed by a single JSON file for 
 
 ```
 Routes:
-  POST   /logs/:siteId              → append entry, returns { pos }
-  GET    /logs/:siteId?since=N      → returns entries since position N
+  POST   /logs/:siteId              → append entry, returns { seq }
+  GET    /logs/:siteId?since=N      → returns entries since seq N
   GET    /logs                      → returns list of site IDs
-  GET    /logs/:siteId/head         → returns latest position
+  GET    /logs/:siteId/head         → returns latest seq
 
   GET    /manifest                  → returns manifest bytes (or 404)
   PUT    /manifest?expect_version=N → CAS manifest (412 Precondition Failed if version mismatch)
@@ -604,10 +611,10 @@ Maps the ReplicatedLog and SnapshotStore interfaces onto S3 operations:
 
 ```
 ReplicatedLog:
-  append(entry)             → PUT deltas/{siteId}_{seq:010}.delta.bin
-  readSince(siteId, since)  → LIST deltas/{siteId}_* → filter by seq > since → GET each
-  listSites()               → LIST deltas/ with delimiter "/" → extract site prefixes
-  getHead(siteId)           → LIST deltas/{siteId}_* → parse max seq from filenames
+  append(entry)             → PUT deltas/{siteId}/{seq:010}.delta.bin
+  readSince(siteId, since)  → LIST deltas/{siteId}/ → filter by seq > since → GET each
+  listSites()               → LIST deltas/ with delimiter "/" → extract siteId prefixes
+  getHead(siteId)           → LIST deltas/{siteId}/ → parse max seq from filenames
 
 SnapshotStore:
   getManifest()             → GET manifest.bin (with X-Tigris-Consistent:true)
