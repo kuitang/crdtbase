@@ -29,6 +29,12 @@ def pack (h : Hlc) : Nat :=
 instance : Ord Hlc where
   compare a b := compare a.pack b.pack
 
+/-- Extended comparison including site ID for tiebreaking. -/
+def compareWithSite (a b : Hlc × String) : Ordering :=
+  match compare a.1 b.1 with
+  | .eq => compare a.2 b.2
+  | ord => ord
+
 /-- Construct an HLC only if both fields are within bounds. -/
 def mk? (wallMs counter : Nat) : Option Hlc :=
   if hWall : wallMs < wallMsMax then
