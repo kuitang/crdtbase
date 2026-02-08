@@ -13,6 +13,47 @@ No traditional unit tests. Every test in this project is either a **property-bas
 npm install -D vitest @fast-check/vitest fast-check
 ```
 
+## Isolated Checks (Recommended During Concurrent Lean Work)
+
+When multiple agents are editing Lean files, prefer module-level builds and test-file runs over full builds:
+
+```bash
+# Build only specific Lean modules (proof files + oracle entrypoint)
+cd lean
+lake build \
+  CrdtBase.Crdt.Lww.Props \
+  CrdtBase.Crdt.PnCounter.Props \
+  CrdtBase.Crdt.OrSet.Props \
+  CrdtBase.Crdt.MvRegister.Props \
+  CrdtBase.DiffTest.Main \
+  CrdtBaseDRT
+```
+
+```bash
+# Run only CRDT property tests
+npx vitest run \
+  test/properties/lww.prop.test.ts \
+  test/properties/pnCounter.prop.test.ts \
+  test/properties/orSet.prop.test.ts \
+  test/properties/mvRegister.prop.test.ts \
+  test/properties/invariants.prop.test.ts
+```
+
+```bash
+# Run only differential oracle tests
+npx vitest run \
+  test/drt/lww.drt.test.ts \
+  test/drt/pnCounter.drt.test.ts \
+  test/drt/orSet.drt.test.ts \
+  test/drt/mvRegister.drt.test.ts
+```
+
+For higher confidence without broad coupling, increase DRT runs:
+
+```bash
+DRT_NUM_RUNS=1000 DRT_TIMEOUT_MS=120000 npx vitest run test/drt/*.drt.test.ts
+```
+
 ---
 
 ## Testing Levels
@@ -41,6 +82,8 @@ Important note for LWW: commutativity/associativity require the event-consistenc
 The Lean model is the test oracle. fast-check generates random inputs, both Lean and TypeScript process them, outputs must match. This catches bugs where the TypeScript code doesn't match the verified specification.
 
 For LWW, generators should default to invariant-respecting states when testing semilattice properties. Add a separate adversarial suite that intentionally violates invariants to verify rejection/detection paths.
+
+For SQL, differential tests use **AST + context** as the oracle input (not raw SQL text). The parser stays tested at Level 2 (`parse/print/parse` properties), while Lean verifies semantic translation/planning.
 
 ```typescript
 import { test, fc } from '@fast-check/vitest';
@@ -94,6 +137,8 @@ test.prop([fc.array(arbLww, { minLength: 2, maxLength: 20 })])(
 | HLC recv | Current state + remote HLC | New HLC equality (or null on drift/bounds rejection) |
 | Apply ops sequence | Random op list, random order | Final state equality |
 | Conflict guard | Same `(site, hlc, table, key, col)` with differing payloads | Must reject/quarantine |
+| SQL write op generation | Random write SQL AST + schema/site/HLC context | Lean `sql_generate_ops` equals TS `generateCrdtOps` |
+| SQL SELECT planner | Random SELECT AST + planner schema | Lean `sql_build_select_plan` equals TS `buildSelectPlan` |
 
 **Run configuration:**
 - Local dev: 1,000 iterations per target (~10 seconds total)
@@ -395,7 +440,9 @@ test/
 │   ├── or-set.drt.test.ts
 │   ├── mv-register.drt.test.ts
 │   ├── hlc.drt.test.ts       # DRT: HLC operations
-│   └── apply-ops.drt.test.ts # DRT: full operation sequences
+│   ├── apply-ops.drt.test.ts # DRT: full operation sequences
+│   ├── sql-generate-ops.drt.test.ts  # DRT: SQL write AST -> CRDT ops
+│   └── sql-planner.drt.test.ts       # DRT: SQL SELECT planner output
 │
 ├── properties/
 │   ├── arbitraries.ts        # All custom fast-check generators

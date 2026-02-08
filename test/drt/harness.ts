@@ -61,6 +61,30 @@ export class LeanDrtClient {
     });
   }
 
+  async lwwMerge<T>(a: unknown, b: unknown): Promise<T> {
+    return this.send<T>({
+      type: 'lww_merge',
+      a,
+      b,
+    });
+  }
+
+  async sqlGenerateOps<T>(statement: unknown, context: unknown): Promise<T> {
+    return this.send<T>({
+      type: 'sql_generate_ops',
+      statement,
+      context,
+    });
+  }
+
+  async sqlBuildSelectPlan<T>(statement: unknown, schema: unknown): Promise<T> {
+    return this.send<T>({
+      type: 'sql_build_select_plan',
+      statement,
+      schema,
+    });
+  }
+
   close(): void {
     this.proc.kill();
   }

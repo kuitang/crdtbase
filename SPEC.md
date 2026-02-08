@@ -473,6 +473,38 @@ DELETE FROM tasks WHERE id = 't1';
 
 Implemented as a tombstone: a special LWW register on a hidden `_deleted` column set to `true`. Reads filter out tombstoned rows. Compaction retains tombstones until a configurable TTL (default: 7 days), after which they are dropped.
 
+### 8.3 Verified SQL Compilation Contract
+
+Formal verification focuses on SQL semantics (not text parsing). The contract is checked two ways:
+
+1. Lean proofs over the SQL model (`lean/CrdtBase/Sql/*`).
+2. Differential random testing: Lean oracle vs TypeScript implementation.
+
+The write-path guarantees:
+- For valid CRDT write statements (`INSERT`, `UPDATE`, `INC/DEC`, `ADD/REMOVE`, `DELETE`), generated ops are schema-correct and syncable (`tbl`, `key`, `col`, `typ`, `hlc`, `site`, `val` all present).
+- Compilation never "accidentally compiles to non-sync" for a valid CRDT mutation.
+- `REMOVE` with zero observed add-tags is an explicit no-op (returns zero CRDT ops), not an error.
+
+The planner guarantees:
+- With `PARTITION BY p`, if `WHERE` contains `p = value`, route to exactly one partition and drop exactly that routing predicate from residual filters.
+- Otherwise route to `all_partitions` and preserve all filters.
+
+SQL text parsing remains property-tested in TypeScript (`parse/print/parse`) and is out of Lean proof scope.
+
+### 8.4 Lean Oracle SQL Protocol (AST + Context)
+
+The Lean DRT executable consumes JSON Lines commands:
+
+```json
+{"type":"sql_generate_ops","statement":<write-ast>,"context":<sql-context>}
+{"type":"sql_build_select_plan","statement":<select-ast>,"schema":<planner-schema>}
+```
+
+Design notes:
+- Oracle input is AST+context (not raw SQL text) to avoid duplicating parser logic in Lean.
+- Responses are either `{"result": ...}` or `{"error":"..."}`.
+- Existing `{"type":"lww_merge", ...}` remains backward compatible.
+
 ---
 
 ## 9. Query Execution

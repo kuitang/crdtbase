@@ -2,5 +2,11 @@ import CrdtBase.Hlc.Defs
 import CrdtBase.Hlc.Props
 import CrdtBase.Crdt.Lww.Defs
 import CrdtBase.Crdt.Lww.Props
+import CrdtBase.Crdt.PnCounter.Defs
+import CrdtBase.Crdt.PnCounter.Props
 import CrdtBase.Crdt.OrSet.Defs
 import CrdtBase.Crdt.OrSet.Props
+import CrdtBase.Crdt.MvRegister.Defs
+import CrdtBase.Crdt.MvRegister.Props
+import CrdtBase.Sql.Defs
+import CrdtBase.Sql.Props

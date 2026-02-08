@@ -104,6 +104,29 @@ Theorems:
 
 **3 theorems.**
 
+### Tier 6: SQL Translation + Planner Soundness (Important)
+
+The SQL frontend is split into parser and semantics:
+
+- **Parser:** handled in TypeScript property tests (`parse/print/parse` stability).
+- **Semantics:** modeled in Lean as AST-to-CRDT-op translation and SELECT planning.
+
+The core guarantee for writes is that valid SQL write statements compile only to
+syncable CRDT operations with schema-correct CRDT tags. This is the
+"no accidental non-sync compilation" property.
+
+The core guarantee for reads is that planner routing is deterministic:
+- if `WHERE` contains `partition_by = value`, route to that single partition and
+  remove exactly that routing predicate from residual filters;
+- otherwise route to `all_partitions` and preserve all filters.
+
+Initial theorem targets:
+- `write_ops_type_sound`
+- `write_ops_syncable`
+- `no_nonsync_for_valid_crdt_writes`
+- `planner_partition_sound`
+- `planner_filter_preservation`
+
 ### What We Do NOT Verify
 
 - **SQL parsing**: Syntax processing, not semantic correctness. Property tests are sufficient (round-trip: `parse(print(ast)) = ast`).
@@ -111,7 +134,7 @@ Theorems:
 - **Storage adapters**: I/O code (OPFS, filesystem, S3). Untestable in Lean.
 - **Network/sync protocol**: The sync protocol's correctness reduces to "deliver all operations eventually" + CRDT convergence. The former is an operational concern, the latter is Tier 3.
 - **Bloom filter**: False-negative-freedom is a well-known property of the algorithm. Property test is sufficient.
-- **Query planner/router**: Partition selection logic. Simple enough for property tests.
+- **Cross-table SQL optimization**: Join reordering, predicate pushdown, and cost-based optimization are out of scope for this SQL subset.
 
 ---
 
@@ -157,6 +180,10 @@ lean/
 │   ├── Tombstone/
 │   │   ├── Defs.lean              # delete model
 │   │   └── Props.lean             # tombstone theorems (Tier 5)
+│   │
+│   ├── Sql/
+│   │   ├── Defs.lean              # SQL AST subset + translation/planner model
+│   │   └── Props.lean             # SQL soundness proofs (Tier 6)
 │   │
 │   └── DiffTest/
 │       └── Main.lean              # executable entry point for DRT
@@ -380,20 +407,26 @@ The Lean model is compiled to an executable (`CrdtBaseDRT`) that reads JSON test
 
 ```json
 // Input (one per line)
-{"type": "lww_merge", "a": {"val": "x", "hlc": 1000, "counter": 0, "site": "aaa"}, "b": {"val": "y", "hlc": 999, "counter": 5, "site": "bbb"}}
+{"type":"lww_merge","a":{"val":"x","hlc":{"wallMs":1000,"counter":0},"site":"aaa"},"b":{"val":"y","hlc":{"wallMs":999,"counter":5},"site":"bbb"}}
 
 // Output (one per line)
-{"result": {"val": "x", "hlc": 1000, "counter": 0, "site": "aaa"}}
+{"result":{"val":"x","hlc":{"wallMs":1000,"counter":0},"site":"aaa"}}
 ```
 
-The Lean executable processes commands:
-- `lww_merge`, `pn_merge`, `or_set_merge`, `mv_merge`: merge two states, return result.
-- `hlc_compare`: compare two HLCs, return ordering.
-- `hlc_now`: given current state and wall clock, return new HLC (or null if bounds overflow).
-- `hlc_recv`: given current state and remote HLC, return new HLC, or null if rejected for drift/bounds.
-- `apply_ops`: given an initial state and a list of operations, return final state.
+The Lean executable processes JSONL commands with shape:
+- `{"type":"lww_merge", ... }`
+- `{"type":"sql_generate_ops", "statement": <write-ast>, "context": <sql-context>}`
+- `{"type":"sql_build_select_plan", "statement": <select-ast>, "schema": <planner-schema>}`
 
-For `or_set_merge`, inputs and outputs include both `elements` and `tombstones` so remove-tag handling is exercised in the Lean/TypeScript comparison.
+`sql_generate_ops` uses an AST+context envelope (not raw SQL text) to avoid parser duplication.
+
+`sql_build_select_plan` verifies the same planner routing/filter behavior used by TypeScript.
+
+All command failures are returned as:
+
+```json
+{"error":"<message>"}
+```
 
 ### Running DRT
 
