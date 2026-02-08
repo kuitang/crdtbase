@@ -182,11 +182,16 @@ The Lean model is intentionally simpler than the TypeScript implementation. It u
 structure Hlc where
   wallMs : Nat
   counter : Nat
+  wallMs_lt : wallMs < 2 ^ 48
+  counter_lt : counter < 2 ^ 16
   deriving Repr, DecidableEq
 
 /-- Pack an HLC into a single natural number for comparison. -/
 def Hlc.pack (h : Hlc) : Nat :=
   h.wallMs * 65536 + h.counter
+
+/-- Construct an HLC only if both fields are within bounds. -/
+def Hlc.mk? (wallMs counter : Nat) : Option Hlc := ...
 
 /-- Total order on HLCs: compare packed values. -/
 instance : Ord Hlc where
@@ -359,8 +364,8 @@ The Lean model is compiled to an executable (`CrdtBaseDRT`) that reads JSON test
 The Lean executable processes commands:
 - `lww_merge`, `pn_merge`, `or_set_merge`, `mv_merge`: merge two states, return result.
 - `hlc_compare`: compare two HLCs, return ordering.
-- `hlc_now`: given current state and wall clock, return new HLC.
-- `hlc_recv`: given current state and remote HLC, return new HLC.
+- `hlc_now`: given current state and wall clock, return new HLC (or null if bounds overflow).
+- `hlc_recv`: given current state and remote HLC, return new HLC, or null if rejected for drift/bounds.
 - `apply_ops`: given an initial state and a list of operations, return final state.
 
 For `or_set_merge`, inputs and outputs include both `elements` and `tombstones` so remove-tag handling is exercised in the Lean/TypeScript comparison.
