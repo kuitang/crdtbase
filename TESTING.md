@@ -48,6 +48,8 @@ const arbHlc = fc.record({
   counter: fc.nat({ max: 65535 }),
 });
 
+// Note: HLC inputs must always respect the 48-bit wallMs and 16-bit counter bounds.
+
 const arbSite = fc.hexaString({ minLength: 8, maxLength: 8 });
 
 const arbLww = fc.record({
@@ -85,7 +87,7 @@ test.prop([fc.array(arbLww, { minLength: 2, maxLength: 20 })])(
 | MVRegister merge | Two random MV-Registers | Merged values equality |
 | HLC compare | Two random HLCs + sites | Ordering equality |
 | HLC now | Current state + wall clock | New HLC equality |
-| HLC recv | Current state + remote HLC | New HLC equality |
+| HLC recv | Current state + remote HLC | New HLC equality (or null on drift/bounds rejection) |
 | Apply ops sequence | Random op list, random order | Final state equality |
 
 **Run configuration:**
