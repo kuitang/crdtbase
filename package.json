@@ -7,12 +7,16 @@
     "test": "vitest run",
     "test:all": "npm run lean:build && vitest run",
     "test:watch": "vitest",
-    "lean:build": "cd lean && lake build CrdtBase.Crdt.Lww.Props CrdtBase.Crdt.PnCounter.Props CrdtBase.Crdt.OrSet.Props CrdtBase.Crdt.MvRegister.Props CrdtBaseDRT"
+    "lean:build": "cd lean && lake build CrdtBase.Crdt.Lww.Props CrdtBase.Crdt.PnCounter.Props CrdtBase.Crdt.OrSet.Props CrdtBase.Crdt.MvRegister.Props CrdtBaseDRT",
+    "cli": "node ./cli.mjs"
   },
   "devDependencies": {
     "@fast-check/vitest": "^0.1.4",
     "fast-check": "^3.16.0",
     "typescript": "^5.4.5",
     "vitest": "^1.6.0"
+  },
+  "dependencies": {
+    "@msgpack/msgpack": "^3.1.3"
   }
 }
