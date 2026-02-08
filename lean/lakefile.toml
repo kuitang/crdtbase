@@ -1,0 +1,14 @@
+[package]
+name = "CrdtBase"
+version = "0.1.0"
+leanOptions = ["-DautoImplicit=false"]
+
+[[lean_lib]]
+name = "CrdtBase"
+
+[[lean_exe]]
+name = "CrdtBaseDRT"
+root = "CrdtBase.DiffTest.Main"
+
+[dependencies]
+Batteries = { git = "https://github.com/leanprover-community/batteries", tag = "v4.7.0" }

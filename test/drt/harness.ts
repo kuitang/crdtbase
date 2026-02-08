@@ -1,0 +1,67 @@
+import { existsSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { createInterface } from 'node:readline';
+
+type Pending = {
+  resolve: (line: string) => void;
+  reject: (error: Error) => void;
+};
+
+export class LeanDrtClient {
+  private pending: Pending[] = [];
+  private proc: ReturnType<typeof spawn>;
+
+  constructor(private readonly binPath: string) {
+    this.proc = spawn(this.binPath, [], { stdio: ['pipe', 'pipe', 'inherit'] });
+    const rl = createInterface({ input: this.proc.stdout });
+    rl.on('line', (line) => {
+      const next = this.pending.shift();
+      if (next) {
+        next.resolve(line);
+      }
+    });
+    this.proc.on('error', (error) => {
+      const err = error instanceof Error ? error : new Error(String(error));
+      this.flushError(err);
+    });
+    this.proc.on('exit', (code) => {
+      if (code !== 0) {
+        this.flushError(new Error(`Lean DRT exited with code ${code}`));
+      }
+    });
+  }
+
+  static findBinary(): string | null {
+    const explicit = process.env.LEAN_DRT_BIN;
+    if (explicit && existsSync(explicit)) {
+      return explicit;
+    }
+    const fallback = 'lean/.lake/build/bin/CrdtBaseDRT';
+    return existsSync(fallback) ? fallback : null;
+  }
+
+  async send<T>(payload: unknown): Promise<T> {
+    return new Promise((resolve, reject) => {
+      this.pending.push({
+        resolve: (line) => {
+          resolve(JSON.parse(line) as T);
+        },
+        reject,
+      });
+      this.proc.stdin.write(`${JSON.stringify(payload)}\n`);
+    });
+  }
+
+  close(): void {
+    this.proc.kill();
+  }
+
+  private flushError(error: Error): void {
+    while (this.pending.length > 0) {
+      const next = this.pending.shift();
+      if (next) {
+        next.reject(error);
+      }
+    }
+  }
+}
