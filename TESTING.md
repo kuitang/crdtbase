@@ -654,3 +654,104 @@ Property tests (Level 2) and model-based tests (Level 3) run without Lean. DRT t
 | **Level 3** (Model-based) | The *integrated system behaves* like a simple model under arbitrary command sequences | High — catches integration bugs, ordering issues, state corruption |
 
 A release requires all four levels to pass. Level 0 is checked at compile time. Levels 1-3 are checked at test time. A nightly deep-fuzz run at 1M iterations per target provides additional confidence.
+
+---
+
+## Level 4: End-to-End Storage/Replication Tests (Implemented)
+
+This repository now includes end-to-end tests that exercise real persistence and transport paths with `.bin` files:
+
+- `test/e2e/three-clients.e2e.test.ts`
+- `test/e2e/s3-minio.e2e.test.ts`
+
+These run in addition to Levels 0-3 and are focused on operational wiring correctness.
+
+### E2E A: Filesystem-backed replication server
+
+**Test file:** `test/e2e/three-clients.e2e.test.ts`
+
+What it validates:
+
+1. Three independent clients execute SQL and converge through the file-backed HTTP replicated log.
+2. Clients persist local `schema.bin`, `state.bin`, `pending.bin`, and `sync.bin`.
+3. Server persists replicated delta entries as MessagePack `.bin` files.
+4. The CLI `dump` command can decode generated `.bin` files.
+
+Core SQL sequence used in test:
+
+```sql
+CREATE TABLE tasks (
+  id STRING PRIMARY KEY,
+  title LWW<STRING>,
+  points COUNTER,
+  tags SET<STRING>,
+  status REGISTER<STRING>
+);
+
+INSERT INTO tasks (id, title, points, tags, status)
+VALUES ('t1', 'from-a', 0, 'alpha', 'open');
+
+UPDATE tasks SET title = 'from-b', status = 'review' WHERE id = 't1';
+INC tasks.points BY 3 WHERE id = 't1';
+ADD 'beta' TO tasks.tags WHERE id = 't1';
+
+UPDATE tasks SET title = 'from-c' WHERE id = 't1';
+INC tasks.points BY 5 WHERE id = 't1';
+ADD 'gamma' TO tasks.tags WHERE id = 't1';
+
+REMOVE 'alpha' FROM tasks.tags WHERE id = 't1';
+
+SELECT * FROM tasks WHERE id = 't1';
+```
+
+Expected converged row:
+
+- `title = 'from-c'`
+- `points = 8`
+- `tags` contains `beta` and `gamma`
+- `status` contains both `open` and `review`
+
+### E2E B: Direct S3 replication via MinIO
+
+**Test file:** `test/e2e/s3-minio.e2e.test.ts`
+
+What it validates:
+
+1. Clients talk directly to S3 through `S3ReplicatedLog` (no in-memory server in the middle).
+2. Objects are written to `deltas/<site>/<seq>.delta.bin`.
+3. Downloaded S3 objects can be inspected with `node cli.mjs dump`.
+4. SQL convergence across three clients remains correct under S3 transport.
+
+The test starts a local MinIO process and creates a test bucket automatically.
+
+### Commands: Run Again
+
+Run filesystem e2e only:
+
+```bash
+npx vitest run test/e2e/three-clients.e2e.test.ts
+```
+
+Run S3/MinIO e2e only:
+
+```bash
+npx vitest run test/e2e/s3-minio.e2e.test.ts
+```
+
+Run all tests:
+
+```bash
+npm test
+```
+
+Run CLI dump manually on a `.bin` file:
+
+```bash
+npm run cli -- dump /path/to/file.bin
+```
+
+### MinIO Notes
+
+On first run, the MinIO harness downloads a MinIO binary to a temp cache directory. Later runs reuse it. If download/startup is slow, run the S3 e2e test alone first.
+
+The S3 e2e test timeout is set higher (`120s`) to tolerate first-run setup cost.
