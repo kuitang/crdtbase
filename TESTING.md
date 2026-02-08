@@ -81,7 +81,7 @@ test.prop([fc.array(arbLww, { minLength: 2, maxLength: 20 })])(
 |--------|----------------|------------|
 | LWW merge | Two random LWW states | Merged state equality |
 | PNCounter merge | Two random counters (random site maps) | Merged state + materialized value |
-| ORSet merge | Two random OR-Sets with overlapping tags | Merged elements equality |
+| ORSet merge | Two random OR-Sets with overlapping tags + tombstones | Merged elements and tombstones equality |
 | MVRegister merge | Two random MV-Registers | Merged values equality |
 | HLC compare | Two random HLCs + sites | Ordering equality |
 | HLC now | Current state + wall clock | New HLC equality |

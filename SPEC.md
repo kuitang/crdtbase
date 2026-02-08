@@ -229,7 +229,11 @@ type SegmentRow = {
 type CrdtState =
   | { t: 1; hlc: string; site: string; val: MsgpackValue }    // LWW Register
   | { t: 2; inc: Record<string, number>; dec: Record<string, number> }  // PN Counter
-  | { t: 3; elems: Array<{ val: MsgpackValue; add_hlc: string; add_site: string }> }  // OR-Set
+  | {
+      t: 3;
+      elems: Array<{ val: MsgpackValue; add_hlc: string; add_site: string }>;
+      tombstones: Array<{ add_hlc: string; add_site: string }>;
+    }  // OR-Set
   | { t: 4; vals: Array<{ val: MsgpackValue; hlc: string; site: string }> };  // MV Register
 ```
 
@@ -327,11 +331,11 @@ Note: ops are not idempotent for PN-Counters. The engine must deduplicate ops by
 
 Observed-Remove Set. Each element has a unique add-tag (hlc + site).
 
-**State:** `{ elements: [{ val, add_hlc, add_site }] }`
+**State:** `{ elems: [{ val, add_hlc, add_site }], tombstones: [{ add_hlc, add_site }] }`
 
-**Current value:** The set of distinct `val` values across all elements.
+**Current value:** The set of distinct `val` values across all elements whose add-tag does **not** appear in `tombstones`.
 
-**Merge:** Union all elements. Then for any element, if a remove operation exists with a matching `(add_hlc, add_site)` tag, remove it.
+**Merge:** Union `elems` and union `tombstones`, then filter out any element whose `(add_hlc, add_site)` appears in `tombstones`.
 
 **Op payload:** `{ a: "add", val: V }` or `{ a: "rmv", tags: Array<{ hlc: string, site: string }> }`. Remove specifies exact add-tags to remove (the client must have observed them).
 
@@ -551,6 +555,8 @@ compact():
      b. For each partition:
         i.   Load existing segment (if any) → current CRDT state per row
         ii.  Apply all new ops → merged state
+             - OR-Set remove ops record their remove-tags in `tombstones` (do not discard).
+             - OR-Set materialization and merges must suppress any element whose add-tag appears in `tombstones`.
         iii. Build bloom filter over primary keys
         iv.  Sort rows by primary key
         v.   Encode as SegmentFile (§6.2)

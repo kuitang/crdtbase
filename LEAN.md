@@ -247,12 +247,15 @@ structure Tagged (α : Type) where
 
 /-- An Observed-Remove Set. -/
 structure OrSet (α : Type) where
-  elements : List (Tagged α)
+  elements   : List (Tagged α)
+  tombstones : List (Hlc × String)
   deriving Repr
 
-/-- Merge: union elements, remove any whose tag appears in a remove set. -/
+/-- Merge: union elements and tombstones, then filter elements by tombstones. -/
 def OrSet.merge (a b : OrSet α) : OrSet α where
-  elements := (a.elements ++ b.elements).dedup
+  elements := ((a.elements ++ b.elements).dedup).filter (fun e =>
+    !((a.tombstones ++ b.tombstones).dedup.contains (e.addHlc, e.addSite)))
+  tombstones := (a.tombstones ++ b.tombstones).dedup
 ```
 
 ### Network Model
@@ -359,6 +362,8 @@ The Lean executable processes commands:
 - `hlc_now`: given current state and wall clock, return new HLC.
 - `hlc_recv`: given current state and remote HLC, return new HLC.
 - `apply_ops`: given an initial state and a list of operations, return final state.
+
+For `or_set_merge`, inputs and outputs include both `elements` and `tombstones` so remove-tag handling is exercised in the Lean/TypeScript comparison.
 
 ### Running DRT
 
