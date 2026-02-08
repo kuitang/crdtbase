@@ -14,7 +14,7 @@ structure LwwRegister (α : Type) where
 namespace LwwRegister
 
 /-- Merge two LWW registers. Higher (hlc, site) wins. -/
-def merge (a b : LwwRegister α) : LwwRegister α :=
+def merge {α : Type} (a b : LwwRegister α) : LwwRegister α :=
   match Hlc.compareWithSite (a.hlc, a.site) (b.hlc, b.site) with
   | .lt => b
   | .eq | .gt => a

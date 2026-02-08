@@ -1,4 +1,5 @@
 import Batteries
+import Init.Data.Ord.String
 
 namespace CrdtBase
 
@@ -31,7 +32,7 @@ instance : Ord Hlc where
 
 /-- Extended comparison including site ID for tiebreaking. -/
 def compareWithSite (a b : Hlc × String) : Ordering :=
-  match compare a.1 b.1 with
+  match compare a.1.pack b.1.pack with
   | .eq => compare a.2 b.2
   | ord => ord
 
@@ -50,38 +51,38 @@ def max3 (a b c : Nat) : Nat :=
   max a (max b c)
 
 /-- Compute the wall clock component for a recv. -/
-def recvWall (local remote : Hlc) (now : Nat) : Nat :=
-  max3 local.wallMs remote.wallMs now
+def recvWall (localHlc remote : Hlc) (now : Nat) : Nat :=
+  max3 localHlc.wallMs remote.wallMs now
 
 /-- Compute the logical counter component for a recv. -/
-def recvCounter (local remote : Hlc) (now : Nat) : Nat :=
-  let wall := recvWall local remote now
-  if hLocal : wall = local.wallMs then
+def recvCounter (localHlc remote : Hlc) (now : Nat) : Nat :=
+  let wall := recvWall localHlc remote now
+  if hLocal : wall = localHlc.wallMs then
     if hRemote : wall = remote.wallMs then
-      max local.counter remote.counter + 1
+      max localHlc.counter remote.counter + 1
     else
-      local.counter + 1
+      localHlc.counter + 1
   else if hRemote : wall = remote.wallMs then
     remote.counter + 1
   else
     0
 
 /-- Advance the local HLC based on a local event. -/
-def now (local : Hlc) (wall : Nat) : Option Hlc :=
-  let wall' := max local.wallMs wall
+def now (localHlc : Hlc) (wall : Nat) : Option Hlc :=
+  let wall' := max localHlc.wallMs wall
   let counter :=
-    if wall' = local.wallMs then
-      local.counter + 1
+    if wall' = localHlc.wallMs then
+      localHlc.counter + 1
     else
       0
   mk? wall' counter
 
 /-- Receive a remote HLC, rejecting on excessive clock drift. -/
-def recv (local remote : Hlc) (now : Nat) : Option Hlc :=
+def recv (localHlc remote : Hlc) (now : Nat) : Option Hlc :=
   if hDrift : remote.wallMs > now + driftLimitMs then
     none
   else
-    mk? (recvWall local remote now) (recvCounter local remote now)
+    mk? (recvWall localHlc remote now) (recvCounter localHlc remote now)
 
 end Hlc
 

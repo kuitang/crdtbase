@@ -1,4 +1,4 @@
-import Std.Data.Finset
+import Mathlib.Data.Finset.Image
 
 set_option autoImplicit false
 
@@ -20,11 +20,19 @@ structure OrSetElem (α : Type) (Hlc : Type) where
 structure OrSet (α : Type) (Hlc : Type) where
   elements   : Finset (OrSetElem α Hlc)
   tombstones : Finset (OrSetTag Hlc)
-  deriving Repr
+
+@[ext] theorem OrSet.ext {α Hlc : Type} {a b : OrSet α Hlc}
+    (hElements : a.elements = b.elements)
+    (hTombstones : a.tombstones = b.tombstones) : a = b := by
+  cases a
+  cases b
+  cases hElements
+  cases hTombstones
+  rfl
 
 /-- Merge: union elements and tombstones, then filter elements by tombstones. -/
 @[simp]
-def OrSet.merge [DecidableEq α] [DecidableEq Hlc]
+def OrSet.merge {α Hlc : Type} [DecidableEq α] [DecidableEq Hlc]
     (a b : OrSet α Hlc) : OrSet α Hlc :=
   let mergedElems := a.elements ∪ b.elements
   let mergedTombs := a.tombstones ∪ b.tombstones
@@ -32,8 +40,8 @@ def OrSet.merge [DecidableEq α] [DecidableEq Hlc]
   { elements := filtered, tombstones := mergedTombs }
 
 /-- Materialize: project to visible values (tags suppressed by tombstones). -/
-def OrSet.values [DecidableEq α] [DecidableEq Hlc]
+def OrSet.values {α Hlc : Type} [DecidableEq α] [DecidableEq Hlc]
     (s : OrSet α Hlc) : Finset α :=
-  s.elements.image (fun e => e.val)
+  Finset.image (fun e => e.val) s.elements
 
 end CrdtBase
