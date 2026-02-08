@@ -1,11 +1,14 @@
 import { execFile as execFileWithCallback } from 'node:child_process';
-import { mkdtemp, readdir, rm, stat } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { afterEach, describe, expect, it } from 'vitest';
 import { FileReplicatedLogServer } from '../../src/backend/fileLogServer';
+import { decodeBin } from '../../src/core/encoding';
+import { SqlSchema } from '../../src/core/sql';
 import { HttpReplicatedLog } from '../../src/platform/node/httpReplicatedLog';
+import { compactReplicatedLogToFs } from '../../src/platform/node/compactor';
 import { NodeCrdtClient } from '../../src/platform/node/nodeClient';
 
 const execFile = promisify(execFileWithCallback);
@@ -143,5 +146,89 @@ describe('Filesystem SQL end-to-end sync', () => {
     expect(parsed.seq).toBe(1);
     expect(Array.isArray(parsed.ops)).toBe(true);
     expect(parsed.ops.length).toBe(4);
+
+    const schemaBytes = await readFile(join(clientADir, 'schema.bin'));
+    const schema = decodeBin<SqlSchema>(schemaBytes);
+    const snapshotsDir = join(serverDir, 'snapshots');
+    const compaction = await compactReplicatedLogToFs({
+      log: logA,
+      schema,
+      outputDir: snapshotsDir,
+    });
+
+    expect(compaction.applied).toBe(true);
+    expect(compaction.opsRead).toBe(12);
+    expect(compaction.manifest.sites_compacted).toEqual({
+      'site-a': 1,
+      'site-b': 2,
+      'site-c': 1,
+    });
+    expect(compaction.manifest.segments).toHaveLength(1);
+
+    const manifestPath = join(snapshotsDir, 'manifest.bin');
+    const { stdout: manifestStdout } = await execFile('node', ['cli.mjs', 'dump', manifestPath], {
+      cwd: process.cwd(),
+    });
+    const manifestDump = JSON.parse(manifestStdout) as {
+      version: number;
+      compaction_hlc: string;
+      segments: Array<{ table: string; partition: string; row_count: number; path: string }>;
+      sites_compacted: Record<string, number>;
+    };
+    expect(manifestDump.version).toBe(compaction.manifest.version);
+    expect(manifestDump.sites_compacted).toEqual(compaction.manifest.sites_compacted);
+    expect(manifestDump.segments).toHaveLength(1);
+    expect(manifestDump.segments[0]!.table).toBe('tasks');
+    expect(manifestDump.segments[0]!.partition).toBe('_default');
+    expect(manifestDump.segments[0]!.row_count).toBe(1);
+
+    const segmentPath = join(snapshotsDir, manifestDump.segments[0]!.path);
+    const { stdout: segmentStdout } = await execFile('node', ['cli.mjs', 'dump', segmentPath], {
+      cwd: process.cwd(),
+    });
+    const segmentDump = JSON.parse(segmentStdout) as {
+      table: string;
+      partition: string;
+      row_count: number;
+      bloom: string;
+      rows: Array<{
+        key: string;
+        cols: {
+          title: { typ: 1; val: string };
+          points: { typ: 2; inc: Record<string, number> };
+          tags: { typ: 3; elements: Array<{ val: string }>; tombstones: unknown[] };
+          status: { typ: 4; values: Array<{ val: string }> };
+        };
+      }>;
+    };
+
+    expect(segmentDump.table).toBe('tasks');
+    expect(segmentDump.partition).toBe('_default');
+    expect(segmentDump.row_count).toBe(1);
+    expect(segmentDump.bloom.startsWith('<bytes:')).toBe(true);
+    expect(segmentDump.rows[0]!.key).toBe('t1');
+    expect(segmentDump.rows[0]!.cols.title.val).toBe('from-c');
+    expect(segmentDump.rows[0]!.cols.points.inc).toEqual({
+      'site-b': 3,
+      'site-c': 5,
+    });
+    expect(segmentDump.rows[0]!.cols.tags.elements.map((item) => item.val).sort()).toEqual([
+      'beta',
+      'gamma',
+    ]);
+    expect(segmentDump.rows[0]!.cols.tags.tombstones.length).toBe(1);
+    expect(segmentDump.rows[0]!.cols.status.values.map((item) => item.val).sort()).toEqual([
+      'open',
+      'review',
+    ]);
+
+    const secondCompaction = await compactReplicatedLogToFs({
+      log: logA,
+      schema,
+      outputDir: snapshotsDir,
+    });
+    expect(secondCompaction.applied).toBe(true);
+    expect(secondCompaction.opsRead).toBe(0);
+    expect(secondCompaction.manifest.sites_compacted).toEqual(compaction.manifest.sites_compacted);
   });
 });
