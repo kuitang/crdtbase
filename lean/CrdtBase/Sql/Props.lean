@@ -95,9 +95,7 @@ theorem no_nonsync_for_valid_crdt_writes
     (ops : List EncodedCrdtOp)
     (hGen : generateCrdtOps statement context = Except.ok ops)
     : ∀ op, op ∈ ops → op.tbl ≠ "" ∧ op.col ≠ "" ∧ op.hlc ≠ "" ∧ op.site ≠ "" := by
-  have hSync : OpsAreSyncable ops := write_ops_syncable statement context ops hGen
-  intro op hMem
-  exact hSync op hMem
+  simpa [OpsAreSyncable] using write_ops_syncable statement context ops hGen
 
 theorem planner_partition_default_route
     (statement : SelectStatement)

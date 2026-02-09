@@ -29,7 +29,7 @@ theorem foldPrefixSuffix_eq_foldl_all {α β : Type}
     (step : β → α → β) (init : β) (ops : List α) :
     ∀ split : Nat, foldPrefixSuffix step init ops split = List.foldl step init ops := by
   intro split
-  exact foldPrefixSuffix_eq_foldl step init ops split
+  simpa using foldPrefixSuffix_eq_foldl step init ops split
 
 /-- Canonical compaction law: compacting a prefix and folding the suffix
 is equivalent to folding the full stream. -/

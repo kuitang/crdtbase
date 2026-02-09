@@ -1,4 +1,5 @@
 import CrdtBase.Tombstone.Defs
+import CrdtBase.Hlc.Props
 
 set_option autoImplicit false
 
@@ -28,8 +29,10 @@ theorem write_resurrects_if_later
 theorem tombstone_stable_without_new_writes
     (state : TombstoneState) :
     merge state state = state := by
+  have hSelf : Hlc.compareWithSite (state.hlc, state.site) (state.hlc, state.site) = .eq :=
+    compareWithSite_self_eq (state.hlc, state.site)
   unfold merge LwwRegister.merge
-  cases Hlc.compareWithSite (state.hlc, state.site) (state.hlc, state.site) <;> simp
+  simp [hSelf]
 
 end Tombstone
 

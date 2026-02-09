@@ -85,7 +85,7 @@ theorem convergence_composite
             cases c with
             | mk c1 c2 =>
                 simp [mergeComposite, hAssocA a1 b1 c1, hAssocB a2 b2 c2]
-  exact convergence_of_comm_assoc (mergeComposite mergeA mergeB) hComm hAssoc init hPerm
+  simpa using convergence_of_comm_assoc (mergeComposite mergeA mergeB) hComm hAssoc init hPerm
 
 end Composite
 
@@ -110,9 +110,9 @@ theorem convergence_lww_of_consistent
     (hPerm : List.Perm ops₁ ops₂)
     (hCons : ∀ a b : LwwRegister α, LwwConsistentPair a b) :
     applyOps LwwRegister.merge init ops₁ = applyOps LwwRegister.merge init ops₂ := by
-  apply convergence_lww init hPerm
-  · exact lww_merge_comm_global_of_consistent hCons
-  · exact lww_merge_assoc_global_of_consistent hCons
+  simpa using convergence_lww init hPerm
+    (lww_merge_comm_global_of_consistent hCons)
+    (lww_merge_assoc_global_of_consistent hCons)
 
 end Lww
 

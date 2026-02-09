@@ -9,9 +9,7 @@ namespace CrdtBase
 theorem or_set_canonicalize_idem {α Hlc : Type} [DecidableEq α] [DecidableEq Hlc]
     (a : OrSet α Hlc) :
     OrSet.canonicalize (OrSet.canonicalize a) = OrSet.canonicalize a := by
-  ext x
-  · simp [OrSet.canonicalize]
-  · simp [OrSet.canonicalize]
+  ext x <;> simp [OrSet.canonicalize]
 
 /-- Canonicalization removes all elements whose tags are tombstoned. -/
 theorem or_set_canonicalize_no_tombstoned_tags {α Hlc : Type} [DecidableEq α] [DecidableEq Hlc]
