@@ -21,3 +21,8 @@ DRT_NUM_RUNS=1000 DRT_TIMEOUT_MS=120000 npx vitest run test/drt/*.drt.test.ts
 ```bash
 npm run lean:build
 ```
+
+- Run current E2E matrix rows implemented in CI today (`node x http-server`, `node x s3-minio`):
+```bash
+npx vitest run test/e2e/three-clients.e2e.test.ts test/e2e/s3-minio.e2e.test.ts
+```
