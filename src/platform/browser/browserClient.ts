@@ -1,5 +1,5 @@
 import { HLC_LIMITS, Hlc } from '../../core/hlc';
-import { LogPosition, ReplicatedLog } from '../../core/replication';
+import { LogPosition, ReplicatedLog, takeContiguousEntriesSince } from '../../core/replication';
 import {
   EncodedCrdtOp,
   SqlExecutionPlan,
@@ -107,7 +107,8 @@ export class BrowserCrdtClient {
       const since = this.syncedSeqBySite.get(siteId) ?? 0;
       let entries;
       if (since === 0) {
-        entries = await this.log.readSince(siteId, 0);
+        const pulled = await this.log.readSince(siteId, 0);
+        entries = takeContiguousEntriesSince(pulled, 0);
       } else {
         const remoteHead = await this.log.getHead(siteId);
         if (remoteHead < since) {
@@ -134,7 +135,7 @@ export class BrowserCrdtClient {
           this.syncedHlcBySite.set(siteId, atCursor.hlc);
         }
 
-        entries = probe.slice(1);
+        entries = takeContiguousEntriesSince(probe.slice(1), since);
       }
       for (const entry of entries) {
         for (const op of entry.ops) {

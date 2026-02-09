@@ -7,7 +7,13 @@ import {
   GetObjectCommand,
 } from '@aws-sdk/client-s3';
 import { decodeBin, encodeBin } from '../core/encoding';
-import { AppendLogEntry, LogEntry, LogPosition, ReplicatedLog } from '../core/replication';
+import {
+  AppendLogEntry,
+  LogEntry,
+  LogPosition,
+  ReplicatedLog,
+  takeContiguousEntriesSince,
+} from '../core/replication';
 
 type S3LikeClient = {
   send(command: unknown): Promise<unknown>;
@@ -167,7 +173,7 @@ export class S3ReplicatedLog implements ReplicatedLog {
       const bytes = await bodyToUint8Array(response.Body);
       entries.push(decodeBin<LogEntry>(bytes));
     }
-    return entries;
+    return takeContiguousEntriesSince(entries, since);
   }
 
   async listSites(): Promise<string[]> {

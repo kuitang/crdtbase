@@ -4,7 +4,12 @@ import { mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { AddressInfo } from 'node:net';
 import { ManifestFile } from '../core/compaction';
 import { decodeBin, encodeBin } from '../core/encoding';
-import { AppendLogEntry, LogEntry, LogPosition } from '../core/replication';
+import {
+  AppendLogEntry,
+  LogEntry,
+  LogPosition,
+  takeContiguousEntriesSince,
+} from '../core/replication';
 import { assertManifestPublishable, assertSafeSnapshotRelativePath } from '../core/snapshotStore';
 
 type JsonRecord = Record<string, unknown>;
@@ -428,7 +433,7 @@ export class FileReplicatedLogServer {
       const bytes = await readFile(join(siteDir, formatSeqFilename(seq)));
       entries.push(decodeBin<LogEntry>(bytes));
     }
-    return entries;
+    return takeContiguousEntriesSince(entries, since);
   }
 
   private async listSitesFromDisk(): Promise<string[]> {

@@ -2,6 +2,7 @@ import Lean
 import CrdtBase.Hlc.Defs
 import CrdtBase.Crdt.Lww.Defs
 import CrdtBase.Crdt.PnCounter.Defs
+import CrdtBase.Replication.Defs
 import CrdtBase.Sql.Defs
 
 set_option autoImplicit false
@@ -227,8 +228,16 @@ structure SqlEvalCmd where
   state : SqlEvalStateCmd
   deriving FromJson
 
+structure ReplicationEntryJson where
+  siteId : String
+  seq : Nat
+  deriving FromJson, ToJson
+
 def resultLine (result : Json) : String :=
   (Json.mkObj [("result", result)]).compress
+
+def toReplicationEntry (entry : ReplicationEntryJson) : Replication.LogEntry :=
+  { siteId := entry.siteId, seq := entry.seq }
 
 def toHlc (h : HlcJson) : Except String Hlc := do
   match Hlc.mk? h.wallMs h.counter with
@@ -821,6 +830,24 @@ def handleSqlBuildSelectPlan (json : Json) : Except String String := do
   let out := buildSelectPlan cmd.statement cmd.schema
   pure (resultLine (toJson out))
 
+def handleReplicationListSites (json : Json) : Except String String := do
+  let entriesJson ← json.getObjValAs? (List ReplicationEntryJson) "entries"
+  let entries := entriesJson.map toReplicationEntry
+  pure (resultLine (toJson (Replication.listSites entries)))
+
+def handleReplicationGetHead (json : Json) : Except String String := do
+  let entriesJson ← json.getObjValAs? (List ReplicationEntryJson) "entries"
+  let siteId ← json.getObjValAs? String "siteId"
+  let entries := entriesJson.map toReplicationEntry
+  pure (resultLine (toJson (Replication.getHead entries siteId)))
+
+def handleReplicationReadSince (json : Json) : Except String String := do
+  let entriesJson ← json.getObjValAs? (List ReplicationEntryJson) "entries"
+  let siteId ← json.getObjValAs? String "siteId"
+  let since ← json.getObjValAs? Nat "since"
+  let entries := entriesJson.map toReplicationEntry
+  pure (resultLine (toJson (Replication.readSince entries siteId since)))
+
 def handleLine (line : String) : Except String String := do
   let json ← Json.parse line
   let typ ← json.getObjValAs? String "type"
@@ -840,6 +867,9 @@ def handleLine (line : String) : Except String String := do
   | "sql_generate_ops" => handleSqlGenerateOps json
   | "sql_build_select_plan" => handleSqlBuildSelectPlan json
   | "sql_eval" => handleSqlEval json
+  | "replication_list_sites" => handleReplicationListSites json
+  | "replication_get_head" => handleReplicationGetHead json
+  | "replication_read_since" => handleReplicationReadSince json
   | _ => throw s!"unsupported command: {typ}"
 
 def emitLine (line : String) : IO Unit := do

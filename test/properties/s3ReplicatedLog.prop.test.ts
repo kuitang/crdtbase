@@ -235,7 +235,7 @@ describe('S3ReplicatedLog properties (direct backend semantics)', () => {
     },
   );
 
-  it('ignores malformed keys while preserving valid seq ordering across paginated reads', async () => {
+  it('ignores malformed keys and only returns contiguous seq prefixes', async () => {
     const client = new InMemoryS3Client(1);
     const log = new S3ReplicatedLog({
       bucket: 'test-bucket',
@@ -270,7 +270,7 @@ describe('S3ReplicatedLog properties (direct backend semantics)', () => {
     client.seedRaw('other/site-a/0000000009.delta.bin', new Uint8Array([1]));
 
     await expect(log.getHead('site-a')).resolves.toBe(3);
-    await expect(log.readSince('site-a', 1).then((entries) => entries.map((entry) => entry.seq))).resolves.toEqual([3]);
+    await expect(log.readSince('site-a', 1).then((entries) => entries.map((entry) => entry.seq))).resolves.toEqual([]);
 
     const appended = await log.append({
       siteId: 'site-a',
@@ -280,7 +280,7 @@ describe('S3ReplicatedLog properties (direct backend semantics)', () => {
     expect(appended).toBe(4);
 
     const seqs = await log.readSince('site-a', 0).then((entries) => entries.map((entry) => entry.seq));
-    expect(seqs).toEqual([1, 3, 4]);
+    expect(seqs).toEqual([1]);
 
     await expect(log.listSites()).resolves.toEqual(['site-a', 'site-b']);
   });

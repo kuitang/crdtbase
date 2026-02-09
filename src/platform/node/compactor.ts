@@ -11,7 +11,7 @@ import {
   segmentFileToRuntimeRows,
 } from '../../core/compaction';
 import { decodeBin, encodeBin } from '../../core/encoding';
-import { LogPosition, ReplicatedLog } from '../../core/replication';
+import { LogPosition, ReplicatedLog, takeContiguousEntriesSince } from '../../core/replication';
 import { SnapshotStore } from '../../core/snapshotStore';
 import { SqlSchema } from '../../core/sql';
 import { RuntimeRowState } from '../../core/sqlEval';
@@ -73,7 +73,8 @@ export async function compactReplicatedLog(
 
   for (const siteId of sites) {
     const since = normalizeSeq(sitesCompacted[siteId] ?? 0);
-    const entries = await options.log.readSince(siteId, since);
+    const readEntries = await options.log.readSince(siteId, since);
+    const entries = takeContiguousEntriesSince(readEntries, since);
     let nextHead = since;
     for (const entry of entries) {
       nextHead = Math.max(nextHead, normalizeSeq(entry.seq));

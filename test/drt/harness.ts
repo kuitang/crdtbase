@@ -94,6 +94,30 @@ export class LeanDrtClient {
     });
   }
 
+  async replicationListSites<T>(entries: unknown): Promise<T> {
+    return this.send<T>({
+      type: 'replication_list_sites',
+      entries,
+    });
+  }
+
+  async replicationGetHead<T>(entries: unknown, siteId: string): Promise<T> {
+    return this.send<T>({
+      type: 'replication_get_head',
+      entries,
+      siteId,
+    });
+  }
+
+  async replicationReadSince<T>(entries: unknown, siteId: string, since: number): Promise<T> {
+    return this.send<T>({
+      type: 'replication_read_since',
+      entries,
+      siteId,
+      since,
+    });
+  }
+
   close(): void {
     this.proc.kill();
   }

@@ -10,6 +10,8 @@ import CrdtBase.Crdt.MvRegister.Defs
 import CrdtBase.Crdt.MvRegister.Props
 import CrdtBase.Convergence.Defs
 import CrdtBase.Convergence.Props
+import CrdtBase.Replication.Defs
+import CrdtBase.Replication.Props
 import CrdtBase.Compaction.Defs
 import CrdtBase.Compaction.Props
 import CrdtBase.Tombstone.Defs
