@@ -1,0 +1,199 @@
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+import { encodeBin } from '../../src/core/encoding';
+import { AppendLogEntry, LogEntry, LogPosition, ReplicatedLog } from '../../src/core/replication';
+import { BrowserCrdtClient } from '../../src/platform/browser/browserClient';
+import { NodeCrdtClient } from '../../src/platform/node/nodeClient';
+
+class StubReplicatedLog implements ReplicatedLog {
+  private readonly entriesBySite = new Map<string, LogEntry[]>();
+  readSinceCalls = 0;
+
+  constructor(entriesBySite: Record<string, LogEntry[]>) {
+    for (const [siteId, entries] of Object.entries(entriesBySite)) {
+      this.entriesBySite.set(
+        siteId,
+        [...entries].sort((left, right) => left.seq - right.seq),
+      );
+    }
+  }
+
+  async append(entry: AppendLogEntry): Promise<LogPosition> {
+    const entries = this.entriesBySite.get(entry.siteId) ?? [];
+    const next = entries.length === 0 ? 1 : entries[entries.length - 1]!.seq + 1;
+    entries.push({
+      siteId: entry.siteId,
+      hlc: entry.hlc,
+      seq: next,
+      ops: [...entry.ops],
+    });
+    this.entriesBySite.set(entry.siteId, entries);
+    return next;
+  }
+
+  async readSince(siteId: string, since: LogPosition): Promise<LogEntry[]> {
+    this.readSinceCalls += 1;
+    return (this.entriesBySite.get(siteId) ?? []).filter((entry) => entry.seq > since);
+  }
+
+  async listSites(): Promise<string[]> {
+    return [...this.entriesBySite.keys()].sort();
+  }
+
+  async getHead(siteId: string): Promise<LogPosition> {
+    const entries = this.entriesBySite.get(siteId) ?? [];
+    return entries.length === 0 ? 0 : entries[entries.length - 1]!.seq;
+  }
+}
+
+async function writeNodeSyncFileV1(
+  dataDir: string,
+  syncedSeqBySite: Record<string, LogPosition>,
+): Promise<void> {
+  await writeFile(
+    join(dataDir, 'sync.bin'),
+    encodeBin({
+      v: 1 as const,
+      syncedSeqBySite,
+    }),
+  );
+}
+
+async function writeNodeSyncFileV2(
+  dataDir: string,
+  syncedBySite: Record<string, { seq: LogPosition; hlc: string | null }>,
+): Promise<void> {
+  await writeFile(
+    join(dataDir, 'sync.bin'),
+    encodeBin({
+      v: 2 as const,
+      syncedBySite,
+    }),
+  );
+}
+
+describe('client sync cursor safety', () => {
+  const tempDirs: string[] = [];
+
+  afterEach(async () => {
+    await Promise.all(
+      tempDirs.splice(0, tempDirs.length).map((dir) => rm(dir, { recursive: true, force: true })),
+    );
+  });
+
+  it('throws in node client when local cursor is ahead of remote head', async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), 'crdtbase-node-sync-cursor-'));
+    tempDirs.push(dataDir);
+    await writeNodeSyncFileV1(dataDir, {
+      'site-a': 4,
+    });
+
+    const log = new StubReplicatedLog({
+      'site-a': [
+        {
+          siteId: 'site-a',
+          hlc: '0x10001',
+          seq: 1,
+          ops: [],
+        },
+      ],
+    });
+    const client = await NodeCrdtClient.open({
+      siteId: 'site-b',
+      log,
+      dataDir,
+      now: () => 1_000,
+    });
+
+    await expect(client.pull()).rejects.toThrow("local sync cursor for site 'site-a' (4) is ahead");
+    expect(log.readSinceCalls).toBe(0);
+  });
+
+  it('throws in node client when cursor seq exists but HLC does not match', async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), 'crdtbase-node-sync-cursor-hlc-'));
+    tempDirs.push(dataDir);
+    await writeNodeSyncFileV2(dataDir, {
+      'site-a': {
+        seq: 1,
+        hlc: '0x10001',
+      },
+    });
+
+    const log = new StubReplicatedLog({
+      'site-a': [
+        {
+          siteId: 'site-a',
+          hlc: '0x20001',
+          seq: 1,
+          ops: [],
+        },
+      ],
+    });
+    const client = await NodeCrdtClient.open({
+      siteId: 'site-b',
+      log,
+      dataDir,
+      now: () => 2_000,
+    });
+
+    await expect(client.pull()).rejects.toThrow("sync cursor mismatch for site 'site-a' at seq 1");
+    expect(log.readSinceCalls).toBe(1);
+  });
+
+  it('throws in browser client when local cursor is ahead of remote head', async () => {
+    const log = new StubReplicatedLog({
+      'site-a': [
+        {
+          siteId: 'site-a',
+          hlc: '0x10001',
+          seq: 2,
+          ops: [],
+        },
+      ],
+    });
+    const client = await BrowserCrdtClient.open({
+      siteId: 'site-b',
+      log,
+      now: () => 2_000,
+    });
+    client.hydrateForTest({
+      syncedSeqBySite: {
+        'site-a': 7,
+      },
+    });
+
+    await expect(client.pull()).rejects.toThrow("local sync cursor for site 'site-a' (7) is ahead");
+    expect(log.readSinceCalls).toBe(0);
+  });
+
+  it('throws in browser client when cursor seq exists but HLC does not match', async () => {
+    const log = new StubReplicatedLog({
+      'site-a': [
+        {
+          siteId: 'site-a',
+          hlc: '0x30001',
+          seq: 1,
+          ops: [],
+        },
+      ],
+    });
+    const client = await BrowserCrdtClient.open({
+      siteId: 'site-b',
+      log,
+      now: () => 4_000,
+    });
+    client.hydrateForTest({
+      syncedSeqBySite: {
+        'site-a': 1,
+      },
+      syncedHlcBySite: {
+        'site-a': '0x10001',
+      },
+    });
+
+    await expect(client.pull()).rejects.toThrow("sync cursor mismatch for site 'site-a' at seq 1");
+    expect(log.readSinceCalls).toBe(1);
+  });
+});

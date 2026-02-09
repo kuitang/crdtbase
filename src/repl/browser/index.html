@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CRDTBase Browser REPL</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="header">
+        <h1>CRDTBase Browser REPL</h1>
+        <p>Black-and-white SQL REPL for CRDTBase replication clients.</p>
+      </header>
+
+      <section class="panel" id="config-panel">
+        <h2>Connection</h2>
+        <div class="grid">
+          <label>
+            Backend
+            <select id="backend">
+              <option value="http">HTTP</option>
+              <option value="s3-presign">S3 (Pre-Signed URLs)</option>
+            </select>
+          </label>
+          <label>
+            Site ID
+            <input id="site-id" value="browser-site" />
+          </label>
+        </div>
+
+        <div id="http-fields" class="grid">
+          <label class="wide">
+            HTTP Base URL
+            <input id="http-base-url" value="http://127.0.0.1:8788" />
+          </label>
+        </div>
+
+        <div id="s3-fields" class="grid hidden">
+          <label>
+            Bucket
+            <input id="s3-bucket" value="crdtbase" />
+          </label>
+          <label>
+            Prefix
+            <input id="s3-prefix" value="deltas" />
+          </label>
+          <label class="wide">
+            Pre-Sign Service URL
+            <input id="presign-base-url" value="http://127.0.0.1:8787" />
+          </label>
+          <label class="wide">
+            Pre-Sign Auth Token (optional)
+            <input id="presign-auth-token" value="" />
+          </label>
+        </div>
+
+        <div class="actions">
+          <button id="connect-btn" class="primary">Connect</button>
+          <span id="status">Disconnected</span>
+        </div>
+      </section>
+
+      <section class="panel" id="repl-panel">
+        <h2>REPL</h2>
+        <textarea id="sql-input" rows="6" placeholder="Type SQL here..."></textarea>
+        <div class="actions">
+          <button id="run-btn" class="primary" disabled>Run SQL</button>
+          <button id="push-btn" disabled>.push</button>
+          <button id="pull-btn" disabled>.pull</button>
+          <button id="sync-btn" disabled>.sync</button>
+        </div>
+
+        <div class="examples">
+          <strong>Examples:</strong>
+          <ul id="example-list"></ul>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Output</h2>
+        <pre id="output" class="mono"></pre>
+      </section>
+    </main>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

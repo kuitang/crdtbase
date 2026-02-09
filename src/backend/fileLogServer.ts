@@ -9,7 +9,14 @@ import { assertManifestPublishable, assertSafeSnapshotRelativePath } from '../co
 
 type JsonRecord = Record<string, unknown>;
 
+function setCorsHeaders(response: ServerResponse): void {
+  response.setHeader('access-control-allow-origin', '*');
+  response.setHeader('access-control-allow-methods', 'GET,POST,PUT,OPTIONS');
+  response.setHeader('access-control-allow-headers', 'content-type,authorization');
+}
+
 function writeJson(response: ServerResponse, statusCode: number, body: JsonRecord): void {
+  setCorsHeaders(response);
   response.statusCode = statusCode;
   response.setHeader('content-type', 'application/json');
   response.end(JSON.stringify(body));
@@ -25,6 +32,7 @@ function writeBytes(
   bytes: Uint8Array,
   contentType = 'application/octet-stream',
 ): void {
+  setCorsHeaders(response);
   response.statusCode = statusCode;
   response.setHeader('content-type', contentType);
   response.end(bytes);
@@ -178,6 +186,12 @@ export class FileReplicatedLogServer {
   ): Promise<void> {
     try {
       const method = request.method ?? 'GET';
+      if (method === 'OPTIONS') {
+        setCorsHeaders(response);
+        response.statusCode = 204;
+        response.end();
+        return;
+      }
       const url = new URL(request.url ?? '/', 'http://file-log.local');
       const parts = splitPath(url.pathname);
 

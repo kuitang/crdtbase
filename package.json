@@ -7,12 +7,26 @@
     "test": "vitest run",
     "test:all": "npm run lean:build && vitest run",
     "test:watch": "vitest",
+    "test:coverage": "DRT_NUM_RUNS=30 MINIO_PROP_NUM_RUNS=8 E2E_CHAOS_SEEDS=11 E2E_CHAOS_STEPS=100 E2E_CHAOS_DELAY_MS=6 E2E_CHAOS_DRAIN_ROUNDS=15 E2E_CHAOS_QUIESCENCE_ROUNDS=2 c8 --clean --all --report-dir coverage --reporter text-summary --reporter text --reporter html --reporter json-summary --reporter lcov --include \"src/**/*.ts\" --exclude \"src/backend/fileLogServerMain.ts\" --exclude \"src/backend/s3PresignServer.ts\" vitest run --no-file-parallelism --maxWorkers=1 --minWorkers=1 test/properties test/drt test/e2e/three-clients.e2e.test.ts test/e2e/s3-minio.e2e.test.ts test/e2e/matrix-status.e2e.test.ts",
+    "test:coverage:all": "c8 --clean --all --report-dir coverage --reporter text-summary --reporter text --reporter html --reporter json-summary --reporter lcov --include \"src/**/*.ts\" --exclude \"src/backend/fileLogServerMain.ts\" --exclude \"src/backend/s3PresignServer.ts\" vitest run --no-file-parallelism --maxWorkers=1 --minWorkers=1",
+    "test:e2e:node": "vitest run test/e2e/three-clients.e2e.test.ts test/e2e/s3-minio.e2e.test.ts",
+    "test:e2e:browser": "vitest run test/e2e/browser-http.e2e.test.ts test/e2e/browser-s3-minio.e2e.test.ts",
     "lean:build": "cd lean && lake build CrdtBase CrdtBaseDRT",
-    "cli": "node ./cli.mjs"
+    "cli": "node ./cli.mjs",
+    "backend:http": "tsx src/backend/fileLogServerMain.ts",
+    "backend:minio": "tsx scripts/start-minio-dev.ts",
+    "presign:server": "tsx src/backend/s3PresignServer.ts",
+    "repl:node": "tsx src/repl/nodeRepl.ts",
+    "repl:browser": "node scripts/serve-browser-repl.mjs"
   },
   "devDependencies": {
+    "@aws-sdk/s3-request-presigner": "^3.985.0",
     "@fast-check/vitest": "^0.1.4",
+    "c8": "^10.1.3",
+    "esbuild": "^0.27.3",
     "fast-check": "^3.16.0",
+    "playwright-core": "^1.58.2",
+    "tsx": "^4.21.0",
     "typescript": "^5.4.5",
     "vitest": "^1.6.0"
   },

@@ -5,16 +5,25 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { GetObjectCommand, ListObjectsV2Command, S3Client } from '@aws-sdk/client-s3';
 import { afterEach, describe, expect, it } from 'vitest';
-import { S3ReplicatedLog } from '../../src/backend/s3ReplicatedLog';
 import { TigrisSnapshotStore } from '../../src/backend/tigrisSnapshotStore';
 import { decodeBin } from '../../src/core/encoding';
 import { SqlSchema } from '../../src/core/sql';
 import { compactReplicatedLog } from '../../src/platform/node/compactor';
 import { NodeCrdtClient } from '../../src/platform/node/nodeClient';
+import {
+  HttpS3PresignProvider,
+  PresignedS3ReplicatedLog,
+} from '../../src/platform/shared/presignedS3ReplicatedLog';
 import { MinioHarness } from './minioHarness';
-import { E2E_SCHEDULES, TASK_QUERY_SQL, runThreeClientConvergenceScenario } from './orchestrator';
+import { PresignHarness } from './presignHarness';
+import {
+  normalizeTaskRows,
+  runThreeClientChaosScenario,
+} from './orchestrator';
+import { assertAckedWritesVisible, loadChaosEnv } from './chaosShared';
 
 const execFile = promisify(execFileWithCallback);
+const CHAOS = loadChaosEnv();
 
 async function objectBodyToBytes(body: unknown): Promise<Uint8Array> {
   if (!body) {
@@ -27,11 +36,16 @@ async function objectBodyToBytes(body: unknown): Promise<Uint8Array> {
   throw new Error('unsupported object body type');
 }
 
-describe('S3 ReplicatedLog with MinIO', () => {
+describe('S3 pre-signed replication over MinIO chaos', () => {
   let tempRoot: string | null = null;
   let minio: MinioHarness | null = null;
+  let presign: PresignHarness | null = null;
 
   afterEach(async () => {
+    if (presign) {
+      await presign.stop();
+      presign = null;
+    }
     if (minio) {
       await minio.stop();
       minio = null;
@@ -42,13 +56,16 @@ describe('S3 ReplicatedLog with MinIO', () => {
     }
   });
 
-  it.each(E2E_SCHEDULES)(
-    'syncs 3 SQL clients directly through S3 and inspects downloaded .bin files with dump [$name]',
-    async (schedule) => {
-      tempRoot = await mkdtemp(join(tmpdir(), 'crdtbase-minio-e2e-'));
+  it.each(CHAOS.seeds)(
+    'converges under random delayed concurrent client activity through pre-signed S3 transport [seed=%s]',
+    async (seed) => {
+      tempRoot = await mkdtemp(join(tmpdir(), 'crdtbase-minio-chaos-e2e-'));
       minio = await MinioHarness.start({
         rootDir: tempRoot,
         bucket: 'crdtbase',
+      });
+      presign = await PresignHarness.start({
+        endpoint: minio.getEndpoint(),
       });
 
       const s3Config = minio.getS3ClientConfig();
@@ -56,23 +73,22 @@ describe('S3 ReplicatedLog with MinIO', () => {
       const clientADir = join(tempRoot, 'client-a');
       const clientBDir = join(tempRoot, 'client-b');
       const clientCDir = join(tempRoot, 'client-c');
+      const observerDir = join(tempRoot, 'observer');
       const clientDDir = join(tempRoot, 'client-d');
 
-      const logA = new S3ReplicatedLog({
-        bucket,
-        prefix: 'deltas',
-        clientConfig: s3Config,
+      const provider = new HttpS3PresignProvider({
+        baseUrl: presign.getBaseUrl(),
       });
-      const logB = new S3ReplicatedLog({
-        bucket,
-        prefix: 'deltas',
-        clientConfig: s3Config,
-      });
-      const logC = new S3ReplicatedLog({
-        bucket,
-        prefix: 'deltas',
-        clientConfig: s3Config,
-      });
+      const makeLog = (): PresignedS3ReplicatedLog =>
+        new PresignedS3ReplicatedLog({
+          bucket,
+          prefix: 'deltas',
+          presign: provider,
+        });
+
+      const logA = makeLog();
+      const logB = makeLog();
+      const logC = makeLog();
 
       const clientA = await NodeCrdtClient.open({
         siteId: 'site-a',
@@ -92,28 +108,45 @@ describe('S3 ReplicatedLog with MinIO', () => {
         dataDir: clientCDir,
         now: () => 3_000,
       });
+      const observer = await NodeCrdtClient.open({
+        siteId: 'site-observer',
+        log: makeLog(),
+        dataDir: observerDir,
+        now: () => 3_500,
+      });
 
-      const result = await runThreeClientConvergenceScenario({
+      const result = await runThreeClientChaosScenario({
         clients: {
           'site-a': clientA,
           'site-b': clientB,
           'site-c': clientC,
         },
-        schedule,
+        observer,
+        config: {
+          seed,
+          stepsPerClient: CHAOS.steps,
+          maxDelayMs: CHAOS.maxDelayMs,
+          drainRounds: CHAOS.drainRounds,
+          quiescenceRounds: CHAOS.quiescenceRounds,
+        },
       });
-      const rowsA = result.rowsBySite['site-a'];
-      const rowsB = result.rowsBySite['site-b'];
-      const rowsC = result.rowsBySite['site-c'];
+
+      const rowsA = result.normalizedRowsBySite['site-a'];
+      const rowsB = result.normalizedRowsBySite['site-b'];
+      const rowsC = result.normalizedRowsBySite['site-c'];
+
       expect(rowsA).toEqual(rowsB);
       expect(rowsB).toEqual(rowsC);
-      expect(rowsA).toHaveLength(1);
+      expect(rowsA.length).toBeGreaterThan(0);
+      expect(result.observerRows).toEqual(rowsA);
+      expect(result.convergenceRound).toBeGreaterThan(0);
+      expect(result.stats.writes).toBeGreaterThan(0);
 
-      const row = rowsA[0]!;
-      expect(row.id).toBe('t1');
-      expect(row.title).toBe('from-c');
-      expect(row.points).toBe(8);
-      expect(new Set(row.tags as string[])).toEqual(new Set(['beta', 'gamma']));
-      expect(row.status).toEqual(['open', 'review']);
+      assertAckedWritesVisible({
+        rows: rowsA,
+        expectedPointsByRow: result.expectedPointsByRow,
+        expectedTagsByRow: result.expectedTagsByRow,
+      });
 
       const rawS3Client = new S3Client(s3Config);
       const listResp = await rawS3Client.send(
@@ -126,17 +159,16 @@ describe('S3 ReplicatedLog with MinIO', () => {
         .flatMap((item) => (item.Key ? [item.Key] : []))
         .sort();
 
-      expect(keys).toEqual([
-        'deltas/site-a/0000000001.delta.bin',
-        'deltas/site-b/0000000001.delta.bin',
-        'deltas/site-b/0000000002.delta.bin',
-        'deltas/site-c/0000000001.delta.bin',
-      ]);
+      expect(keys.length).toBeGreaterThan(0);
+      expect(keys.some((key) => key.startsWith('deltas/site-a/'))).toBe(true);
+      expect(keys.some((key) => key.startsWith('deltas/site-b/'))).toBe(true);
+      expect(keys.some((key) => key.startsWith('deltas/site-c/'))).toBe(true);
 
       const downloadDir = join(tempRoot, 'downloads');
       await mkdir(downloadDir, { recursive: true });
 
-      for (const key of keys) {
+      const sampleKeys = keys.slice(0, Math.min(keys.length, 8));
+      for (const key of sampleKeys) {
         const object = await rawS3Client.send(
           new GetObjectCommand({
             Bucket: bucket,
@@ -157,10 +189,10 @@ describe('S3 ReplicatedLog with MinIO', () => {
         expect(decoded.siteId.startsWith('site-')).toBe(true);
         expect(decoded.seq).toBeGreaterThanOrEqual(1);
         expect(Array.isArray(decoded.ops)).toBe(true);
+        expect(decoded.ops.length).toBeGreaterThan(0);
       }
 
-      // Double-check one downloaded file is readable as bytes in harness output directory.
-      const samplePath = join(downloadDir, 'deltas__site-b__0000000001.delta.bin');
+      const samplePath = join(downloadDir, sampleKeys[0]!.replaceAll('/', '__'));
       const sampleBytes = await readFile(samplePath);
       expect(sampleBytes.length).toBeGreaterThan(0);
 
@@ -179,19 +211,13 @@ describe('S3 ReplicatedLog with MinIO', () => {
         snapshots,
       });
       expect(compaction.applied).toBe(true);
-      expect(compaction.opsRead).toBe(12);
-      expect(compaction.manifest.segments).toHaveLength(1);
-      expect(compaction.manifest.sites_compacted).toEqual({
-        'site-a': 1,
-        'site-b': 2,
-        'site-c': 1,
-      });
+      expect(compaction.opsRead).toBeGreaterThan(0);
+      expect(compaction.manifest.segments.length).toBeGreaterThan(0);
+      expect(compaction.manifest.sites_compacted['site-a']).toBe(await logA.getHead('site-a'));
+      expect(compaction.manifest.sites_compacted['site-b']).toBe(await logA.getHead('site-b'));
+      expect(compaction.manifest.sites_compacted['site-c']).toBe(await logA.getHead('site-c'));
 
-      const logD = new S3ReplicatedLog({
-        bucket,
-        prefix: 'deltas',
-        clientConfig: s3Config,
-      });
+      const logD = makeLog();
       const clientD = await NodeCrdtClient.open({
         siteId: 'site-d',
         log: logD,
@@ -200,7 +226,7 @@ describe('S3 ReplicatedLog with MinIO', () => {
         now: () => 4_000,
       });
       await clientD.pull();
-      const rowsD = await clientD.query(TASK_QUERY_SQL);
+      const rowsD = normalizeTaskRows(await clientD.query('SELECT * FROM tasks;'));
       expect(rowsD).toEqual(rowsA);
 
       const snapshotList = await rawS3Client.send(
@@ -214,11 +240,7 @@ describe('S3 ReplicatedLog with MinIO', () => {
         .sort();
       expect(snapshotKeys).toContain('snapshots/manifest.bin');
       expect(snapshotKeys).toContain('snapshots/schema.bin');
-      expect(
-        snapshotKeys.some((key) =>
-          key.startsWith('snapshots/segments/'),
-        ),
-      ).toBe(true);
+      expect(snapshotKeys.some((key) => key.startsWith('snapshots/segments/'))).toBe(true);
 
       const secondCompaction = await compactReplicatedLog({
         log: logA,

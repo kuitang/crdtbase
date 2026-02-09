@@ -35,6 +35,17 @@ type SyncFile = {
   syncedSeqBySite: Record<string, LogPosition>;
 };
 
+type SyncFileV2 = {
+  v: 2;
+  syncedBySite: Record<
+    string,
+    {
+      seq: LogPosition;
+      hlc: string | null;
+    }
+  >;
+};
+
 type PendingFile = {
   v: 1;
   pendingOps: EncodedCrdtOp[];
@@ -60,6 +71,7 @@ export type NodeCrdtClientOptions = {
 export class NodeCrdtClient {
   private readonly rows = new Map<string, RuntimeRowState>();
   private readonly syncedSeqBySite = new Map<string, LogPosition>();
+  private readonly syncedHlcBySite = new Map<string, string>();
   private pendingOps: EncodedCrdtOp[] = [];
   private lastLocalHlc: Hlc | null = null;
   private schema: SqlSchema = {};
@@ -156,6 +168,7 @@ export class NodeCrdtClient {
     });
     this.pendingOps = [];
     this.syncedSeqBySite.set(this.siteId, seq);
+    this.syncedHlcBySite.set(this.siteId, ops[ops.length - 1]!.hlc);
     await this.persistStateFiles();
   }
 
@@ -165,12 +178,43 @@ export class NodeCrdtClient {
     const sites = await this.log.listSites();
     for (const siteId of sites) {
       const since = this.syncedSeqBySite.get(siteId) ?? 0;
-      const entries = await this.log.readSince(siteId, since);
+      let entries;
+      if (since === 0) {
+        entries = await this.log.readSince(siteId, 0);
+      } else {
+        const remoteHead = await this.log.getHead(siteId);
+        if (remoteHead < since) {
+          throw new Error(
+            `local sync cursor for site '${siteId}' (${since}) is ahead of remote head (${remoteHead}); reset local data dir '${this.dataDir}' and retry`,
+          );
+        }
+
+        const probe = await this.log.readSince(siteId, since - 1);
+        const atCursor = probe[0];
+        if (!atCursor || atCursor.seq !== since) {
+          throw new Error(
+            `failed to validate sync cursor for site '${siteId}' at seq ${since}; remote history may be missing or rewritten; reset local data dir '${this.dataDir}' and retry`,
+          );
+        }
+
+        const expectedHlc = this.syncedHlcBySite.get(siteId);
+        if (expectedHlc !== undefined && atCursor.hlc !== expectedHlc) {
+          throw new Error(
+            `sync cursor mismatch for site '${siteId}' at seq ${since}; local hlc='${expectedHlc}' remote hlc='${atCursor.hlc}'. remote history was likely reset or rewritten; reset local data dir '${this.dataDir}' and retry`,
+          );
+        }
+        if (expectedHlc === undefined) {
+          this.syncedHlcBySite.set(siteId, atCursor.hlc);
+        }
+
+        entries = probe.slice(1);
+      }
       for (const entry of entries) {
         for (const op of entry.ops) {
           applyCrdtOpToRows(this.rows, op);
         }
         this.syncedSeqBySite.set(siteId, entry.seq);
+        this.syncedHlcBySite.set(siteId, entry.hlc);
       }
     }
     await this.persistStateFiles();
@@ -211,7 +255,7 @@ export class NodeCrdtClient {
       this.readOptionalFile<SqlSchema>(this.schemaPath, {}),
       this.readOptionalFile<StateFile>(this.statePath, { v: 1, rows: [], lastLocalHlc: null }),
       this.readOptionalFile<PendingFile>(this.pendingPath, { v: 1, pendingOps: [] }),
-      this.readOptionalFile<SyncFile>(this.syncPath, { v: 1, syncedSeqBySite: {} }),
+      this.readOptionalFile<SyncFile | SyncFileV2>(this.syncPath, { v: 2, syncedBySite: {} }),
       this.readOptionalFile<ManifestFile | null>(this.snapshotManifestPath, null),
     ]);
 
@@ -219,8 +263,18 @@ export class NodeCrdtClient {
     this.pendingOps = [...pending.pendingOps];
     this.lastLocalHlc = state.lastLocalHlc ? decodeHlcHex(state.lastLocalHlc) : null;
     this.syncedSeqBySite.clear();
-    for (const [site, seq] of Object.entries(sync.syncedSeqBySite)) {
-      this.syncedSeqBySite.set(site, seq);
+    this.syncedHlcBySite.clear();
+    if (sync.v === 1) {
+      for (const [site, seq] of Object.entries(sync.syncedSeqBySite)) {
+        this.syncedSeqBySite.set(site, seq);
+      }
+    } else {
+      for (const [site, cursor] of Object.entries(sync.syncedBySite)) {
+        this.syncedSeqBySite.set(site, cursor.seq);
+        if (cursor.hlc !== null) {
+          this.syncedHlcBySite.set(site, cursor.hlc);
+        }
+      }
     }
 
     this.rows.clear();
@@ -247,9 +301,17 @@ export class NodeCrdtClient {
       pendingOps: this.pendingOps,
     };
 
-    const syncFile: SyncFile = {
-      v: 1,
-      syncedSeqBySite: Object.fromEntries(this.syncedSeqBySite.entries()),
+    const syncFile: SyncFileV2 = {
+      v: 2,
+      syncedBySite: Object.fromEntries(
+        [...this.syncedSeqBySite.entries()].map(([siteId, seq]) => [
+          siteId,
+          {
+            seq,
+            hlc: this.syncedHlcBySite.get(siteId) ?? null,
+          },
+        ]),
+      ),
     };
 
     await Promise.all([
@@ -314,6 +376,7 @@ export class NodeCrdtClient {
     // Reset site cursors to compaction watermarks so uncompacted deltas are replayed exactly once.
     for (const [siteId, seq] of Object.entries(manifest.sites_compacted)) {
       this.syncedSeqBySite.set(siteId, seq);
+      this.syncedHlcBySite.delete(siteId);
     }
 
     await writeFile(this.snapshotManifestPath, encodeBin(manifest));
