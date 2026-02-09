@@ -6,6 +6,10 @@ import { promisify } from 'node:util';
 import { GetObjectCommand, ListObjectsV2Command, S3Client } from '@aws-sdk/client-s3';
 import { afterEach, describe, expect, it } from 'vitest';
 import { S3ReplicatedLog } from '../../src/backend/s3ReplicatedLog';
+import { TigrisSnapshotStore } from '../../src/backend/tigrisSnapshotStore';
+import { decodeBin } from '../../src/core/encoding';
+import { SqlSchema } from '../../src/core/sql';
+import { compactReplicatedLog } from '../../src/platform/node/compactor';
 import { NodeCrdtClient } from '../../src/platform/node/nodeClient';
 import { MinioHarness } from './minioHarness';
 
@@ -48,6 +52,10 @@ describe('S3 ReplicatedLog with MinIO', () => {
 
       const s3Config = minio.getS3ClientConfig();
       const bucket = minio.getBucket();
+      const clientADir = join(tempRoot, 'client-a');
+      const clientBDir = join(tempRoot, 'client-b');
+      const clientCDir = join(tempRoot, 'client-c');
+      const clientDDir = join(tempRoot, 'client-d');
 
       const logA = new S3ReplicatedLog({
         bucket,
@@ -68,19 +76,19 @@ describe('S3 ReplicatedLog with MinIO', () => {
       const clientA = await NodeCrdtClient.open({
         siteId: 'site-a',
         log: logA,
-        dataDir: join(tempRoot, 'client-a'),
+        dataDir: clientADir,
         now: () => 1_000,
       });
       const clientB = await NodeCrdtClient.open({
         siteId: 'site-b',
         log: logB,
-        dataDir: join(tempRoot, 'client-b'),
+        dataDir: clientBDir,
         now: () => 2_000,
       });
       const clientC = await NodeCrdtClient.open({
         siteId: 'site-c',
         log: logC,
-        dataDir: join(tempRoot, 'client-c'),
+        dataDir: clientCDir,
         now: () => 3_000,
       });
 
@@ -190,6 +198,71 @@ describe('S3 ReplicatedLog with MinIO', () => {
       const samplePath = join(downloadDir, 'deltas__site-b__0000000001.delta.bin');
       const sampleBytes = await readFile(samplePath);
       expect(sampleBytes.length).toBeGreaterThan(0);
+
+      const snapshots = new TigrisSnapshotStore({
+        bucket,
+        prefix: 'snapshots',
+        clientConfig: s3Config,
+      });
+      const schemaBytes = await readFile(join(clientADir, 'schema.bin'));
+      const schema = decodeBin<SqlSchema>(schemaBytes);
+      await snapshots.putSchema(schema);
+
+      const compaction = await compactReplicatedLog({
+        log: logA,
+        schema,
+        snapshots,
+      });
+      expect(compaction.applied).toBe(true);
+      expect(compaction.opsRead).toBe(12);
+      expect(compaction.manifest.segments).toHaveLength(1);
+      expect(compaction.manifest.sites_compacted).toEqual({
+        'site-a': 1,
+        'site-b': 2,
+        'site-c': 1,
+      });
+
+      const logD = new S3ReplicatedLog({
+        bucket,
+        prefix: 'deltas',
+        clientConfig: s3Config,
+      });
+      const clientD = await NodeCrdtClient.open({
+        siteId: 'site-d',
+        log: logD,
+        dataDir: clientDDir,
+        snapshots,
+        now: () => 4_000,
+      });
+      await clientD.pull();
+      const rowsD = await clientD.query(querySql);
+      expect(rowsD).toEqual(rowsA);
+
+      const snapshotList = await rawS3Client.send(
+        new ListObjectsV2Command({
+          Bucket: bucket,
+          Prefix: 'snapshots/',
+        }),
+      );
+      const snapshotKeys = (snapshotList.Contents ?? [])
+        .flatMap((item) => (item.Key ? [item.Key] : []))
+        .sort();
+      expect(snapshotKeys).toContain('snapshots/manifest.bin');
+      expect(snapshotKeys).toContain('snapshots/schema.bin');
+      expect(
+        snapshotKeys.some((key) =>
+          key.startsWith('snapshots/segments/'),
+        ),
+      ).toBe(true);
+
+      const secondCompaction = await compactReplicatedLog({
+        log: logA,
+        schema,
+        snapshots,
+      });
+      expect(secondCompaction.applied).toBe(true);
+      expect(secondCompaction.opsRead).toBe(0);
+      expect(secondCompaction.manifest.sites_compacted).toEqual(compaction.manifest.sites_compacted);
     },
     120_000,
   );

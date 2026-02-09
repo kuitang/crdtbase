@@ -1,5 +1,5 @@
 import { execFile as execFileWithCallback } from 'node:child_process';
-import { mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -8,7 +8,8 @@ import { FileReplicatedLogServer } from '../../src/backend/fileLogServer';
 import { decodeBin } from '../../src/core/encoding';
 import { SqlSchema } from '../../src/core/sql';
 import { HttpReplicatedLog } from '../../src/platform/node/httpReplicatedLog';
-import { compactReplicatedLogToFs } from '../../src/platform/node/compactor';
+import { compactReplicatedLog } from '../../src/platform/node/compactor';
+import { HttpSnapshotStore } from '../../src/platform/node/httpSnapshotStore';
 import { NodeCrdtClient } from '../../src/platform/node/nodeClient';
 
 const execFile = promisify(execFileWithCallback);
@@ -34,6 +35,7 @@ describe('Filesystem SQL end-to-end sync', () => {
     const clientADir = join(tempRoot, 'client-a');
     const clientBDir = join(tempRoot, 'client-b');
     const clientCDir = join(tempRoot, 'client-c');
+    const clientDDir = join(tempRoot, 'client-d');
 
     server = new FileReplicatedLogServer(serverDir);
     const baseUrl = await server.start();
@@ -149,11 +151,11 @@ describe('Filesystem SQL end-to-end sync', () => {
 
     const schemaBytes = await readFile(join(clientADir, 'schema.bin'));
     const schema = decodeBin<SqlSchema>(schemaBytes);
-    const snapshotsDir = join(serverDir, 'snapshots');
-    const compaction = await compactReplicatedLogToFs({
+    const snapshots = new HttpSnapshotStore(baseUrl);
+    const compaction = await compactReplicatedLog({
       log: logA,
       schema,
-      outputDir: snapshotsDir,
+      snapshots,
     });
 
     expect(compaction.applied).toBe(true);
@@ -165,6 +167,7 @@ describe('Filesystem SQL end-to-end sync', () => {
     });
     expect(compaction.manifest.segments).toHaveLength(1);
 
+    const snapshotsDir = join(serverDir, 'snapshots');
     const manifestPath = join(snapshotsDir, 'manifest.bin');
     const { stdout: manifestStdout } = await execFile('node', ['cli.mjs', 'dump', manifestPath], {
       cwd: process.cwd(),
@@ -222,10 +225,25 @@ describe('Filesystem SQL end-to-end sync', () => {
       'review',
     ]);
 
-    const secondCompaction = await compactReplicatedLogToFs({
+    await mkdir(clientDDir, { recursive: true });
+    await writeFile(join(clientDDir, 'schema.bin'), schemaBytes);
+    const clientD = await NodeCrdtClient.open({
+      siteId: 'site-d',
+      log: new HttpReplicatedLog(baseUrl),
+      dataDir: clientDDir,
+      snapshots,
+      now: () => 4_000,
+    });
+    await clientD.pull();
+    const rowsD = await clientD.query(querySql);
+    expect(rowsD).toEqual(rowsA);
+    await stat(join(clientDDir, 'snapshots', 'manifest.bin'));
+    await stat(join(clientDDir, 'snapshots', manifestDump.segments[0]!.path));
+
+    const secondCompaction = await compactReplicatedLog({
       log: logA,
       schema,
-      outputDir: snapshotsDir,
+      snapshots,
     });
     expect(secondCompaction.applied).toBe(true);
     expect(secondCompaction.opsRead).toBe(0);

@@ -1,9 +1,11 @@
 import { createServer, IncomingMessage, Server, ServerResponse } from 'node:http';
+import { dirname, join } from 'node:path';
 import { mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
 import { AddressInfo } from 'node:net';
+import { ManifestFile } from '../core/compaction';
 import { decodeBin, encodeBin } from '../core/encoding';
 import { AppendLogEntry, LogEntry, LogPosition } from '../core/replication';
+import { assertManifestPublishable, assertSafeSnapshotRelativePath } from '../core/snapshotStore';
 
 type JsonRecord = Record<string, unknown>;
 
@@ -15,6 +17,17 @@ function writeJson(response: ServerResponse, statusCode: number, body: JsonRecor
 
 function writeError(response: ServerResponse, statusCode: number, message: string): void {
   writeJson(response, statusCode, { error: message });
+}
+
+function writeBytes(
+  response: ServerResponse,
+  statusCode: number,
+  bytes: Uint8Array,
+  contentType = 'application/octet-stream',
+): void {
+  response.statusCode = statusCode;
+  response.setHeader('content-type', contentType);
+  response.end(bytes);
 }
 
 async function readJsonBody<T>(request: IncomingMessage): Promise<T> {
@@ -29,6 +42,17 @@ async function readJsonBody<T>(request: IncomingMessage): Promise<T> {
   return JSON.parse(raw) as T;
 }
 
+async function readRawBody(request: IncomingMessage): Promise<Uint8Array> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of request) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  if (chunks.length === 0) {
+    throw new Error('request body is required');
+  }
+  return Buffer.concat(chunks);
+}
+
 function parseSince(raw: string | null): number {
   if (raw === null) {
     return 0;
@@ -36,6 +60,17 @@ function parseSince(raw: string | null): number {
   const value = Number(raw);
   if (!Number.isInteger(value) || value < 0) {
     throw new Error(`invalid 'since' value '${raw}'`);
+  }
+  return value;
+}
+
+function parseExpectedVersion(raw: string | null): number {
+  if (raw === null) {
+    throw new Error("missing 'expect_version' query parameter");
+  }
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`invalid 'expect_version' value '${raw}'`);
   }
   return value;
 }
@@ -64,9 +99,15 @@ export class FileReplicatedLogServer {
   private server: Server | null = null;
   private baseUrl: string | null = null;
   private readonly logsDir: string;
+  private readonly snapshotsDir: string;
+  private readonly manifestPath: string;
+  private readonly schemaPath: string;
 
   constructor(private readonly rootDir: string) {
     this.logsDir = join(rootDir, 'logs');
+    this.snapshotsDir = join(rootDir, 'snapshots');
+    this.manifestPath = join(this.snapshotsDir, 'manifest.bin');
+    this.schemaPath = join(this.snapshotsDir, 'schema.bin');
   }
 
   async start(port = 0, host = '127.0.0.1'): Promise<string> {
@@ -76,6 +117,7 @@ export class FileReplicatedLogServer {
 
     await rm(this.rootDir, { recursive: true, force: true });
     await mkdir(this.logsDir, { recursive: true });
+    await mkdir(this.snapshotsDir, { recursive: true });
 
     const server = createServer((request, response) => {
       void this.handleRequest(request, response);
@@ -145,6 +187,40 @@ export class FileReplicatedLogServer {
         return;
       }
 
+      if (parts.length === 1 && parts[0] === 'manifest') {
+        if (method === 'GET') {
+          await this.handleGetManifest(response);
+          return;
+        }
+        if (method === 'PUT') {
+          await this.handlePutManifest(request, url, response);
+          return;
+        }
+      }
+
+      if (parts.length === 1 && parts[0] === 'schema') {
+        if (method === 'GET') {
+          await this.handleGetSchema(response);
+          return;
+        }
+        if (method === 'PUT') {
+          await this.handlePutSchema(request, response);
+          return;
+        }
+      }
+
+      if (parts[0] === 'segments' && parts.length >= 2) {
+        const segmentPath = parts.slice(1).join('/');
+        if (method === 'GET') {
+          await this.handleGetSegment(segmentPath, response);
+          return;
+        }
+        if (method === 'PUT') {
+          await this.handlePutSegment(segmentPath, request, response);
+          return;
+        }
+      }
+
       if (parts[0] !== 'logs') {
         writeError(response, 404, 'not found');
         return;
@@ -212,6 +288,83 @@ export class FileReplicatedLogServer {
   private async handleHead(siteId: string, response: ServerResponse): Promise<void> {
     const seq: LogPosition = await this.readHeadFromDisk(siteId);
     writeJson(response, 200, { seq });
+  }
+
+  private async handleGetManifest(response: ServerResponse): Promise<void> {
+    const bytes = await this.readOptionalBytes(this.manifestPath);
+    if (bytes === null) {
+      writeError(response, 404, 'manifest not found');
+      return;
+    }
+    writeBytes(response, 200, bytes);
+  }
+
+  private async handlePutManifest(
+    request: IncomingMessage,
+    url: URL,
+    response: ServerResponse,
+  ): Promise<void> {
+    const expectedVersion = parseExpectedVersion(url.searchParams.get('expect_version'));
+    const bytes = await readRawBody(request);
+    const manifest = decodeBin<ManifestFile>(bytes);
+    assertManifestPublishable(manifest, expectedVersion);
+
+    const currentManifest = await this.readOptionalManifestFromDisk();
+    const currentVersion = currentManifest?.version ?? 0;
+    if (currentVersion !== expectedVersion) {
+      writeError(response, 412, 'manifest version mismatch');
+      return;
+    }
+
+    // Re-check immediately before write for best-effort CAS safety.
+    const latestManifest = await this.readOptionalManifestFromDisk();
+    const latestVersion = latestManifest?.version ?? 0;
+    if (latestVersion !== expectedVersion) {
+      writeError(response, 412, 'manifest version mismatch');
+      return;
+    }
+
+    await this.writeBytes(this.manifestPath, bytes);
+    writeJson(response, 200, { ok: true });
+  }
+
+  private async handleGetSchema(response: ServerResponse): Promise<void> {
+    const bytes = await this.readOptionalBytes(this.schemaPath);
+    if (bytes === null) {
+      writeError(response, 404, 'schema not found');
+      return;
+    }
+    writeBytes(response, 200, bytes);
+  }
+
+  private async handlePutSchema(
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    const bytes = await readRawBody(request);
+    await this.writeBytes(this.schemaPath, bytes);
+    writeJson(response, 200, { ok: true });
+  }
+
+  private async handleGetSegment(path: string, response: ServerResponse): Promise<void> {
+    const absolutePath = this.resolveSnapshotPath(path);
+    const bytes = await this.readOptionalBytes(absolutePath);
+    if (bytes === null) {
+      writeError(response, 404, 'segment not found');
+      return;
+    }
+    writeBytes(response, 200, bytes);
+  }
+
+  private async handlePutSegment(
+    path: string,
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    const absolutePath = this.resolveSnapshotPath(path);
+    const bytes = await readRawBody(request);
+    await this.writeBytes(absolutePath, bytes);
+    writeJson(response, 200, { ok: true });
   }
 
   private siteDir(siteId: string): string {
@@ -290,5 +443,34 @@ export class FileReplicatedLogServer {
       }
     }
     return sites.sort();
+  }
+
+  private resolveSnapshotPath(path: string): string {
+    assertSafeSnapshotRelativePath(path, 'segment path');
+    return join(this.snapshotsDir, path);
+  }
+
+  private async readOptionalBytes(path: string): Promise<Uint8Array | null> {
+    try {
+      return await readFile(path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  private async writeBytes(path: string, bytes: Uint8Array): Promise<void> {
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, bytes);
+  }
+
+  private async readOptionalManifestFromDisk(): Promise<ManifestFile | null> {
+    const bytes = await this.readOptionalBytes(this.manifestPath);
+    if (bytes === null) {
+      return null;
+    }
+    return decodeBin<ManifestFile>(bytes);
   }
 }

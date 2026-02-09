@@ -1,5 +1,3 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
 import {
   ManifestFile,
   ManifestSegmentRef,
@@ -14,32 +12,20 @@ import {
 } from '../../core/compaction';
 import { decodeBin, encodeBin } from '../../core/encoding';
 import { LogPosition, ReplicatedLog } from '../../core/replication';
+import { SnapshotStore } from '../../core/snapshotStore';
 import { SqlSchema } from '../../core/sql';
 import { RuntimeRowState } from '../../core/sqlEval';
 
-function isEnoent(error: unknown): boolean {
-  return (error as { code?: string }).code === 'ENOENT';
-}
-
-async function readOptionalManifest(path: string): Promise<ManifestFile | null> {
-  try {
-    const bytes = await readFile(path);
-    return decodeBin<ManifestFile>(bytes);
-  } catch (error) {
-    if (isEnoent(error)) {
-      return null;
-    }
-    throw error;
-  }
-}
-
 async function loadRowsFromManifest(
-  outputDir: string,
+  snapshots: SnapshotStore,
   manifest: ManifestFile,
 ): Promise<Map<string, RuntimeRowState>> {
   const rows = new Map<string, RuntimeRowState>();
   for (const segmentRef of manifest.segments) {
-    const bytes = await readFile(join(outputDir, segmentRef.path));
+    const bytes = await snapshots.getSegment(segmentRef.path);
+    if (bytes === null) {
+      throw new Error(`missing segment referenced by manifest: ${segmentRef.path}`);
+    }
     const segment = decodeBin<SegmentFile>(bytes);
     const loaded = segmentFileToRuntimeRows(segment);
     mergeRuntimeRowMaps(rows, loaded);
@@ -54,11 +40,10 @@ function normalizeSeq(value: LogPosition): number {
   return value;
 }
 
-export type NodeCompactorOptions = {
+export type SnapshotCompactorOptions = {
   log: ReplicatedLog;
-  schema: SqlSchema;
-  outputDir: string;
-  manifestPath?: string;
+  snapshots: SnapshotStore;
+  schema?: SqlSchema;
 };
 
 export type NodeCompactionResult = {
@@ -68,15 +53,16 @@ export type NodeCompactionResult = {
   opsRead: number;
 };
 
-export async function compactReplicatedLogToFs(
-  options: NodeCompactorOptions,
+export async function compactReplicatedLog(
+  options: SnapshotCompactorOptions,
 ): Promise<NodeCompactionResult> {
-  const outputDir = options.outputDir;
-  const manifestPath = options.manifestPath ?? join(outputDir, 'manifest.bin');
-  await mkdir(outputDir, { recursive: true });
+  const schema = options.schema ?? (await options.snapshots.getSchema());
+  if (!schema) {
+    throw new Error('compaction requires schema: provide options.schema or snapshots.getSchema()');
+  }
 
-  const priorManifest = (await readOptionalManifest(manifestPath)) ?? makeEmptyManifest();
-  const rows = await loadRowsFromManifest(outputDir, priorManifest);
+  const priorManifest = (await options.snapshots.getManifest()) ?? makeEmptyManifest();
+  const rows = await loadRowsFromManifest(options.snapshots, priorManifest);
   const sitesCompacted: Record<string, number> = { ...priorManifest.sites_compacted };
 
   let compactionHlc = priorManifest.compaction_hlc;
@@ -102,7 +88,7 @@ export async function compactReplicatedLogToFs(
   }
 
   const builtSegments = buildSegmentsFromRows({
-    schema: options.schema,
+    schema,
     rows,
     defaultHlcMax: compactionHlc,
   });
@@ -110,10 +96,8 @@ export async function compactReplicatedLogToFs(
   const manifestSegments: ManifestSegmentRef[] = [];
   const writtenSegments: string[] = [];
   for (const built of builtSegments) {
-    const segmentPath = join(outputDir, built.path);
-    await mkdir(dirname(segmentPath), { recursive: true });
     const bytes = encodeBin(built.segment);
-    await writeFile(segmentPath, bytes);
+    await options.snapshots.putSegment(built.path, bytes);
     manifestSegments.push(buildManifestSegmentRef(built.path, built.segment, bytes.byteLength));
     writtenSegments.push(built.path);
   }
@@ -126,9 +110,9 @@ export async function compactReplicatedLogToFs(
     sites_compacted: sitesCompacted,
   };
 
-  // File-based CAS: if version changed between read and write, skip publishing.
-  const latestManifest = (await readOptionalManifest(manifestPath)) ?? makeEmptyManifest();
-  if (latestManifest.version !== priorManifest.version) {
+  const applied = await options.snapshots.putManifest(nextManifest, priorManifest.version);
+  if (!applied) {
+    const latestManifest = (await options.snapshots.getManifest()) ?? makeEmptyManifest();
     return {
       applied: false,
       manifest: latestManifest,
@@ -137,8 +121,6 @@ export async function compactReplicatedLogToFs(
     };
   }
 
-  await mkdir(dirname(manifestPath), { recursive: true });
-  await writeFile(manifestPath, encodeBin(nextManifest));
   return {
     applied: true,
     manifest: nextManifest,

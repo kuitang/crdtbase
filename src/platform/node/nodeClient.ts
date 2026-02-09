@@ -1,8 +1,10 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { ManifestFile, SegmentFile, mergeRuntimeRowMaps, segmentFileToRuntimeRows } from '../../core/compaction';
 import { decodeBin, encodeBin } from '../../core/encoding';
 import { HLC_LIMITS, Hlc } from '../../core/hlc';
 import { LogPosition, ReplicatedLog } from '../../core/replication';
+import { SnapshotStore, assertSafeSnapshotRelativePath } from '../../core/snapshotStore';
 import {
   EncodedCrdtOp,
   SqlExecutionPlan,
@@ -51,6 +53,7 @@ export type NodeCrdtClientOptions = {
   siteId: string;
   log: ReplicatedLog;
   dataDir: string;
+  snapshots?: SnapshotStore;
   now?: () => number;
 };
 
@@ -62,28 +65,42 @@ export class NodeCrdtClient {
   private schema: SqlSchema = {};
   private readonly ready: Promise<void>;
   private readonly now: () => number;
+  private readonly snapshots: SnapshotStore | null;
+  private localSnapshotManifestVersion = 0;
 
   private readonly schemaPath: string;
   private readonly statePath: string;
   private readonly pendingPath: string;
   private readonly syncPath: string;
+  private readonly snapshotRootDir: string;
+  private readonly snapshotManifestPath: string;
 
   constructor(
     public readonly siteId: string,
     private readonly log: ReplicatedLog,
     private readonly dataDir: string,
+    snapshots?: SnapshotStore,
     now?: () => number,
   ) {
     this.now = now ?? (() => Date.now());
+    this.snapshots = snapshots ?? null;
     this.schemaPath = join(this.dataDir, 'schema.bin');
     this.statePath = join(this.dataDir, 'state.bin');
     this.pendingPath = join(this.dataDir, 'pending.bin');
     this.syncPath = join(this.dataDir, 'sync.bin');
+    this.snapshotRootDir = join(this.dataDir, 'snapshots');
+    this.snapshotManifestPath = join(this.snapshotRootDir, 'manifest.bin');
     this.ready = this.loadFromDisk();
   }
 
   static async open(options: NodeCrdtClientOptions): Promise<NodeCrdtClient> {
-    const client = new NodeCrdtClient(options.siteId, options.log, options.dataDir, options.now);
+    const client = new NodeCrdtClient(
+      options.siteId,
+      options.log,
+      options.dataDir,
+      options.snapshots,
+      options.now,
+    );
     await client.waitReady();
     return client;
   }
@@ -144,6 +161,7 @@ export class NodeCrdtClient {
 
   async pull(): Promise<void> {
     await this.waitReady();
+    await this.refreshFromSnapshotManifest();
     const sites = await this.log.listSites();
     for (const siteId of sites) {
       const since = this.syncedSeqBySite.get(siteId) ?? 0;
@@ -189,11 +207,12 @@ export class NodeCrdtClient {
 
   private async loadFromDisk(): Promise<void> {
     await mkdir(this.dataDir, { recursive: true });
-    const [schema, state, pending, sync] = await Promise.all([
+    const [schema, state, pending, sync, localManifest] = await Promise.all([
       this.readOptionalFile<SqlSchema>(this.schemaPath, {}),
       this.readOptionalFile<StateFile>(this.statePath, { v: 1, rows: [], lastLocalHlc: null }),
       this.readOptionalFile<PendingFile>(this.pendingPath, { v: 1, pendingOps: [] }),
       this.readOptionalFile<SyncFile>(this.syncPath, { v: 1, syncedSeqBySite: {} }),
+      this.readOptionalFile<ManifestFile | null>(this.snapshotManifestPath, null),
     ]);
 
     this.schema = schema;
@@ -208,6 +227,8 @@ export class NodeCrdtClient {
     for (const [key, row] of evalRowsToRuntime(state.rows).entries()) {
       this.rows.set(key, row);
     }
+
+    this.localSnapshotManifestVersion = localManifest?.version ?? 0;
   }
 
   private async persistSchema(): Promise<void> {
@@ -249,5 +270,73 @@ export class NodeCrdtClient {
       }
       throw error;
     }
+  }
+
+  private async refreshFromSnapshotManifest(): Promise<void> {
+    if (!this.snapshots) {
+      return;
+    }
+    await this.hydrateSchemaFromSnapshotsIfMissing();
+    const manifest = await this.snapshots.getManifest();
+    if (manifest === null || manifest.version <= this.localSnapshotManifestVersion) {
+      return;
+    }
+
+    const rows = new Map<string, RuntimeRowState>();
+    await mkdir(this.snapshotRootDir, { recursive: true });
+
+    for (const segmentRef of manifest.segments) {
+      assertSafeSnapshotRelativePath(segmentRef.path, 'segment path');
+      const bytes = await this.snapshots.getSegment(segmentRef.path);
+      if (bytes === null) {
+        throw new Error(`manifest references missing segment: ${segmentRef.path}`);
+      }
+
+      const cachePath = this.resolveSnapshotSegmentCachePath(segmentRef.path);
+      await mkdir(dirname(cachePath), { recursive: true });
+      await writeFile(cachePath, bytes);
+
+      const segment = decodeBin<SegmentFile>(bytes);
+      const loaded = segmentFileToRuntimeRows(segment);
+      mergeRuntimeRowMaps(rows, loaded);
+    }
+
+    // Preserve read-your-writes for local unpushed operations across segment reload.
+    for (const pending of this.pendingOps) {
+      applyCrdtOpToRows(rows, pending);
+    }
+
+    this.rows.clear();
+    for (const [key, row] of rows.entries()) {
+      this.rows.set(key, row);
+    }
+
+    // Reset site cursors to compaction watermarks so uncompacted deltas are replayed exactly once.
+    for (const [siteId, seq] of Object.entries(manifest.sites_compacted)) {
+      this.syncedSeqBySite.set(siteId, seq);
+    }
+
+    await writeFile(this.snapshotManifestPath, encodeBin(manifest));
+    this.localSnapshotManifestVersion = manifest.version;
+  }
+
+  private async hydrateSchemaFromSnapshotsIfMissing(): Promise<void> {
+    if (!this.snapshots) {
+      return;
+    }
+    if (Object.keys(this.schema).length > 0) {
+      return;
+    }
+    const snapshotSchema = await this.snapshots.getSchema();
+    if (snapshotSchema === null) {
+      return;
+    }
+    this.schema = snapshotSchema;
+    await this.persistSchema();
+  }
+
+  private resolveSnapshotSegmentCachePath(segmentPath: string): string {
+    assertSafeSnapshotRelativePath(segmentPath, 'segment path');
+    return join(this.snapshotRootDir, segmentPath);
   }
 }
