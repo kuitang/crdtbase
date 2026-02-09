@@ -16,8 +16,7 @@ theorem lww_equal_key_implies_equal_payload {α : Type} (a b : LwwRegister α)
     (hCons : LwwConsistentPair a b)
     (hEq : Hlc.compareWithSite (a.hlc, a.site) (b.hlc, b.site) = .eq) :
     a.val = b.val := by
-  have hStateEq : a = b := hCons hEq
-  simp [hStateEq]
+  simp [hCons hEq]
 
 /-- Conflicting payloads on the same `(hlc, site)` violate LWW event-consistency. -/
 theorem dedup_rejects_conflicting_same_key {α : Type} (a b : LwwRegister α)
@@ -25,9 +24,7 @@ theorem dedup_rejects_conflicting_same_key {α : Type} (a b : LwwRegister α)
     (hValNe : a.val ≠ b.val) :
     ¬ LwwConsistentPair a b := by
   intro hCons
-  have hStateEq : a = b := hCons hEq
-  apply hValNe
-  simp [hStateEq]
+  exact hValNe (by simp [hCons hEq])
 
 /-- LWW merge is commutative under event-consistency. -/
 theorem lww_merge_comm_of_consistent {α : Type} (a b : LwwRegister α)
@@ -96,7 +93,7 @@ theorem lww_merge_comm_global_of_consistent {α : Type}
     (hCons : ∀ a b : LwwRegister α, LwwConsistentPair a b) :
     ∀ a b : LwwRegister α, LwwRegister.merge a b = LwwRegister.merge b a := by
   intro a b
-  exact lww_merge_comm_of_consistent a b (hCons a b)
+  simpa using lww_merge_comm_of_consistent a b (hCons a b)
 
 /-- Globalized associativity under pairwise event-consistency. -/
 theorem lww_merge_assoc_global_of_consistent {α : Type}
@@ -105,7 +102,7 @@ theorem lww_merge_assoc_global_of_consistent {α : Type}
       LwwRegister.merge (LwwRegister.merge a b) c =
         LwwRegister.merge a (LwwRegister.merge b c) := by
   intro a b c
-  exact lww_merge_assoc_of_consistent a b c
+  simpa using lww_merge_assoc_of_consistent a b c
     (hCons a b) (hCons b c)
 
 end CrdtBase

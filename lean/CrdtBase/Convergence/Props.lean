@@ -22,7 +22,7 @@ theorem convergence_of_same_ops {σ α : Type}
     (step : σ → α → σ) [RightCommutative step]
     (init : σ) {ops₁ ops₂ : List α} (hSame : SameOps ops₁ ops₂) :
     applyOps step init ops₁ = applyOps step init ops₂ := by
-  exact convergence_of_perm step init hSame.perm
+  simpa using convergence_of_perm step init hSame.perm
 
 /-- Convergence for binary merges once global commutativity and associativity hold. -/
 theorem convergence_of_comm_assoc {α : Type}
@@ -102,7 +102,7 @@ theorem convergence_lww
       LwwRegister.merge (LwwRegister.merge a b) c =
         LwwRegister.merge a (LwwRegister.merge b c)) :
     applyOps LwwRegister.merge init ops₁ = applyOps LwwRegister.merge init ops₂ := by
-  exact convergence_of_comm_assoc LwwRegister.merge hComm hAssoc init hPerm
+  simpa using convergence_of_comm_assoc LwwRegister.merge hComm hAssoc init hPerm
 
 /-- LWW convergence under global event-consistency. -/
 theorem convergence_lww_of_consistent
@@ -127,7 +127,7 @@ theorem convergence_pn_counter
     (init : PnCounter) {ops₁ ops₂ : List PnCounter}
     (hPerm : List.Perm ops₁ ops₂) :
     applyOps PnCounter.merge init ops₁ = applyOps PnCounter.merge init ops₂ := by
-  exact convergence_of_perm PnCounter.merge init hPerm
+  simpa using convergence_of_perm PnCounter.merge init hPerm
 
 section OrSet
 
@@ -145,7 +145,7 @@ theorem convergence_or_set
     (hPerm : List.Perm ops₁ ops₂) :
     applyOps (OrSet.merge (α := α) (Hlc := Hlc)) init ops₁ =
       applyOps (OrSet.merge (α := α) (Hlc := Hlc)) init ops₂ := by
-  exact convergence_of_perm (OrSet.merge (α := α) (Hlc := Hlc)) init hPerm
+  simpa using convergence_of_perm (OrSet.merge (α := α) (Hlc := Hlc)) init hPerm
 
 end OrSet
 
@@ -165,7 +165,7 @@ theorem convergence_mv_register
     (hPerm : List.Perm ops₁ ops₂) :
     applyOps (MvRegister.merge (α := α)) init ops₁ =
       applyOps (MvRegister.merge (α := α)) init ops₂ := by
-  exact convergence_of_perm (MvRegister.merge (α := α)) init hPerm
+  simpa using convergence_of_perm (MvRegister.merge (α := α)) init hPerm
 
 end MvRegister
 

@@ -34,19 +34,15 @@ theorem now_some_bounds
 
 /-- max3 dominates each of its arguments. -/
 theorem max3_ge_left (a b c : Nat) : a ≤ Hlc.max3 a b c := by
-  simp [Hlc.max3, Nat.le_max_left]
+  exact Nat.le_max_left a (max b c)
 
 /-- max3 dominates each of its arguments (middle). -/
 theorem max3_ge_mid (a b c : Nat) : b ≤ Hlc.max3 a b c := by
-  have hbc : b ≤ max b c := Nat.le_max_left b c
-  have habc : max b c ≤ max a (max b c) := Nat.le_max_right a (max b c)
-  exact Nat.le_trans hbc habc
+  exact Nat.le_trans (Nat.le_max_left b c) (Nat.le_max_right a (max b c))
 
 /-- max3 dominates each of its arguments (right). -/
 theorem max3_ge_right (a b c : Nat) : c ≤ Hlc.max3 a b c := by
-  have hbc : c ≤ max b c := Nat.le_max_right b c
-  have habc : max b c ≤ max a (max b c) := Nat.le_max_right a (max b c)
-  exact Nat.le_trans hbc habc
+  exact Nat.le_trans (Nat.le_max_right b c) (Nat.le_max_right a (max b c))
 
 /-- If recv succeeds, the resulting wallMs is at least every input clock. -/
 theorem recv_wallMs_monotonic
@@ -87,12 +83,7 @@ theorem recv_wallMs_monotonic
 /-- Packed HLC values are totally ordered by `<`. -/
 theorem hlc_total_order (a b : Hlc) :
     a.pack < b.pack ∨ a.pack = b.pack ∨ b.pack < a.pack := by
-  have h : a.pack < b.pack ∨ b.pack ≤ a.pack := Nat.lt_or_ge a.pack b.pack
-  rcases h with hLt | hGe
-  · exact Or.inl hLt
-  · rcases Nat.eq_or_lt_of_le hGe with hEq | hGt
-    · exact Or.inr (Or.inl hEq.symm)
-    · exact Or.inr (Or.inr hGt)
+  exact Nat.lt_trichotomy a.pack b.pack
 
 /-- Higher wall-clock component always yields a larger packed HLC. -/
 theorem hlc_pack_preserves_order
@@ -140,10 +131,7 @@ theorem hlc_site_tiebreak_total (a b : Hlc × String) :
 /-- Self-comparison for `(hlc, site)` is reflexive. -/
 theorem compareWithSite_self_eq (a : Hlc × String) :
     Hlc.compareWithSite a a = .eq := by
-  rcases a with ⟨h, site⟩
-  have hPack : ¬ h.pack < h.pack := Nat.lt_irrefl h.pack
-  have hSite : ¬ site < site := String.lt_irrefl site
-  simp [Hlc.compareWithSite, hPack, hSite]
+  simp [Hlc.compareWithSite]
 
 private def siteLexLt (a b : Hlc × String) : Prop :=
   a.1.pack < b.1.pack ∨ (a.1.pack = b.1.pack ∧ a.2 < b.2)
