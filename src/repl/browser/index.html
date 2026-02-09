@@ -32,7 +32,7 @@
         <div id="http-fields" class="grid">
           <label class="wide">
             HTTP Base URL
-            <input id="http-base-url" value="http://127.0.0.1:8788" />
+            <input id="http-base-url" value="http://0.0.0.0:8788" />
           </label>
         </div>
 
@@ -46,7 +46,7 @@
             >{
   "bucket": "crdtbase",
   "prefix": "deltas",
-  "endpoint": "http://127.0.0.1:9000",
+  "endpoint": "http://0.0.0.0:9000",
   "region": "us-east-1",
   "accessKeyId": "minioadmin",
   "secretAccessKey": "minioadmin",
@@ -54,8 +54,9 @@
 }</textarea>
           </label>
           <p class="wide">
-            Accepts either JSON object or loose KEY=value tokens (whitespace-separated). Example:
-            <code>bucket=crdtbase endpoint=http://127.0.0.1:9000 accessKeyId=minioadmin secretAccessKey=minioadmin forcePathStyle=true</code>
+            Accepts either JSON object or loose KEY=value tokens (whitespace-separated). Unknown keys are ignored.
+            Example:
+            <code>BUCKET_NAME=crdtbase AWS_ENDPOINT_URL_S3=http://0.0.0.0:9000 AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin AWS_REGION=us-east-1</code>
           </p>
         </div>
 

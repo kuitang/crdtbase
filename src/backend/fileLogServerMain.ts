@@ -14,20 +14,20 @@ function printUsage(): void {
       '',
       'Options:',
       '  --root-dir <path>   (default: ./.crdtbase-http-server)',
-      '  --host <host>       (default: 127.0.0.1)',
+      '  --host <host>       (default: 0.0.0.0)',
       '  --port <port>       (default: 8788)',
       '',
       'Environment:',
-      '  CRDTBASE_HTTP_ROOT_DIR, CRDTBASE_HTTP_HOST, CRDTBASE_HTTP_PORT',
+      '  HTTP_ROOT_DIR, HTTP_HOST, HTTP_PORT',
     ].join('\n') + '\n',
   );
 }
 
 function parseConfig(argv: string[]): Config {
   const config: Config = {
-    rootDir: process.env.CRDTBASE_HTTP_ROOT_DIR ?? join(process.cwd(), '.crdtbase-http-server'),
-    host: process.env.CRDTBASE_HTTP_HOST ?? '127.0.0.1',
-    port: Number.parseInt(process.env.CRDTBASE_HTTP_PORT ?? '8788', 10),
+    rootDir: process.env.HTTP_ROOT_DIR ?? join(process.cwd(), '.crdtbase-http-server'),
+    host: process.env.HTTP_HOST ?? '0.0.0.0',
+    port: Number.parseInt(process.env.HTTP_PORT ?? '8788', 10),
   };
 
   for (let index = 0; index < argv.length; index += 1) {

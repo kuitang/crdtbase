@@ -1,5 +1,12 @@
 # Agent Notes
 
+## Setup
+
+- Install dependencies:
+```bash
+npm install
+```
+
 ## Test Commands
 
 - Run everything (Lean build + full Vitest suite):
@@ -52,3 +59,79 @@ coverage/coverage-summary.json
 
 Coverage is generated via `c8` wrapped around Vitest (stable for this property-heavy suite).
 Coverage commands run Vitest with single-worker settings to avoid MinIO port collisions between parallel suites.
+
+## Runtime Commands
+
+- Start HTTP backend in tmux (binds `0.0.0.0:8788`):
+```bash
+tmux new-session -d -s crdtbase-http "cd /home/kuitang/git/crdtbase && npm run backend:http -- --host 0.0.0.0 --port 8788 --root-dir ./.crdtbase-http-server"
+```
+
+- Start Browser REPL in tmux (binds `0.0.0.0:4183`):
+```bash
+tmux new-session -d -s crdtbase-browser "cd /home/kuitang/git/crdtbase && npm run repl:browser -- --host 0.0.0.0 --port 4183"
+```
+
+- List tmux sessions:
+```bash
+tmux ls
+```
+
+- Attach to an existing tmux session (for manual control):
+```bash
+tmux attach -t crdtbase-http
+tmux attach -t crdtbase-browser
+```
+
+- If already inside tmux, switch to another session:
+```bash
+tmux switch-client -t crdtbase-http
+tmux switch-client -t crdtbase-browser
+```
+
+- Check Browser REPL tmux session output:
+```bash
+tmux capture-pane -pt crdtbase-browser
+```
+
+- Check HTTP backend tmux session output:
+```bash
+tmux capture-pane -pt crdtbase-http
+```
+
+- Stop tmux sessions:
+```bash
+tmux kill-session -t crdtbase-http
+tmux kill-session -t crdtbase-browser
+```
+
+- Start Node REPL against S3/Tigris using canonical AWS env only:
+```bash
+source deploy/tigris/.env.local
+SITE_ID=site-a npm run repl:node
+```
+
+## Tigris/AWS Commands
+
+- Apply bucket CORS with canonical AWS CLI:
+```bash
+source deploy/tigris/.env.local
+aws --endpoint-url "$AWS_ENDPOINT_URL_S3" s3api put-bucket-cors \
+  --bucket "$BUCKET_NAME" \
+  --cors-configuration file://deploy/tigris/cors.example.json
+```
+
+- Verify bucket CORS:
+```bash
+source deploy/tigris/.env.local
+aws --endpoint-url "$AWS_ENDPOINT_URL_S3" s3api get-bucket-cors \
+  --bucket "$BUCKET_NAME"
+```
+
+- Decode a remote delta object via pipe (no temp file):
+```bash
+source deploy/tigris/.env.local
+aws --endpoint-url "$AWS_ENDPOINT_URL_S3" s3 cp \
+  "s3://$BUCKET_NAME/deltas/site-a/0000000001.delta.bin" \
+  - | node cli.mjs dump -
+```

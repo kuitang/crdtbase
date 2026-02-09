@@ -20,18 +20,39 @@ function toJsonFriendly(value) {
 
 async function dumpFile(path) {
   const bytes = await readFile(path);
+  dumpBytes(bytes);
+}
+
+function printUsage() {
+  process.stderr.write('Usage: node cli.mjs dump <path-to-bin|->\n');
+}
+
+function dumpBytes(bytes) {
   const decoded = decode(bytes);
   process.stdout.write(`${JSON.stringify(toJsonFriendly(decoded), null, 2)}\n`);
 }
 
-function printUsage() {
-  process.stderr.write('Usage: node cli.mjs dump <path-to-bin>\n');
+async function readStdinBytes() {
+  const chunks = [];
+  for await (const chunk of process.stdin) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
+}
+
+async function dumpStdin() {
+  const bytes = await readStdinBytes();
+  if (bytes.length === 0) {
+    throw new Error('stdin is empty');
+  }
+  dumpBytes(bytes);
 }
 
 const [, , command, ...args] = process.argv;
 
 if (command === 'dump' && args.length === 1) {
-  dumpFile(args[0]).catch((error) => {
+  const action = args[0] === '-' ? dumpStdin : () => dumpFile(args[0]);
+  action().catch((error) => {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
     process.exitCode = 1;
   });

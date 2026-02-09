@@ -178,37 +178,29 @@ function parseS3Config(raw: string): ParsedS3Config {
     values = parseLooseKeyValueMap(trimmed);
   }
 
-  const bucket = resolveValue(values, ['bucket', 's3_bucket', 'crdtbase_s3_bucket']);
-  const prefix = resolveValue(values, ['prefix', 's3_prefix', 'crdtbase_s3_prefix']) ?? 'deltas';
+  const bucket = resolveValue(values, ['bucket', 'bucket_name', 's3_bucket']);
+  const prefix = resolveValue(values, ['prefix', 's3_prefix']) ?? 'deltas';
   const endpoint = resolveValue(values, ['endpoint', 's3_endpoint', 'aws_endpoint_url_s3', 'aws_endpoint_url']);
-  const region = resolveValue(values, ['region', 's3_region', 'aws_region']) ?? 'auto';
+  const region = resolveValue(values, ['region', 's3_region', 'aws_region', 'aws_default_region']) ?? 'auto';
   const accessKeyId = resolveValue(values, [
     'accessKeyId',
     'access_key_id',
     's3_access_key_id',
-    'crdtbase_s3_access_key_id',
     'aws_access_key_id',
   ]);
   const secretAccessKey = resolveValue(values, [
     'secretAccessKey',
     'secret_access_key',
     's3_secret_access_key',
-    'crdtbase_s3_secret_access_key',
     'aws_secret_access_key',
   ]);
   const sessionToken = resolveValue(values, [
     'sessionToken',
     'session_token',
     's3_session_token',
-    'crdtbase_s3_session_token',
     'aws_session_token',
   ]);
-  const forcePathStyleRaw = resolveValue(values, [
-    'forcePathStyle',
-    'force_path_style',
-    's3_force_path_style',
-    'crdtbase_s3_force_path_style',
-  ]);
+  const forcePathStyleRaw = resolveValue(values, ['forcePathStyle', 'force_path_style', 's3_force_path_style']);
   const forcePathStyle =
     forcePathStyleRaw === undefined
       ? false

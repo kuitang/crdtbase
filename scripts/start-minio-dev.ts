@@ -11,8 +11,8 @@ function parseArg(name: string, fallback: string): string {
 }
 
 async function main(): Promise<void> {
-  const rootDir = resolve(parseArg('--root-dir', process.env.CRDTBASE_MINIO_ROOT_DIR ?? '.crdtbase-minio'));
-  const bucket = parseArg('--bucket', process.env.CRDTBASE_MINIO_BUCKET ?? 'crdtbase');
+  const rootDir = resolve(parseArg('--root-dir', process.env.MINIO_ROOT_DIR ?? '.crdtbase-minio'));
+  const bucket = parseArg('--bucket', process.env.MINIO_BUCKET ?? 'crdtbase');
 
   await mkdir(rootDir, { recursive: true });
   const harness = await MinioHarness.start({ rootDir, bucket });

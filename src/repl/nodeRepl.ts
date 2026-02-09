@@ -57,6 +57,13 @@ function printUsage(): void {
       '  --s3-session-token <token>         Optional session token',
       '  --s3-force-path-style <true|false> (default: false)',
       '',
+      'Environment:',
+      '  BACKEND, SITE_ID, DATA_DIR, HTTP_BASE_URL',
+      '  BUCKET_NAME, S3_PREFIX, S3_FORCE_PATH_STYLE',
+      '  AWS_ENDPOINT_URL_S3 (or AWS_ENDPOINT_URL)',
+      '  AWS_REGION (or AWS_DEFAULT_REGION)',
+      '  AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN',
+      '',
       'REPL commands:',
       '  .help      show this help',
       '  .examples  print example SQL statements',
@@ -69,8 +76,9 @@ function printUsage(): void {
 }
 
 function parseBackend(value: string): BackendMode {
-  if (value === 'http' || value === 's3') {
-    return value;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === 'http' || normalized === 's3') {
+    return normalized;
   }
   throw new Error(`unsupported backend '${value}'`);
 }
@@ -92,29 +100,30 @@ function buildEphemeralDataDir(siteId: string): string {
 }
 
 function parseConfig(argv: string[]): Config {
-  let backend = parseBackend(process.env.CRDTBASE_BACKEND ?? 'http');
-  let siteId = process.env.CRDTBASE_SITE_ID ?? 'cli-site';
-  let dataDir = process.env.CRDTBASE_DATA_DIR ?? '';
+  const endpointFromEnv = process.env.AWS_ENDPOINT_URL_S3 ?? process.env.AWS_ENDPOINT_URL ?? '';
+  const bucketFromEnv = process.env.BUCKET_NAME ?? '';
+  const hasS3Env =
+    bucketFromEnv.trim().length > 0 &&
+    endpointFromEnv.trim().length > 0 &&
+    (process.env.AWS_ACCESS_KEY_ID ?? '').trim().length > 0 &&
+    (process.env.AWS_SECRET_ACCESS_KEY ?? '').trim().length > 0;
+
+  let backend = parseBackend(process.env.BACKEND ?? (hasS3Env ? 's3' : 'http'));
+  let siteId = process.env.SITE_ID ?? 'cli-site';
+  let dataDir = process.env.DATA_DIR ?? '';
   let dataDirExplicit = dataDir.trim().length > 0;
   let resetState = false;
-  let httpBaseUrl = process.env.CRDTBASE_HTTP_BASE_URL ?? '';
-  let bucket = process.env.CRDTBASE_S3_BUCKET ?? '';
-  let prefix = process.env.CRDTBASE_S3_PREFIX ?? 'deltas';
-  let s3Endpoint =
-    process.env.CRDTBASE_S3_ENDPOINT ??
-    process.env.AWS_ENDPOINT_URL_S3 ??
-    process.env.AWS_ENDPOINT_URL ??
-    '';
-  let s3Region = process.env.CRDTBASE_S3_REGION ?? process.env.AWS_REGION ?? 'auto';
-  let s3AccessKeyId =
-    process.env.CRDTBASE_S3_ACCESS_KEY_ID ?? process.env.AWS_ACCESS_KEY_ID ?? '';
-  let s3SecretAccessKey =
-    process.env.CRDTBASE_S3_SECRET_ACCESS_KEY ?? process.env.AWS_SECRET_ACCESS_KEY ?? '';
-  let s3SessionToken =
-    process.env.CRDTBASE_S3_SESSION_TOKEN ?? process.env.AWS_SESSION_TOKEN ?? '';
+  let httpBaseUrl = process.env.HTTP_BASE_URL ?? '';
+  let bucket = bucketFromEnv;
+  let prefix = process.env.S3_PREFIX ?? 'deltas';
+  let s3Endpoint = endpointFromEnv;
+  let s3Region = process.env.AWS_REGION ?? process.env.AWS_DEFAULT_REGION ?? 'auto';
+  let s3AccessKeyId = process.env.AWS_ACCESS_KEY_ID ?? '';
+  let s3SecretAccessKey = process.env.AWS_SECRET_ACCESS_KEY ?? '';
+  let s3SessionToken = process.env.AWS_SESSION_TOKEN ?? '';
   let s3ForcePathStyle = parseBooleanFlag(
-    process.env.CRDTBASE_S3_FORCE_PATH_STYLE ?? 'false',
-    'CRDTBASE_S3_FORCE_PATH_STYLE',
+    process.env.S3_FORCE_PATH_STYLE ?? 'false',
+    'S3_FORCE_PATH_STYLE',
   );
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -146,7 +155,7 @@ function parseConfig(argv: string[]): Config {
       index += 1;
       continue;
     }
-    if (arg === '--bucket' && value) {
+    if ((arg === '--bucket' || arg === '--bucket-name') && value) {
       bucket = value;
       index += 1;
       continue;

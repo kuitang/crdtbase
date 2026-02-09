@@ -1,255 +1,113 @@
 # CRDTBase
 
-CRDT-native SQL sync engine in TypeScript, with pluggable replication backends.
+CRDT-native SQL sync engine in TypeScript with pluggable replication backends (HTTP and direct S3).
 
-This repository includes:
-- Node client runtime
-- Browser client runtime
-- HTTP replicated-log backend (`FileReplicatedLogServer`)
-- S3 replicated-log backend
-- Chaos E2E tests for Node and browser
-- REPLs for Node CLI and browser
+## Command Source of Truth
 
-## Install
+Shell commands for setup, tests, runtime, and Tigris operations are in `AGENTS.md`.
+This README focuses on manual validation expectations and operator notes.
 
-```bash
-npm install
-```
+## Components
 
-## Test Matrix
+- Node REPL client
+- Browser REPL client
+- HTTP replicated log backend (`FileReplicatedLogServer`)
+- Direct S3 replicated log backend (`S3ReplicatedLog`)
+- Property tests, differential random tests (Lean parity), and chaos E2E suites
 
-Run TypeScript tests:
+## Canonical S3 Environment Variables
 
-```bash
-npm test
-```
+The codebase now uses canonical AWS names:
 
-Run Node E2E chaos tests only:
+- `BUCKET_NAME`
+- `AWS_ENDPOINT_URL_S3` (or `AWS_ENDPOINT_URL`)
+- `AWS_REGION` (or `AWS_DEFAULT_REGION`)
+- `AWS_ACCESS_KEY_ID`
+- `AWS_SECRET_ACCESS_KEY`
+- `AWS_SESSION_TOKEN` (optional)
+- `S3_PREFIX` (optional, default `deltas`)
+- `S3_FORCE_PATH_STYLE` (optional)
 
-```bash
-npm run test:e2e:node
-```
+Project-specific `CRDTBASE_*` S3 env aliases are intentionally removed.
 
-Run browser E2E chaos tests only (Playwright + Chromium):
+## Manual Runtime Notes
 
-```bash
-npm run test:e2e:browser
-```
+- Run long-lived services (`crdtbase-http`, `crdtbase-browser`) in tmux sessions (see `AGENTS.md`).
+- Attach to existing sessions using the tmux commands in `AGENTS.md`.
+- Open browser REPL at `http://<host>:4183/`, where `<host>` is the machine running tmux.
+- Node REPL defaults to ephemeral local state under `/tmp` unless `DATA_DIR` is set.
 
-Run full suite (Lean + TS):
+## Browser S3 Auth Input
 
-```bash
-npm run test:all
-```
+Browser REPL S3 config accepts either:
+- JSON object
+- whitespace/newline-separated `KEY=value` tokens
 
-## TypeScript Test Architecture
+Recognized keys include both plain names and AWS env-style names (`bucket` or `BUCKET_NAME`, `endpoint` or `AWS_ENDPOINT_URL_S3`, etc.).
+Unknown keys are ignored, so pasting a larger env block is safe.
 
-TypeScript tests are organized into three layers:
-- `test/properties/*.prop.test.ts`: fast-check property tests for CRDT algebra, invariants, SQL parsing/planning, compaction, and snapshot stores.
-- `test/drt/*.drt.test.ts`: differential random tests (DRT) that compare TypeScript behavior against the Lean oracle (`CrdtBaseDRT`).
-- `test/e2e/*.e2e.test.ts`: multi-client chaos end-to-end flows (HTTP and S3/MinIO for Node and browser adapters).
+## Manual Convergence Scenario (3 Sites)
 
-This project intentionally favors property/model/differential testing over one-off example unit tests.
+Use three site IDs (`site-a`, `site-b`, `site-c`) against the same backend.
 
-## Coverage (Vitest + Property Tests)
+1. On `site-a`, create schema and insert the initial row, then push.
+2. On `site-b`, pull, apply concurrent edits (title/status/increment/tag), then push.
+3. On `site-c`, pull, apply another concurrent title/increment/tag, then push and pull again.
+4. Sync all three sites and compare final row values.
 
-Coverage is collected with `c8` (Node V8 coverage) wrapped around Vitest. This is fast and stable for this ESM + fast-check suite, including property and chaos tests.
+Expected converged row for the standard walkthrough:
+- `id = 't1'`
+- `title = 'from-c'`
+- `points = 8`
+- `tags = [alpha, beta, gamma]`
+- `status = [open, review]`
 
-Run coverage on the current Node CI matrix plus property and DRT suites:
+## Verifying Writes Are Going to Tigris (Not MinIO)
 
-```bash
-npm run test:coverage
-```
+When validating manually:
+- Confirm the active S3 endpoint is your Tigris endpoint, not `localhost` or `0.0.0.0:9000`.
+- Confirm expected delta keys exist under `deltas/<site-id>/...` in the configured bucket.
+- Decode one delta object using the pipe-based decode command in `AGENTS.md` and verify fields such as `siteId`, `seq`, and `ops`.
 
-Run coverage on the full suite (includes browser E2E when Playwright/Chromium is available):
+## Tigris Setup Artifacts
 
-```bash
-npm run test:coverage:all
-```
-
-Reports are written to:
-- `coverage/index.html`
-- `coverage/lcov.info`
-- `coverage/coverage-summary.json`
-
-`test:coverage` lowers chaos/DRT run counts and forces single-worker execution to avoid MinIO port races while still exercising end-to-end merge/sync paths.
-
-## CI
-
-GitHub CI runs on every push to `main` and every PR targeting `main`:
-- Lean proofs/oracle build (`CrdtBase`, `CrdtBaseDRT`) with mathlib cache
-- full TypeScript test suite (`npm test`)
-
-Workflow file:
-- `.github/workflows/ci.yml`
-
-## Backend: HTTP (File Replicated Log)
-
-Start HTTP backend:
-
-```bash
-npm run backend:http -- --host 0.0.0.0 --port 8788 --root-dir ./.crdtbase-http-server
-```
-
-This server exposes `GET/POST/PUT` endpoints for logs and snapshots and now includes CORS headers for browser use.
-
-## Backend: Direct S3 / Tigris
-
-S3 mode uses direct signed AWS SDK requests (`S3ReplicatedLog`) with credentials.
-No intermediate signing service is used in this repository.
-
-Tigris service setup (bucket, credentials, env template, CORS example):
 - `deploy/tigris/README.md`
 - `deploy/tigris/env.tigris.example`
 - `deploy/tigris/cors.example.json`
 
-### Browser note for S3
+## Fly Multi-Region Stress Coordinator
 
-Browser direct-to-S3 requests require bucket CORS to allow your REPL origin.
+For true multi-region stress (real Tigris endpoint, per-run bucket lifecycle), use:
 
-Example with `mc`:
+- `scripts/stress/fly-coordinator.sh`
+- `test/stress/flyWorker.ts`
+- `test/stress/PLAN.md`
 
-```bash
-cat > cors.json <<'JSON'
-{
-  "CORSRules": [
-    {
-      "AllowedOrigins": ["*"],
-      "AllowedMethods": ["GET", "PUT", "POST", "DELETE", "HEAD"],
-      "AllowedHeaders": ["*"],
-      "ExposeHeaders": ["ETag"],
-      "MaxAgeSeconds": 3000
-    }
-  ]
-}
-JSON
+Coordinator behavior:
+- creates a fresh bucket for each run
+- launches three Fly workers (`iad,lhr,syd` by default)
+- drives soft/hard S3 control-object barriers
+- enforces invariants + convergence digests
+- deletes the bucket at the end of each run (success and failure paths)
 
-mc alias set local http://127.0.0.1:9000 minioadmin minioadmin
-mc cors set local/crdtbase cors.json
-```
-
-## Node REPL
-
-Default behavior:
-- each REPL process uses a fresh ephemeral local state dir under `/tmp` (avoids stale cursor errors after backend resets)
-- pass `--data-dir <path>` if you want persistent state across sessions
-- pass `--reset-state` to wipe `--data-dir` on startup
-
-Start Node REPL (HTTP backend):
+Basic usage:
 
 ```bash
-npm run repl:node -- \
-  --backend http \
-  --site-id site-a \
-  --http-base-url http://127.0.0.1:8788
+export FLY_APP=<your-fly-app>
+export FLY_WORKER_IMAGE=<registry/image:tag-built-with-Dockerfile.stress>
+export AWS_ENDPOINT_URL_S3=<tigris-endpoint>
+export AWS_ACCESS_KEY_ID=<key>
+export AWS_SECRET_ACCESS_KEY=<secret>
+export AWS_REGION=auto
+
+npm run stress:fly:coordinator
 ```
 
-Start Node REPL (S3 backend):
-
-```bash
-npm run repl:node -- \
-  --backend s3 \
-  --site-id site-a \
-  --bucket crdtbase \
-  --prefix deltas \
-  --s3-endpoint http://127.0.0.1:9000 \
-  --s3-region us-east-1 \
-  --s3-access-key-id minioadmin \
-  --s3-secret-access-key minioadmin \
-  --s3-force-path-style true
-```
-
-Start Node REPL with persistent local state (opt-in):
-
-```bash
-npm run repl:node -- \
-  --backend s3 \
-  --site-id site-a \
-  --bucket crdtbase \
-  --prefix deltas \
-  --s3-endpoint http://127.0.0.1:9000 \
-  --s3-region us-east-1 \
-  --s3-access-key-id minioadmin \
-  --s3-secret-access-key minioadmin \
-  --s3-force-path-style true \
-  --data-dir ./.crdtbase-cli/site-a
-```
-
-### REPL commands
-
-- `.help`
-- `.examples`
-- `.push`
-- `.pull`
-- `.sync`
-- `.quit`
-
-SQL input supports DDL/write/select. `SELECT` results are rendered as plain text tables.
-
-## Browser REPL
-
-Start browser REPL server:
-
-```bash
-npm run repl:browser -- --host 0.0.0.0 --port 4173
-```
-
-Open:
-
-```text
-http://0.0.0.0:4173
-```
-
-The browser REPL uses a black-and-white ChatGPT-like style and supports:
-- backend switch (`HTTP` or `S3 (Direct Credentials)`)
-- `.push` / `.pull` / `.sync` buttons
-- SQL execution (Ctrl/Cmd + Enter)
-- plain table output formatting
-- clickable example queries
-
-For S3 mode, use a single connection textarea that accepts either:
-- JSON object
-- loose `KEY=value` pairs separated by whitespace/newlines
-
-Accepted keys include:
-- `bucket`, `prefix`, `endpoint`, `region`
-- `accessKeyId` / `AWS_ACCESS_KEY_ID`
-- `secretAccessKey` / `AWS_SECRET_ACCESS_KEY`
-- `sessionToken` / `AWS_SESSION_TOKEN` (optional)
-- `forcePathStyle` (optional, typically `true` for MinIO)
-
-Browser REPL state safety:
-- local client state is in-memory only (no browser persistence across page reload)
-- changing backend or connection settings auto-disconnects the active session
-- reconnect always starts a fresh local session
-
-## Example SQL (works in both REPLs)
-
-```sql
-CREATE TABLE tasks (
-  id STRING PRIMARY KEY,
-  title LWW<STRING>,
-  points COUNTER,
-  tags SET<STRING>,
-  status REGISTER<STRING>
-);
-
-INSERT INTO tasks (id, title, points, tags, status)
-VALUES ('t1', 'hello', 0, 'alpha', 'open');
-
-INC tasks.points BY 3 WHERE id = 't1';
-ADD 'beta' TO tasks.tags WHERE id = 't1';
-UPDATE tasks SET title = 'from-repl' WHERE id = 't1';
-SELECT * FROM tasks;
-```
-
-## Manual Consistency Check
-
-1. Start backend (`backend:http` or S3 direct).
-2. Open two clients (two Node REPLs, or Node + browser) with different `site-id`s.
-3. On client A: run DDL + insert + `INC` + `ADD`, then `.push`.
-4. On client B: `.pull`, run concurrent writes, `.push`.
-5. On both: `.sync`.
-6. Run `SELECT * FROM tasks;` on both clients.
-
-Expected: both clients converge to identical rows after sync rounds, matching chaos E2E guarantees.
+Optional knobs:
+- `STRESS_RUNS` (default `10`)
+- `STRESS_OPS_PER_CLIENT` (default `30000`)
+- `STRESS_BARRIER_EVERY_OPS` (default `3000`)
+- `STRESS_HARD_BARRIER_EVERY` (default `2`)
+- `STRESS_DRAIN_ROUNDS` (default `8`)
+- `STRESS_SOFT_BARRIER_TIMEOUT_S` (default `30`)
+- `STRESS_HARD_BARRIER_TIMEOUT_S` (default `90`)

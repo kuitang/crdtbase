@@ -1,10 +1,7 @@
 {
   "CORSRules": [
     {
-      "AllowedOrigins": [
-        "http://127.0.0.1:4173",
-        "http://0.0.0.0:4173"
-      ],
+      "AllowedOrigins": ["*"],
       "AllowedMethods": ["GET", "PUT", "POST", "DELETE", "HEAD"],
       "AllowedHeaders": ["*"],
       "ExposeHeaders": ["ETag"],
