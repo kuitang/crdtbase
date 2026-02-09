@@ -682,7 +682,11 @@ def applyOpToRows (rows : List EvalRow) (op : EncodedCrdtOp) : Except String (Li
   pure (upsertRow rows op.tbl op.key nextColumns)
 
 def materializeRow (row : EvalRow) : List (String × Json) :=
-  row.columns.map (fun column =>
+  row.columns.filterMap (fun column =>
+    if column.column == "_exists" then
+      none
+    else
+      some <|
     match column.state with
     | .lww val _ _ => (column.column, val)
     | .pnCounter counter =>
@@ -697,6 +701,11 @@ def materializeRow (row : EvalRow) : List (String × Json) :=
         match state.values with
         | [single] => (column.column, single.val)
         | many => (column.column, Json.arr (many.map (·.val)).toArray))
+
+def rowIsDeleted (row : EvalRow) : Bool :=
+  match row.columns.find? (fun column => column.column == "_exists") with
+  | some { state := .lww (.bool false) _ _, .. } => true
+  | _ => false
 
 def lookupMaterialized (values : List (String × Json)) (column : String) : Option Json :=
   (values.find? (fun entry => entry.1 = column)).map (·.2)
@@ -723,6 +732,8 @@ def runSelectStatement
   let plan := buildSelectPlan statement { partitionBy := tableSchema.partitionBy }
   let outputRows := rows.filterMap (fun row =>
     if row.table ≠ statement.table then
+      none
+    else if rowIsDeleted row then
       none
     else
       let materialized := materializeRow row

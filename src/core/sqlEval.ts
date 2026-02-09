@@ -5,14 +5,12 @@ import { OrSet, OrSetElement, OrSetTag, canonicalizeOrSet, mergeOrSet } from './
 import { PnCounter, applyPnCounterDelta, pnCounterValue } from './crdt/pnCounter';
 import {
   AddStatement,
-  CrdtOpPayload,
   DecStatement,
   DeleteStatement,
   EncodedCrdtOp,
   IncStatement,
   RemoveStatement,
   RemoveTagResolverInput,
-  SetRemoveOpPayload,
   SetRemoveTag,
   SelectQueryPlan,
   SqlComparisonOp,
@@ -210,38 +208,6 @@ export function evalCondition(actual: unknown, op: SqlComparisonOp, expected: Sq
   return false;
 }
 
-function assertCounterPayload(payload: CrdtOpPayload): payload is { d: 'inc' | 'dec'; n: number } {
-  return (
-    typeof payload === 'object' &&
-    payload !== null &&
-    'd' in payload &&
-    'n' in payload &&
-    (payload.d === 'inc' || payload.d === 'dec') &&
-    typeof payload.n === 'number'
-  );
-}
-
-function assertSetAddPayload(payload: CrdtOpPayload): payload is { a: 'add'; val: SqlValue } {
-  return (
-    typeof payload === 'object' &&
-    payload !== null &&
-    'a' in payload &&
-    payload.a === 'add' &&
-    'val' in payload
-  );
-}
-
-function assertSetRemovePayload(payload: CrdtOpPayload): payload is SetRemoveOpPayload {
-  return (
-    typeof payload === 'object' &&
-    payload !== null &&
-    'a' in payload &&
-    payload.a === 'rmv' &&
-    'tags' in payload &&
-    Array.isArray(payload.tags)
-  );
-}
-
 function isSqlScalar(value: unknown): value is SqlValue {
   return (
     value === null ||
@@ -385,6 +351,9 @@ export function evalRowsToRuntime(rows: SqlEvalRowState[]): Map<string, RuntimeR
 export function materializeRow(row: RuntimeRowState): Record<string, unknown> {
   const values: Record<string, unknown> = {};
   for (const [column, state] of row.columns.entries()) {
+    if (column === '_exists') {
+      continue;
+    }
     switch (state.typ) {
       case 1:
         values[column] = state.state.val;
@@ -447,14 +416,31 @@ export function applyCrdtOpToRows(
       key: op.key,
       columns: new Map<string, RuntimeColumnState>(),
     };
-  const current = row.columns.get(op.col);
   const incomingHlc = decodeHlcHex(op.hlc);
-
-  switch (op.typ) {
-    case 1: {
+  switch (op.kind) {
+    case 'row_exists': {
+      const current = row.columns.get('_exists');
+      const incoming: LwwRegister<SqlValue> = {
+        val: op.exists,
+        hlc: incomingHlc,
+        site: op.site,
+      };
+      if (!current) {
+        row.columns.set('_exists', { typ: 1, state: incoming });
+      } else if (current.typ === 1) {
+        row.columns.set('_exists', { typ: 1, state: mergeLww(current.state, incoming) });
+      } else {
+        throw new Error(
+          `column '${op.tbl}._exists' was previously typ ${current.typ}, got typ 1`,
+        );
+      }
+      break;
+    }
+    case 'cell_lww': {
       if (!isSqlScalar(op.val)) {
         throw new Error(`invalid LWW payload for ${op.tbl}.${op.col}`);
       }
+      const current = row.columns.get(op.col);
       const incoming: LwwRegister<SqlValue> = {
         val: op.val,
         hlc: incomingHlc,
@@ -471,42 +457,45 @@ export function applyCrdtOpToRows(
       }
       break;
     }
-    case 2: {
-      if (!assertCounterPayload(op.val)) {
-        throw new Error(`invalid PN-Counter payload for ${op.tbl}.${op.col}`);
-      }
+    case 'cell_counter': {
+      const current = row.columns.get(op.col);
       if (current && current.typ !== 2) {
         throw new Error(
           `column '${op.tbl}.${op.col}' was previously typ ${current.typ}, got typ 2`,
         );
       }
       const base = current?.typ === 2 ? current.state : { inc: {}, dec: {} };
-      const merged = applyPnCounterDelta(base, op.site, op.val.d, op.val.n);
+      const merged = applyPnCounterDelta(base, op.site, op.d, op.n);
       row.columns.set(op.col, { typ: 2, state: merged });
       break;
     }
-    case 3: {
+    case 'cell_or_set_add': {
+      const current = row.columns.get(op.col);
       if (current && current.typ !== 3) {
         throw new Error(
           `column '${op.tbl}.${op.col}' was previously typ ${current.typ}, got typ 3`,
         );
       }
       const base = current?.typ === 3 ? current.state : { elements: [], tombstones: [] };
-      if (assertSetAddPayload(op.val)) {
-        const element: OrSetElement<SqlValue> = {
-          val: op.val.val,
-          tag: { addHlc: incomingHlc, addSite: op.site },
-        };
-        row.columns.set(op.col, {
-          typ: 3,
-          state: mergeOrSet(base, { elements: [element], tombstones: [] }),
-        });
-        break;
+      const element: OrSetElement<SqlValue> = {
+        val: op.val,
+        tag: { addHlc: incomingHlc, addSite: op.site },
+      };
+      row.columns.set(op.col, {
+        typ: 3,
+        state: mergeOrSet(base, { elements: [element], tombstones: [] }),
+      });
+      break;
+    }
+    case 'cell_or_set_remove': {
+      const current = row.columns.get(op.col);
+      if (current && current.typ !== 3) {
+        throw new Error(
+          `column '${op.tbl}.${op.col}' was previously typ ${current.typ}, got typ 3`,
+        );
       }
-      if (!assertSetRemovePayload(op.val)) {
-        throw new Error(`invalid OR-Set payload for ${op.tbl}.${op.col}`);
-      }
-      const tombstones: OrSetTag[] = op.val.tags.map((tag) => ({
+      const base = current?.typ === 3 ? current.state : { elements: [], tombstones: [] };
+      const tombstones: OrSetTag[] = op.tags.map((tag) => ({
         addHlc: decodeHlcHex(tag.hlc),
         addSite: tag.site,
       }));
@@ -516,10 +505,11 @@ export function applyCrdtOpToRows(
       });
       break;
     }
-    case 4: {
+    case 'cell_mv_register': {
       if (!isSqlScalar(op.val)) {
         throw new Error(`invalid MV-Register payload for ${op.tbl}.${op.col}`);
       }
+      const current = row.columns.get(op.col);
       if (current && current.typ !== 4) {
         throw new Error(
           `column '${op.tbl}.${op.col}' was previously typ ${current.typ}, got typ 4`,
@@ -537,8 +527,6 @@ export function applyCrdtOpToRows(
       });
       break;
     }
-    default:
-      throw new Error(`unsupported CRDT op type ${(op as { typ: number }).typ}`);
   }
 
   rows.set(key, row);
@@ -556,6 +544,10 @@ export function runSelectPlan(
   const rows: Record<string, unknown>[] = [];
   for (const row of rowsState.values()) {
     if (row.table !== plan.table) {
+      continue;
+    }
+    const exists = row.columns.get('_exists');
+    if (exists && exists.typ === 1 && exists.state.val === false) {
       continue;
     }
 

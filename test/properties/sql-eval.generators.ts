@@ -129,7 +129,7 @@ const arbEvalRowState: fc.Arbitrary<SqlEvalRowState> = fc
     points: fc.option(arbPnCounter, { nil: undefined }),
     tags: fc.option(arbOrSet, { nil: undefined }),
     status: fc.option(arbMv, { nil: undefined }),
-    deleted: fc.option(arbLww(fc.boolean()), { nil: undefined }),
+    exists: fc.option(arbLww(fc.boolean()), { nil: undefined }),
   })
   .map((value) => {
     const columns: SqlEvalRowState['columns'] = {};
@@ -139,7 +139,7 @@ const arbEvalRowState: fc.Arbitrary<SqlEvalRowState> = fc
     if (value.points) columns.points = { typ: 2, ...value.points };
     if (value.tags) columns.tags = value.tags;
     if (value.status) columns.status = value.status;
-    if (value.deleted) columns._deleted = { typ: 1, ...value.deleted };
+    if (value.exists) columns._exists = { typ: 1, ...value.exists };
     return {
       table: 'tasks',
       key: value.key,

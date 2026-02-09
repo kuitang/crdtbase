@@ -307,6 +307,7 @@ instance : ToJson SelectPlannerSchema where
 structure EncodedCrdtOp where
   tbl : String
   key : Json
+  kind : String
   col : String
   typ : Nat
   hlc : String
@@ -314,15 +315,35 @@ structure EncodedCrdtOp where
   val : Json
 
 instance : ToJson EncodedCrdtOp where
-  toJson op := Json.mkObj [
-    ("tbl", toJson op.tbl),
-    ("key", op.key),
-    ("col", toJson op.col),
-    ("typ", toJson op.typ),
-    ("hlc", toJson op.hlc),
-    ("site", toJson op.site),
-    ("val", op.val)
-  ]
+  toJson op :=
+    let base := [
+      ("tbl", toJson op.tbl),
+      ("key", op.key),
+      ("hlc", toJson op.hlc),
+      ("site", toJson op.site),
+      ("kind", toJson op.kind)
+    ]
+    match op.kind with
+    | "row_exists" =>
+        Json.mkObj (base ++ [("exists", op.val)])
+    | "cell_counter" =>
+        Json.mkObj (base ++ [
+          ("col", toJson op.col),
+          ("d", toJson ((op.val.getObjValAs? String "d").toOption.getD "")),
+          ("n", (op.val.getObjVal? "n").toOption.getD (toJson (0 : Nat)))
+        ])
+    | "cell_or_set_add" =>
+        Json.mkObj (base ++ [
+          ("col", toJson op.col),
+          ("val", (op.val.getObjVal? "val").toOption.getD Json.null)
+        ])
+    | "cell_or_set_remove" =>
+        Json.mkObj (base ++ [
+          ("col", toJson op.col),
+          ("tags", (op.val.getObjVal? "tags").toOption.getD (toJson ([] : List SetRemoveTag)))
+        ])
+    | _ =>
+        Json.mkObj (base ++ [("col", toJson op.col), ("val", op.val)])
 
 def CrdtTypeTag.isValid (tag : Nat) : Prop :=
   tag = 1 ∨ tag = 2 ∨ tag = 3 ∨ tag = 4
@@ -408,6 +429,7 @@ private def nextHlc (hlcSequence : List String) : Except String (String × List 
 def createOp
     (table : String)
     (key : Json)
+    (kind : String)
     (column : String)
     (typ : Nat)
     (hlc : String)
@@ -416,11 +438,21 @@ def createOp
     : EncodedCrdtOp :=
   { tbl := table
     key := key
+    kind := kind
     col := column
     typ := typ
     hlc := hlc
     site := site
     val := val }
+
+private def createRowExistsOp
+    (table : String)
+    (key : Json)
+    (hlc : String)
+    (site : String)
+    (isPresent : Bool)
+    : EncodedCrdtOp :=
+  createOp table key "row_exists" "_exists" 1 hlc site (toJson isPresent)
 
 private def createInsertColumnOp
     (statement : InsertStatement)
@@ -433,25 +465,30 @@ private def createInsertColumnOp
     : Except String (Option EncodedCrdtOp × List String) := do
   let columnSchema ← lookupColumnSchema tableSchema statement.table column
   match columnSchema.crdt with
-  | .scalar => pure (none, hlcSequence)
+  | .scalar =>
+      if column = tableSchema.pk then
+        pure (none, hlcSequence)
+      else
+        let (hlc, remaining) ← nextHlc hlcSequence
+        pure (some (createOp statement.table key "cell_lww" column 1 hlc site value), remaining)
   | .lww =>
       let (hlc, remaining) ← nextHlc hlcSequence
-      pure (some (createOp statement.table key column 1 hlc site value), remaining)
+      pure (some (createOp statement.table key "cell_lww" column 1 hlc site value), remaining)
   | .mvRegister =>
       let (hlc, remaining) ← nextHlc hlcSequence
-      pure (some (createOp statement.table key column 4 hlc site value), remaining)
+      pure (some (createOp statement.table key "cell_mv_register" column 4 hlc site value), remaining)
   | .pnCounter =>
       match value with
       | .num _ =>
           let (hlc, remaining) ← nextHlc hlcSequence
           let payload := Json.mkObj [("d", toJson "inc"), ("n", value)]
-          pure (some (createOp statement.table key column 2 hlc site payload), remaining)
+          pure (some (createOp statement.table key "cell_counter" column 2 hlc site payload), remaining)
       | _ =>
           throw s!"INSERT for counter column '{statement.table}.{column}' requires NUMBER"
   | .orSet =>
       let (hlc, remaining) ← nextHlc hlcSequence
       let payload := Json.mkObj [("a", toJson "add"), ("val", value)]
-      pure (some (createOp statement.table key column 3 hlc site payload), remaining)
+      pure (some (createOp statement.table key "cell_or_set_add" column 3 hlc site payload), remaining)
 
 private def createUpdateColumnOp
     (statement : UpdateStatement)
@@ -465,12 +502,16 @@ private def createUpdateColumnOp
   match columnSchema.crdt with
   | .lww =>
       let (hlc, remaining) ← nextHlc hlcSequence
-      pure (createOp statement.table key assignment.column 1 hlc site assignment.value, remaining)
+      pure (createOp statement.table key "cell_lww" assignment.column 1 hlc site assignment.value, remaining)
   | .mvRegister =>
       let (hlc, remaining) ← nextHlc hlcSequence
-      pure (createOp statement.table key assignment.column 4 hlc site assignment.value, remaining)
+      pure (createOp statement.table key "cell_mv_register" assignment.column 4 hlc site assignment.value, remaining)
   | .scalar =>
-      throw s!"UPDATE cannot target scalar column '{statement.table}.{assignment.column}'"
+      if assignment.column = tableSchema.pk then
+        throw s!"UPDATE cannot target primary key column '{statement.table}.{assignment.column}'"
+      else
+        let (hlc, remaining) ← nextHlc hlcSequence
+        pure (createOp statement.table key "cell_lww" assignment.column 1 hlc site assignment.value, remaining)
   | .pnCounter =>
       throw s!"UPDATE cannot target counter column '{statement.table}.{assignment.column}'; use INC/DEC"
   | .orSet =>
@@ -512,7 +553,9 @@ private def generateInsertOps
         throw s!"INSERT into '{statement.table}' must include primary key column '{tableSchema.pk}'"
     | some pair => pure pair.snd
   let key ← assertPrimaryKeyValue primaryValue statement.table tableSchema.pk
-  collectInsertOps statement tableSchema site key valuesByColumn hlcSequence []
+  let (existsHlc, afterExists) ← nextHlc hlcSequence
+  let (ops, remaining) ← collectInsertOps statement tableSchema site key valuesByColumn afterExists []
+  pure (createRowExistsOp statement.table key existsHlc site true :: ops, remaining)
 
 private def collectUpdateOps
     (statement : UpdateStatement)
@@ -536,7 +579,9 @@ private def generateUpdateOps
     (hlcSequence : List String)
     : Except String (List EncodedCrdtOp × List String) := do
   let key ← findPrimaryKeyInWhere statement.whereClause statement.table tableSchema.pk
-  collectUpdateOps statement tableSchema site key statement.assignments hlcSequence []
+  let (existsHlc, afterExists) ← nextHlc hlcSequence
+  let (ops, remaining) ← collectUpdateOps statement tableSchema site key statement.assignments afterExists []
+  pure (createRowExistsOp statement.table key existsHlc site true :: ops, remaining)
 
 private def generateCounterOps
     (statement : CounterStatement)
@@ -549,9 +594,10 @@ private def generateCounterOps
   let columnSchema ← lookupColumnSchema tableSchema statement.table statement.column
   if columnSchema.crdt != .pnCounter then
     throw s!"column '{statement.table}.{statement.column}' is not a COUNTER"
-  let (hlc, remaining) ← nextHlc hlcSequence
+  let (existsHlc, afterExists) ← nextHlc hlcSequence
+  let (hlc, remaining) ← nextHlc afterExists
   let payload := Json.mkObj [("d", toJson direction), ("n", toJson statement.amount)]
-  pure ([createOp statement.table key statement.column 2 hlc site payload], remaining)
+  pure ([createRowExistsOp statement.table key existsHlc site true, createOp statement.table key "cell_counter" statement.column 2 hlc site payload], remaining)
 
 private def generateSetAddOps
     (statement : SetStatement)
@@ -563,9 +609,10 @@ private def generateSetAddOps
   let columnSchema ← lookupColumnSchema tableSchema statement.table statement.column
   if columnSchema.crdt != .orSet then
     throw s!"column '{statement.table}.{statement.column}' is not a SET"
-  let (hlc, remaining) ← nextHlc hlcSequence
+  let (existsHlc, afterExists) ← nextHlc hlcSequence
+  let (hlc, remaining) ← nextHlc afterExists
   let payload := Json.mkObj [("a", toJson "add"), ("val", statement.value)]
-  pure ([createOp statement.table key statement.column 3 hlc site payload], remaining)
+  pure ([createRowExistsOp statement.table key existsHlc site true, createOp statement.table key "cell_or_set_add" statement.column 3 hlc site payload], remaining)
 
 private def generateSetRemoveOps
     (statement : SetStatement)
@@ -581,9 +628,10 @@ private def generateSetRemoveOps
   if removeTags.isEmpty then
     pure ([], hlcSequence)
   else
-    let (hlc, remaining) ← nextHlc hlcSequence
+    let (existsHlc, afterExists) ← nextHlc hlcSequence
+    let (hlc, remaining) ← nextHlc afterExists
     let payload := Json.mkObj [("a", toJson "rmv"), ("tags", toJson removeTags)]
-    pure ([createOp statement.table key statement.column 3 hlc site payload], remaining)
+    pure ([createRowExistsOp statement.table key existsHlc site true, createOp statement.table key "cell_or_set_remove" statement.column 3 hlc site payload], remaining)
 
 private def generateDeleteOps
     (statement : DeleteStatement)
@@ -593,7 +641,7 @@ private def generateDeleteOps
     : Except String (List EncodedCrdtOp × List String) := do
   let key ← findPrimaryKeyInWhere statement.whereClause statement.table tableSchema.pk
   let (hlc, remaining) ← nextHlc hlcSequence
-  pure ([createOp statement.table key "_deleted" 1 hlc site (toJson true)], remaining)
+  pure ([createRowExistsOp statement.table key hlc site false], remaining)
 
 def generateCrdtOpsCore
     (statement : SqlWriteStatement)

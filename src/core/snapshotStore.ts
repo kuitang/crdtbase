@@ -154,6 +154,9 @@ function assertSqlTableSchema(table: string, schema: SqlSchema[string]): void {
     ) {
       throw new Error(`invalid schema.${table}.${column}.crdt: ${String(definition.crdt)}`);
     }
+    if (column !== schema.pk && definition.crdt === 'scalar') {
+      throw new Error(`invalid schema.${table}.${column}: non-primary scalar columns must be lww`);
+    }
   }
 
   const partitionBy = schema.partitionBy ?? null;

@@ -118,7 +118,9 @@ describe('SQL execution planner', () => {
                     ? 'or_set'
                     : column.type.kind === 'register'
                       ? 'mv_register'
-                      : column.type.kind,
+                      : column.type.kind === 'scalar' && column.name !== primaryKeys[0]!.name
+                        ? 'lww'
+                        : column.type.kind,
             },
           ]),
         ),

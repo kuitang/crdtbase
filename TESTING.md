@@ -340,7 +340,7 @@ test('engine matches simple model under arbitrary command sequences', async () =
         const model: Model = new Map();
         const engine = await createTestEngine();
         await engine.exec(
-          'CREATE TABLE t (id STRING PRIMARY KEY, name LWW<STRING>, count COUNTER)'
+          'CREATE TABLE t (id PRIMARY KEY, name LWW<STRING>, count COUNTER)'
         );
         await fc.asyncModelRun(() => ({ model, real: engine }), cmds);
       }
@@ -685,7 +685,7 @@ Core SQL sequence used in test:
 
 ```sql
 CREATE TABLE tasks (
-  id STRING PRIMARY KEY,
+  id PRIMARY KEY,
   title LWW<STRING>,
   points COUNTER,
   tags SET<STRING>,

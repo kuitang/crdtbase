@@ -164,7 +164,6 @@ const arbManifestFile: fc.Arbitrary<ManifestFile> = fc
   }));
 
 const arbColumnCrdt = fc.constantFrom<SqlColumnCrdt>(
-  'scalar',
   'lww',
   'pn_counter',
   'or_set',

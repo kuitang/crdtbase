@@ -253,8 +253,7 @@ const arbScalarType: fc.Arbitrary<ModelScalarType> = fc.constantFrom(
   'BOOLEAN',
 );
 
-const arbColumnType: fc.Arbitrary<ModelColumnType> = fc.oneof(
-  arbScalarType.map((scalar) => ({ kind: 'scalar' as const, scalar })),
+const arbNonPrimaryColumnType: fc.Arbitrary<ModelColumnType> = fc.oneof(
   arbScalarType.map((scalar) => ({ kind: 'lww' as const, scalar })),
   fc.constant({ kind: 'counter' as const }),
   arbScalarType.map((scalar) => ({ kind: 'set' as const, scalar })),
@@ -265,7 +264,7 @@ const arbCreateColumns = fc
   .uniqueArray(
     fc.record({
       name: arbIdentifier,
-      type: arbColumnType,
+      type: arbNonPrimaryColumnType,
       primaryKey: fc.boolean(),
     }),
     { minLength: 1, maxLength: 6, selector: (column) => column.name },
@@ -321,16 +320,22 @@ const arbCreateTableCase: fc.Arbitrary<GeneratedSqlCase> = fc
   })
   .map(({ table, columns, partitionBy }) => {
     const renderedColumns = columns
-      .map(
-        (column) =>
-          `${column.name} ${renderColumnType(column.type)}${column.primaryKey ? ' PRIMARY KEY' : ''}`,
+      .map((column) =>
+        column.primaryKey
+          ? `${column.name} PRIMARY KEY`
+          : `${column.name} ${renderColumnType(column.type)}`,
       )
       .join(', ');
     const partition = partitionBy ? ` PARTITION BY ${partitionBy}` : '';
     const sql = `CREATE TABLE ${table} (${renderedColumns})${partition}`;
+    const normalizedColumns = columns.map((column) =>
+      column.primaryKey
+        ? ({ name: column.name, type: { kind: 'scalar', scalar: 'STRING' }, primaryKey: true as const })
+        : column,
+    );
     const expected = partitionBy
-      ? ({ kind: 'create_table', table, columns, partitionBy } as const)
-      : ({ kind: 'create_table', table, columns } as const);
+      ? ({ kind: 'create_table', table, columns: normalizedColumns, partitionBy } as const)
+      : ({ kind: 'create_table', table, columns: normalizedColumns } as const);
     return { sql, expected };
   });
 
@@ -599,19 +604,61 @@ export type ModelSqlSchema = Record<
   }
 >;
 
-export type ModelEncodedCrdtOp = {
-  tbl: string;
-  key: string | number;
-  col: string;
-  typ: 1 | 2 | 3 | 4;
-  hlc: string;
-  site: string;
-  val:
-    | ModelSqlValue
-    | { d: 'inc' | 'dec'; n: number }
-    | { a: 'add'; val: ModelSqlValue }
-    | { a: 'rmv'; tags: Array<{ hlc: string; site: string }> };
-};
+export type ModelEncodedCrdtOp =
+  | {
+      tbl: string;
+      key: string | number;
+      hlc: string;
+      site: string;
+      kind: 'row_exists';
+      exists: boolean;
+    }
+  | {
+      tbl: string;
+      key: string | number;
+      hlc: string;
+      site: string;
+      kind: 'cell_lww';
+      col: string;
+      val: ModelSqlValue;
+    }
+  | {
+      tbl: string;
+      key: string | number;
+      hlc: string;
+      site: string;
+      kind: 'cell_counter';
+      col: string;
+      d: 'inc' | 'dec';
+      n: number;
+    }
+  | {
+      tbl: string;
+      key: string | number;
+      hlc: string;
+      site: string;
+      kind: 'cell_or_set_add';
+      col: string;
+      val: ModelSqlValue;
+    }
+  | {
+      tbl: string;
+      key: string | number;
+      hlc: string;
+      site: string;
+      kind: 'cell_or_set_remove';
+      col: string;
+      tags: Array<{ hlc: string; site: string }>;
+    }
+  | {
+      tbl: string;
+      key: string | number;
+      hlc: string;
+      site: string;
+      kind: 'cell_mv_register';
+      col: string;
+      val: ModelSqlValue;
+    };
 
 export type GeneratedWriteOpsCase = {
   sql: string;
@@ -628,14 +675,13 @@ export const MODEL_TASKS_SCHEMA: ModelSqlSchema = {
     partitionBy: 'owner_id',
     columns: {
       id: { crdt: 'scalar' },
-      owner_id: { crdt: 'scalar' },
+      owner_id: { crdt: 'lww' },
       title: { crdt: 'lww' },
       done: { crdt: 'lww' },
       priority: { crdt: 'lww' },
       points: { crdt: 'pn_counter' },
       tags: { crdt: 'or_set' },
       status: { crdt: 'mv_register' },
-      _deleted: { crdt: 'lww' },
     },
   },
 };
@@ -718,11 +764,20 @@ const arbInsertWriteCaseTemplate: fc.Arbitrary<WriteCaseTemplate> = fc
   .map((value) => {
     const columns: string[] = ['id'];
     const values: ModelSqlValue[] = [value.id];
-    const templates: WriteOpTemplate[] = [];
+    const templates: WriteOpTemplate[] = [
+      { tbl: 'tasks', key: value.id, kind: 'row_exists', exists: true },
+    ];
 
     if (value.ownerId !== undefined) {
       columns.push('owner_id');
       values.push(value.ownerId);
+      templates.push({
+        tbl: 'tasks',
+        key: value.id,
+        kind: 'cell_lww',
+        col: 'owner_id',
+        val: value.ownerId,
+      });
     }
     if (value.title !== undefined) {
       columns.push('title');
@@ -730,8 +785,8 @@ const arbInsertWriteCaseTemplate: fc.Arbitrary<WriteCaseTemplate> = fc
       templates.push({
         tbl: 'tasks',
         key: value.id,
+        kind: 'cell_lww',
         col: 'title',
-        typ: 1,
         val: value.title,
       });
     }
@@ -741,8 +796,8 @@ const arbInsertWriteCaseTemplate: fc.Arbitrary<WriteCaseTemplate> = fc
       templates.push({
         tbl: 'tasks',
         key: value.id,
+        kind: 'cell_lww',
         col: 'done',
-        typ: 1,
         val: value.done,
       });
     }
@@ -752,8 +807,8 @@ const arbInsertWriteCaseTemplate: fc.Arbitrary<WriteCaseTemplate> = fc
       templates.push({
         tbl: 'tasks',
         key: value.id,
+        kind: 'cell_lww',
         col: 'priority',
-        typ: 1,
         val: value.priority,
       });
     }
@@ -763,9 +818,10 @@ const arbInsertWriteCaseTemplate: fc.Arbitrary<WriteCaseTemplate> = fc
       templates.push({
         tbl: 'tasks',
         key: value.id,
+        kind: 'cell_counter',
         col: 'points',
-        typ: 2,
-        val: { d: 'inc', n: value.points },
+        d: 'inc',
+        n: value.points,
       });
     }
     if (value.tags !== undefined) {
@@ -774,9 +830,9 @@ const arbInsertWriteCaseTemplate: fc.Arbitrary<WriteCaseTemplate> = fc
       templates.push({
         tbl: 'tasks',
         key: value.id,
+        kind: 'cell_or_set_add',
         col: 'tags',
-        typ: 3,
-        val: { a: 'add', val: value.tags },
+        val: value.tags,
       });
     }
     if (value.status !== undefined) {
@@ -785,8 +841,8 @@ const arbInsertWriteCaseTemplate: fc.Arbitrary<WriteCaseTemplate> = fc
       templates.push({
         tbl: 'tasks',
         key: value.id,
+        kind: 'cell_mv_register',
         col: 'status',
-        typ: 4,
         val: value.status,
       });
     }
@@ -818,34 +874,62 @@ const arbUpdateWriteCaseTemplate: fc.Arbitrary<WriteCaseTemplate> = fc
     if (value.title !== undefined) {
       assignments.push({
         text: `title = ${renderLiteral(value.title)}`,
-        template: { tbl: 'tasks', key: value.id, col: 'title', typ: 1, val: value.title },
+        template: {
+          tbl: 'tasks',
+          key: value.id,
+          kind: 'cell_lww',
+          col: 'title',
+          val: value.title,
+        },
       });
     }
     if (value.done !== undefined) {
       assignments.push({
         text: `done = ${renderLiteral(value.done)}`,
-        template: { tbl: 'tasks', key: value.id, col: 'done', typ: 1, val: value.done },
+        template: {
+          tbl: 'tasks',
+          key: value.id,
+          kind: 'cell_lww',
+          col: 'done',
+          val: value.done,
+        },
       });
     }
     if (value.priority !== undefined) {
       assignments.push({
         text: `priority = ${renderLiteral(value.priority)}`,
-        template: { tbl: 'tasks', key: value.id, col: 'priority', typ: 1, val: value.priority },
+        template: {
+          tbl: 'tasks',
+          key: value.id,
+          kind: 'cell_lww',
+          col: 'priority',
+          val: value.priority,
+        },
       });
     }
     if (value.status !== undefined) {
       assignments.push({
         text: `status = ${renderLiteral(value.status)}`,
-        template: { tbl: 'tasks', key: value.id, col: 'status', typ: 4, val: value.status },
+        template: {
+          tbl: 'tasks',
+          key: value.id,
+          kind: 'cell_mv_register',
+          col: 'status',
+          val: value.status,
+        },
       });
     }
 
+    const templates: WriteOpTemplate[] = [
+      { tbl: 'tasks', key: value.id, kind: 'row_exists', exists: true },
+      ...assignments.map((item) => item.template),
+    ];
     return {
       sql: `UPDATE tasks SET ${assignments.map((item) => item.text).join(', ')} WHERE ${whereById(
         value.id,
         value.ownerId,
       )}`,
-      templates: assignments.map((item) => item.template),
+      templates,
     };
   });
 
@@ -858,12 +942,14 @@ const arbIncWriteCaseTemplate: fc.Arbitrary<WriteCaseTemplate> = fc
   .map((value) => ({
     sql: `INC tasks.points BY ${value.amount} WHERE ${whereById(value.id, value.ownerId)}`,
     templates: [
+      { tbl: 'tasks', key: value.id, kind: 'row_exists', exists: true },
       {
         tbl: 'tasks',
         key: value.id,
+        kind: 'cell_counter',
         col: 'points',
-        typ: 2,
-        val: { d: 'inc', n: value.amount },
+        d: 'inc',
+        n: value.amount,
       },
     ],
   }));
@@ -877,12 +963,14 @@ const arbDecWriteCaseTemplate: fc.Arbitrary<WriteCaseTemplate> = fc
   .map((value) => ({
     sql: `DEC tasks.points BY ${value.amount} WHERE ${whereById(value.id, value.ownerId)}`,
     templates: [
+      { tbl: 'tasks', key: value.id, kind: 'row_exists', exists: true },
       {
         tbl: 'tasks',
         key: value.id,
+        kind: 'cell_counter',
         col: 'points',
-        typ: 2,
-        val: { d: 'dec', n: value.amount },
+        d: 'dec',
+        n: value.amount,
       },
     ],
   }));
@@ -896,12 +984,13 @@ const arbAddWriteCaseTemplate: fc.Arbitrary<WriteCaseTemplate> = fc
   .map((value) => ({
     sql: `ADD ${renderLiteral(value.value)} TO tasks.tags WHERE ${whereById(value.id, value.ownerId)}`,
     templates: [
+      { tbl: 'tasks', key: value.id, kind: 'row_exists', exists: true },
       {
         tbl: 'tasks',
         key: value.id,
+        kind: 'cell_or_set_add',
         col: 'tags',
-        typ: 3,
-        val: { a: 'add', val: value.value },
+        val: value.value,
       },
     ],
   }));
@@ -922,12 +1011,13 @@ const arbRemoveWriteCaseTemplate: fc.Arbitrary<WriteCaseTemplate> = fc
     templates:
       value.tags.length > 0
         ? [
+            { tbl: 'tasks', key: value.id, kind: 'row_exists', exists: true },
             {
               tbl: 'tasks',
               key: value.id,
+              kind: 'cell_or_set_remove',
               col: 'tags',
-              typ: 3,
-              val: { a: 'rmv', tags: value.tags },
+              tags: value.tags,
             },
           ]
         : [],
@@ -940,7 +1030,7 @@ const arbDeleteWriteCaseTemplate: fc.Arbitrary<WriteCaseTemplate> = fc
   })
   .map((value) => ({
     sql: `DELETE FROM tasks WHERE ${whereById(value.id, value.ownerId)}`,
-    templates: [{ tbl: 'tasks', key: value.id, col: '_deleted', typ: 1, val: true }],
+    templates: [{ tbl: 'tasks', key: value.id, kind: 'row_exists', exists: false }],
   }));
 
 export const arbGeneratedWriteOpsCase: fc.Arbitrary<GeneratedWriteOpsCase> = withMeta(

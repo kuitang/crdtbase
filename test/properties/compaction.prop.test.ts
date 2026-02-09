@@ -14,7 +14,7 @@ import { RuntimeRowState, applyCrdtOpToRows, runtimeRowsToEval } from '../../src
 import { arbScalar, arbSiteId } from './arbitraries';
 
 type OpTemplate = {
-  typ: 1 | 2 | 3 | 4;
+  kind: 'cell_lww' | 'cell_counter' | 'cell_or_set_add' | 'cell_or_set_remove' | 'cell_mv_register';
   key: string | number;
   site: string;
   scalar: string | number | boolean | null;
@@ -36,55 +36,57 @@ function tagHlc(wallMs: number, counter: number): string {
 
 function toOp(template: OpTemplate, index: number): EncodedCrdtOp {
   const hlc = opHlc(index);
-  switch (template.typ) {
-    case 1:
+  switch (template.kind) {
+    case 'cell_lww':
       return {
         tbl: 't',
         key: template.key,
+        kind: 'cell_lww',
         col: 'lww',
-        typ: 1,
         hlc,
         site: template.site,
         val: template.scalar,
       };
-    case 2:
+    case 'cell_counter':
       return {
         tbl: 't',
         key: template.key,
+        kind: 'cell_counter',
         col: 'counter',
-        typ: 2,
         hlc,
         site: template.site,
-        val: {
-          d: template.counterDirection,
-          n: template.counterAmount,
-        },
+        d: template.counterDirection,
+        n: template.counterAmount,
       };
-    case 3:
+    case 'cell_or_set_add':
       return {
         tbl: 't',
         key: template.key,
+        kind: 'cell_or_set_add',
         col: 'set',
-        typ: 3,
         hlc,
         site: template.site,
-        val:
-          template.setAction === 'add'
-            ? { a: 'add', val: template.scalar }
-            : {
-                a: 'rmv',
-                tags: template.removeTags.map((tag) => ({
-                  hlc: tagHlc(tag.wallMs, tag.counter),
-                  site: tag.site,
-                })),
-              },
+        val: template.scalar,
       };
-    case 4:
+    case 'cell_or_set_remove':
       return {
         tbl: 't',
         key: template.key,
+        kind: 'cell_or_set_remove',
+        col: 'set',
+        hlc,
+        site: template.site,
+        tags: template.removeTags.map((tag) => ({
+          hlc: tagHlc(tag.wallMs, tag.counter),
+          site: tag.site,
+        })),
+      };
+    case 'cell_mv_register':
+      return {
+        tbl: 't',
+        key: template.key,
+        kind: 'cell_mv_register',
         col: 'reg',
-        typ: 4,
         hlc,
         site: template.site,
         val: template.scalar,
@@ -95,7 +97,15 @@ function toOp(template: OpTemplate, index: number): EncodedCrdtOp {
 const arbCompactionOps = fc
   .array(
     fc.record({
-      typ: fc.constantFrom<1 | 2 | 3 | 4>(1, 2, 3, 4),
+      kind: fc.constantFrom<
+        'cell_lww' | 'cell_counter' | 'cell_or_set_add' | 'cell_or_set_remove' | 'cell_mv_register'
+      >(
+        'cell_lww',
+        'cell_counter',
+        'cell_or_set_add',
+        'cell_or_set_remove',
+        'cell_mv_register',
+      ),
       key: fc.oneof(
         fc.string({ minLength: 1, maxLength: 8 }),
         fc.integer({ min: -20, max: 20 }),

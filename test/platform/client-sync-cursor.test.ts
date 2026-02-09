@@ -286,7 +286,7 @@ describe('client sync cursor safety', () => {
       dataDir,
       now: () => 5_000,
     });
-    await client.exec('CREATE TABLE tasks (id STRING PRIMARY KEY, points COUNTER);');
+    await client.exec('CREATE TABLE tasks (id PRIMARY KEY, points COUNTER);');
 
     await client.pull();
     expect(client.getSyncedHeads()['site-a']).toBe(1);
@@ -308,7 +308,7 @@ describe('client sync cursor safety', () => {
       log,
       now: () => 6_000,
     });
-    await client.exec('CREATE TABLE tasks (id STRING PRIMARY KEY, points COUNTER);');
+    await client.exec('CREATE TABLE tasks (id PRIMARY KEY, points COUNTER);');
 
     await client.pull();
     expect(client.getSyncedHeads()['site-a']).toBe(1);

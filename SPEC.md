@@ -395,7 +395,7 @@ Minimal subset. No joins, no subqueries, no GROUP BY, no ORDER BY (results are a
 
 ```sql
 CREATE TABLE tasks (
-  id       STRING PRIMARY KEY,
+  id       PRIMARY KEY,
   title    LWW<STRING>,
   done     LWW<BOOLEAN>,
   priority LWW<NUMBER>,
@@ -406,10 +406,13 @@ CREATE TABLE tasks (
 ```
 
 Type mapping:
+- `PRIMARY KEY` (without a scalar type token) → structural row key column (internal schema tag `scalar`, never a user CRDT column)
 - `LWW<T>` → LWW Register (tag 1)
 - `COUNTER` → PN Counter (tag 2)
 - `SET<T>` → OR-Set (tag 3)
 - `REGISTER<T>` → MV Register (tag 4)
+
+Bare `STRING|NUMBER|BOOLEAN` column type syntax is disallowed for non-primary columns.
 
 `PARTITION BY` names the column used to determine which segment file a row belongs to. If omitted, all rows go into a single partition `"_default"`.
 

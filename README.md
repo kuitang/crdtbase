@@ -15,6 +15,18 @@ This README focuses on manual validation expectations and operator notes.
 - Direct S3 replicated log backend (`S3ReplicatedLog`)
 - Property tests, differential random tests (Lean parity), and chaos E2E suites
 
+## Table CRDT Model
+
+Table state is modeled as a key-to-row map where each row has mixed CRDT columns plus an
+explicit row-visibility register. Wire ops use discriminated forms:
+
+- `row_exists` (row tombstone / resurrection marker)
+- `cell_lww`
+- `cell_counter`
+- `cell_or_set_add`
+- `cell_or_set_remove`
+- `cell_mv_register`
+
 ## Canonical S3 Environment Variables
 
 The codebase now uses canonical AWS names:

@@ -8,6 +8,8 @@ import CrdtBase.Crdt.OrSet.Defs
 import CrdtBase.Crdt.OrSet.Props
 import CrdtBase.Crdt.MvRegister.Defs
 import CrdtBase.Crdt.MvRegister.Props
+import CrdtBase.Crdt.Table.Defs
+import CrdtBase.Crdt.Table.Props
 import CrdtBase.Convergence.Defs
 import CrdtBase.Convergence.Props
 import CrdtBase.Replication.Defs

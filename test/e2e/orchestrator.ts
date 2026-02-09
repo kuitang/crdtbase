@@ -44,7 +44,7 @@ export type E2eChaosScenarioResult = {
 
 export const CREATE_TASKS_TABLE_SQL = [
   'CREATE TABLE tasks (',
-  'id STRING PRIMARY KEY,',
+  'id PRIMARY KEY,',
   'title LWW<STRING>,',
   'points COUNTER,',
   'tags SET<STRING>,',

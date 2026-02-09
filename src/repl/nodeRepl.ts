@@ -29,7 +29,7 @@ type Config = {
 };
 
 const EXAMPLE_QUERIES = [
-  'CREATE TABLE tasks (id STRING PRIMARY KEY, title LWW<STRING>, points COUNTER, tags SET<STRING>, status REGISTER<STRING>);',
+  'CREATE TABLE tasks (id PRIMARY KEY, title LWW<STRING>, points COUNTER, tags SET<STRING>, status REGISTER<STRING>);',
   "INSERT INTO tasks (id, title, points, tags, status) VALUES ('t1', 'hello', 0, 'alpha', 'open');",
   "INC tasks.points BY 3 WHERE id = 't1';",
   "ADD 'beta' TO tasks.tags WHERE id = 't1';",

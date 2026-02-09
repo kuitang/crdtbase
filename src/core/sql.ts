@@ -131,41 +131,63 @@ export type SelectQueryPlan = {
   filters: SqlWhereCondition[];
 };
 
-export type CrdtTypeTag = 1 | 2 | 3 | 4;
-
 export type SqlPrimaryKey = string | number;
-
-export type CounterOpPayload = {
-  d: 'inc' | 'dec';
-  n: number;
-};
-
-export type SetAddOpPayload = {
-  a: 'add';
-  val: SqlValue;
-};
 
 export type SetRemoveTag = {
   hlc: string;
   site: string;
 };
 
-export type SetRemoveOpPayload = {
-  a: 'rmv';
+type BaseCrdtOp = {
+  tbl: string;
+  key: SqlPrimaryKey;
+  hlc: string;
+  site: string;
+};
+
+export type RowExistsOp = BaseCrdtOp & {
+  kind: 'row_exists';
+  exists: boolean;
+};
+
+export type CellLwwOp = BaseCrdtOp & {
+  kind: 'cell_lww';
+  col: string;
+  val: SqlValue;
+};
+
+export type CellCounterOp = BaseCrdtOp & {
+  kind: 'cell_counter';
+  col: string;
+  d: 'inc' | 'dec';
+  n: number;
+};
+
+export type CellOrSetAddOp = BaseCrdtOp & {
+  kind: 'cell_or_set_add';
+  col: string;
+  val: SqlValue;
+};
+
+export type CellOrSetRemoveOp = BaseCrdtOp & {
+  kind: 'cell_or_set_remove';
+  col: string;
   tags: SetRemoveTag[];
 };
 
-export type CrdtOpPayload = SqlValue | CounterOpPayload | SetAddOpPayload | SetRemoveOpPayload;
-
-export type EncodedCrdtOp = {
-  tbl: string;
-  key: SqlPrimaryKey;
+export type CellMvRegisterOp = BaseCrdtOp & {
+  kind: 'cell_mv_register';
   col: string;
-  typ: CrdtTypeTag;
-  hlc: string;
-  site: string;
-  val: CrdtOpPayload;
+  val: SqlValue;
 };
+
+export type EncodedCrdtOp =
+  | RowExistsOp
+  | CellLwwOp
+  | CellCounterOp
+  | CellOrSetAddOp
+  | CellOrSetRemoveOp
+  | CellMvRegisterOp;
 
 export type SqlColumnCrdt = 'scalar' | 'lww' | 'pn_counter' | 'or_set' | 'mv_register';
 
@@ -385,13 +407,19 @@ class Parser {
 
   private parseCreateColumn(): SqlCreateColumn {
     const name = this.expectIdentifier();
-    const type = this.parseColumnType();
-    let primaryKey: true | undefined;
     if (this.matchKeyword('PRIMARY')) {
       this.expectKeyword('KEY');
-      primaryKey = true;
+      // Primary key is structural (non-CRDT), represented internally as scalar.
+      return { name, type: { kind: 'scalar', scalar: 'STRING' }, primaryKey: true };
     }
-    return primaryKey ? { name, type, primaryKey } : { name, type };
+    const type = this.parseColumnType();
+    if (this.matchKeyword('PRIMARY')) {
+      this.expectKeyword('KEY');
+      this.raise(
+        `PRIMARY KEY column '${name}' must be declared as '${name} PRIMARY KEY' without a type`,
+      );
+    }
+    return { name, type };
   }
 
   private parseColumnType(): SqlColumnType {
@@ -416,8 +444,7 @@ class Parser {
       this.expectSymbol('>');
       return { kind: 'register', scalar };
     }
-    const scalar = this.parseScalarType();
-    return { kind: 'scalar', scalar };
+    this.raise(`expected CRDT column type (LWW<...>, COUNTER, SET<...>, REGISTER<...>)`);
   }
 
   private parseScalarType(): SqlScalarType {
@@ -715,9 +742,12 @@ export function printSql(statement: SqlStatement): string {
   switch (statement.kind) {
     case 'create_table': {
       const columns = statement.columns
-        .map((column) =>
-          `${column.name} ${printColumnType(column.type)}${column.primaryKey ? ' PRIMARY KEY' : ''}`,
-        )
+        .map((column) => {
+          if (column.primaryKey) {
+            return `${column.name} PRIMARY KEY`;
+          }
+          return `${column.name} ${printColumnType(column.type)}`;
+        })
         .join(', ');
       const partition = statement.partitionBy ? ` PARTITION BY ${statement.partitionBy}` : '';
       return `CREATE TABLE ${statement.table} (${columns})${partition}`;
@@ -858,17 +888,22 @@ export function tableSchemaFromCreate(statement: CreateTableStatement): SqlTable
   }
 
   const columns: SqlTableSchema['columns'] = {};
+  const pkName = primaryKeys[0]!.name;
   for (const column of statement.columns) {
     if (columns[column.name]) {
       throw new Error(
         `CREATE TABLE ${statement.table} has duplicate column '${column.name}'`,
       );
     }
+    if (column.type.kind === 'scalar' && column.name !== pkName) {
+      columns[column.name] = { crdt: 'lww' };
+      continue;
+    }
     columns[column.name] = { crdt: columnTypeToSchema(column.type) };
   }
 
   return {
-    pk: primaryKeys[0]!.name,
+    pk: pkName,
     partitionBy: statement.partitionBy ?? null,
     columns,
   };
@@ -937,19 +972,23 @@ function createOp(
   context: CrdtOpGenerationContext,
   table: string,
   key: SqlPrimaryKey,
-  column: string,
-  typ: CrdtTypeTag,
-  val: CrdtOpPayload,
-): EncodedCrdtOp {
+): BaseCrdtOp {
   return {
     tbl: table,
     key,
-    col: column,
-    typ,
     hlc: context.nextHlc(),
     site: context.site,
-    val,
   };
+}
+
+function createRowExistsOp(
+  context: CrdtOpGenerationContext,
+  table: string,
+  key: SqlPrimaryKey,
+  exists: boolean,
+): EncodedCrdtOp {
+  const op = createOp(context, table, key);
+  return { ...op, kind: 'row_exists', exists };
 }
 
 function createInsertColumnOp(
@@ -963,24 +1002,47 @@ function createInsertColumnOp(
   const columnSchema = requireColumnSchema(tableSchema, statement.table, column);
   switch (columnSchema.crdt) {
     case 'scalar':
-      return null;
+      if (column === tableSchema.pk) {
+        return null;
+      }
+      return {
+        ...createOp(context, statement.table, key),
+        kind: 'cell_lww',
+        col: column,
+        val: value,
+      };
     case 'lww':
-      return createOp(context, statement.table, key, column, 1, value);
+      return {
+        ...createOp(context, statement.table, key),
+        kind: 'cell_lww',
+        col: column,
+        val: value,
+      };
     case 'mv_register':
-      return createOp(context, statement.table, key, column, 4, value);
+      return {
+        ...createOp(context, statement.table, key),
+        kind: 'cell_mv_register',
+        col: column,
+        val: value,
+      };
     case 'pn_counter':
       if (typeof value !== 'number') {
         throw new Error(`INSERT for counter column '${statement.table}.${column}' requires NUMBER`);
       }
-      return createOp(context, statement.table, key, column, 2, {
+      return {
+        ...createOp(context, statement.table, key),
+        kind: 'cell_counter',
+        col: column,
         d: 'inc',
         n: value,
-      });
+      };
     case 'or_set':
-      return createOp(context, statement.table, key, column, 3, {
-        a: 'add',
+      return {
+        ...createOp(context, statement.table, key),
+        kind: 'cell_or_set_add',
+        col: column,
         val: value,
-      });
+      };
   }
 }
 
@@ -994,11 +1056,29 @@ function createUpdateColumnOp(
   const columnSchema = requireColumnSchema(tableSchema, statement.table, assignment.column);
   switch (columnSchema.crdt) {
     case 'lww':
-      return createOp(context, statement.table, key, assignment.column, 1, assignment.value);
+      return {
+        ...createOp(context, statement.table, key),
+        kind: 'cell_lww',
+        col: assignment.column,
+        val: assignment.value,
+      };
     case 'mv_register':
-      return createOp(context, statement.table, key, assignment.column, 4, assignment.value);
+      return {
+        ...createOp(context, statement.table, key),
+        kind: 'cell_mv_register',
+        col: assignment.column,
+        val: assignment.value,
+      };
     case 'scalar':
-      throw new Error(`UPDATE cannot target scalar column '${statement.table}.${assignment.column}'`);
+      if (assignment.column === tableSchema.pk) {
+        throw new Error(`UPDATE cannot target primary key column '${statement.table}.${assignment.column}'`);
+      }
+      return {
+        ...createOp(context, statement.table, key),
+        kind: 'cell_lww',
+        col: assignment.column,
+        val: assignment.value,
+      };
     case 'pn_counter':
       throw new Error(`UPDATE cannot target counter column '${statement.table}.${assignment.column}'; use INC/DEC`);
     case 'or_set':
@@ -1022,7 +1102,7 @@ function generateInsertOps(
   }
   const key = assertPrimaryKeyValue(primaryValue, statement.table, tableSchema.pk);
 
-  const ops: EncodedCrdtOp[] = [];
+  const ops: EncodedCrdtOp[] = [createRowExistsOp(context, statement.table, key, true)];
   for (let index = 0; index < statement.columns.length; index += 1) {
     const column = statement.columns[index]!;
     if (column === tableSchema.pk) {
@@ -1049,9 +1129,12 @@ function generateUpdateOps(
   context: CrdtOpGenerationContext,
 ): EncodedCrdtOp[] {
   const key = findPrimaryKeyInWhere(statement.where, statement.table, tableSchema.pk);
-  return statement.assignments.map((assignment) =>
-    createUpdateColumnOp(statement, tableSchema, context, key, assignment),
-  );
+  return [
+    createRowExistsOp(context, statement.table, key, true),
+    ...statement.assignments.map((assignment) =>
+      createUpdateColumnOp(statement, tableSchema, context, key, assignment),
+    ),
+  ];
 }
 
 function generateCounterOps(
@@ -1065,10 +1148,14 @@ function generateCounterOps(
     throw new Error(`column '${statement.table}.${statement.column}' is not a COUNTER`);
   }
   return [
-    createOp(context, statement.table, key, statement.column, 2, {
+    createRowExistsOp(context, statement.table, key, true),
+    {
+      ...createOp(context, statement.table, key),
+      kind: 'cell_counter',
+      col: statement.column,
       d: statement.kind,
       n: ensureCounterAmount(statement.amount, statement.table, statement.column),
-    }),
+    },
   ];
 }
 
@@ -1083,10 +1170,13 @@ function generateSetAddOps(
     throw new Error(`column '${statement.table}.${statement.column}' is not a SET`);
   }
   return [
-    createOp(context, statement.table, key, statement.column, 3, {
-      a: 'add',
+    createRowExistsOp(context, statement.table, key, true),
+    {
+      ...createOp(context, statement.table, key),
+      kind: 'cell_or_set_add',
+      col: statement.column,
       val: statement.value,
-    }),
+    },
   ];
 }
 
@@ -1113,10 +1203,13 @@ function generateSetRemoveOps(
     return [];
   }
   return [
-    createOp(context, statement.table, key, statement.column, 3, {
-      a: 'rmv',
+    createRowExistsOp(context, statement.table, key, true),
+    {
+      ...createOp(context, statement.table, key),
+      kind: 'cell_or_set_remove',
+      col: statement.column,
       tags,
-    }),
+    },
   ];
 }
 
@@ -1126,7 +1219,7 @@ function generateDeleteOps(
   context: CrdtOpGenerationContext,
 ): EncodedCrdtOp[] {
   const key = findPrimaryKeyInWhere(statement.where, statement.table, tableSchema.pk);
-  return [createOp(context, statement.table, key, '_deleted', 1, true)];
+  return [createRowExistsOp(context, statement.table, key, false)];
 }
 
 export function generateCrdtOps(

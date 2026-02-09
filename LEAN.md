@@ -105,7 +105,17 @@ Deletion is modeled as a LWW register on a hidden `_deleted` column. The interac
 Theorems:
 - `delete_wins_if_later`: If a delete has a higher HLC than any concurrent write, the row is tombstoned in the merged state.
 - `write_resurrects_if_later`: If a write has a higher HLC than a delete, the row is NOT tombstoned. (This is the intended semantic — LWW means last-writer-wins, including for deletes.)
-- `tombstone_stable_without_new_writes`: Once a row is tombstoned and no new writes arrive, it remains tombstoned through any number of merges. (Idempotency of LWW applied to the `_deleted` column.)
+- `tombstone_stable_without_new_writes`: Once a row is tombstoned and no new writes arrive, it remains tombstoned through any number of merges. (Idempotency of LWW applied to the row-visibility register.)
+
+### Table Composition Properties
+
+The Lean model now includes explicit whole-table composition lemmas in `Crdt/Table/Props`:
+
+- `table_merge_comm_of_row_comm`: pointwise table merge is commutative when row merge is commutative.
+- `table_merge_assoc_of_row_assoc`: pointwise table merge is associative when row merge is associative.
+- `table_merge_idem_of_row_idem`: pointwise table merge is idempotent when row merge is idempotent.
+- `modify_row_at_disjoint_commute`: updates on disjoint keys commute at the table level.
+- Mixed-operator row composition (`row_exists_counter_commute`, `row_exists_set_commute`, `row_counter_register_commute`).
 
 **3 theorems.**
 
