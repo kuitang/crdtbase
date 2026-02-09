@@ -11,6 +11,7 @@ import { HttpReplicatedLog } from '../../src/platform/node/httpReplicatedLog';
 import { compactReplicatedLog } from '../../src/platform/node/compactor';
 import { HttpSnapshotStore } from '../../src/platform/node/httpSnapshotStore';
 import { NodeCrdtClient } from '../../src/platform/node/nodeClient';
+import { E2E_SCHEDULES, TASK_QUERY_SQL, runThreeClientConvergenceScenario } from './orchestrator';
 
 const execFile = promisify(execFileWithCallback);
 
@@ -29,7 +30,9 @@ describe('Filesystem SQL end-to-end sync', () => {
     }
   });
 
-  it('syncs 3 clients via SQL with local/server .bin files and CLI dump', async () => {
+  it.each(E2E_SCHEDULES)(
+    'syncs 3 clients via SQL with local/server .bin files and CLI dump [$name]',
+    async (schedule) => {
     tempRoot = await mkdtemp(join(tmpdir(), 'crdtbase-e2e-'));
     const serverDir = join(tempRoot, 'server');
     const clientADir = join(tempRoot, 'client-a');
@@ -63,54 +66,17 @@ describe('Filesystem SQL end-to-end sync', () => {
       now: () => 3_000,
     });
 
-    const createTableSql = [
-      'CREATE TABLE tasks (',
-      'id STRING PRIMARY KEY,',
-      'title LWW<STRING>,',
-      'points COUNTER,',
-      'tags SET<STRING>,',
-      'status REGISTER<STRING>',
-      ')',
-    ].join(' ');
-    await Promise.all([
-      clientA.exec(createTableSql),
-      clientB.exec(createTableSql),
-      clientC.exec(createTableSql),
-    ]);
-
-    await clientA.exec(
-      "INSERT INTO tasks (id, title, points, tags, status) VALUES ('t1', 'from-a', 0, 'alpha', 'open');",
-    );
-    await clientA.sync();
-    await clientB.pull();
-    await clientC.pull();
-
-    await clientB.exec("UPDATE tasks SET title = 'from-b', status = 'review' WHERE id = 't1';");
-    await clientB.exec('INC tasks.points BY 3 WHERE id = \'t1\';');
-    await clientB.exec("ADD 'beta' TO tasks.tags WHERE id = 't1';");
-
-    await clientC.exec("UPDATE tasks SET title = 'from-c' WHERE id = 't1';");
-    await clientC.exec('INC tasks.points BY 5 WHERE id = \'t1\';');
-    await clientC.exec("ADD 'gamma' TO tasks.tags WHERE id = 't1';");
-
-    await clientB.push();
-    await clientC.push();
-    await clientA.pull();
-    await clientB.pull();
-    await clientC.pull();
-
-    await clientB.exec("REMOVE 'alpha' FROM tasks.tags WHERE id = 't1';");
-    await clientB.push();
-    await clientA.pull();
-    await clientC.pull();
-
-    const querySql = "SELECT * FROM tasks WHERE id = 't1';";
-    const [rowsA, rowsB, rowsC] = await Promise.all([
-      clientA.query(querySql),
-      clientB.query(querySql),
-      clientC.query(querySql),
-    ]);
-
+    const result = await runThreeClientConvergenceScenario({
+      clients: {
+        'site-a': clientA,
+        'site-b': clientB,
+        'site-c': clientC,
+      },
+      schedule,
+    });
+    const rowsA = result.rowsBySite['site-a'];
+    const rowsB = result.rowsBySite['site-b'];
+    const rowsC = result.rowsBySite['site-c'];
     expect(rowsA).toEqual(rowsB);
     expect(rowsB).toEqual(rowsC);
     expect(rowsA).toHaveLength(1);
@@ -235,7 +201,7 @@ describe('Filesystem SQL end-to-end sync', () => {
       now: () => 4_000,
     });
     await clientD.pull();
-    const rowsD = await clientD.query(querySql);
+    const rowsD = await clientD.query(TASK_QUERY_SQL);
     expect(rowsD).toEqual(rowsA);
     await stat(join(clientDDir, 'snapshots', 'manifest.bin'));
     await stat(join(clientDDir, 'snapshots', manifestDump.segments[0]!.path));
@@ -248,5 +214,6 @@ describe('Filesystem SQL end-to-end sync', () => {
     expect(secondCompaction.applied).toBe(true);
     expect(secondCompaction.opsRead).toBe(0);
     expect(secondCompaction.manifest.sites_compacted).toEqual(compaction.manifest.sites_compacted);
-  });
+    },
+  );
 });
