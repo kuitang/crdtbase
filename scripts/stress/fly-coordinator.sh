@@ -18,5 +18,11 @@ set -euo pipefail
 # Implementation note:
 # This shell entrypoint is intentionally thin. Coordinator logic lives in
 # scripts/stress/fly-coordinator.ts using Fly Machines REST API with OpenAPI-generated types.
+#
+# Fly auth note:
+# - Coordinator uses FLY_API_TOKEN / FLY_ACCESS_TOKEN as initial bearer token.
+# - On 401/403 from Fly Machines API, coordinator retries once after refreshing token from
+#   FLY_API_TOKEN_COMMAND (default: "flyctl auth token"). This prevents multi-run batches
+#   from failing when short-lived tokens expire mid-job.
 
 exec npx tsx scripts/stress/fly-coordinator.ts "$@"

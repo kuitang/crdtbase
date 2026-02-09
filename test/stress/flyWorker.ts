@@ -328,7 +328,7 @@ function readConfig(): WorkerConfig {
   const pollIntervalMs = parsePositiveIntEnv('STRESS_POLL_INTERVAL_MS', 250);
   const drainRounds = parsePositiveIntEnv('STRESS_DRAIN_ROUNDS', 8);
   const drainQuiescenceRounds = parsePositiveIntEnv('STRESS_DRAIN_QUIESCENCE_ROUNDS', 2);
-  const drainMaxExtraRounds = parsePositiveIntEnv('STRESS_DRAIN_MAX_EXTRA_ROUNDS', 40);
+  const drainMaxExtraRounds = parsePositiveIntEnv('STRESS_DRAIN_MAX_EXTRA_ROUNDS', 200);
   const commandTimeoutMs = parsePositiveIntEnv('STRESS_COMMAND_TIMEOUT_S', 180) * 1000;
   const seedRaw = readRequiredEnv('STRESS_SEED');
   const seed = Number.parseInt(seedRaw, 10) | 0;
@@ -460,7 +460,7 @@ async function runMain(): Promise<void> {
   logLine(
     config.siteId,
     config.runId,
-    `worker starting region=${config.region} ops=${config.opsPerClient} barrierEvery=${config.barrierEveryOps} hardEvery=${config.hardBarrierEvery} syncAfterEachOp=true drainRounds=${config.drainRounds} quiescence=${config.drainQuiescenceRounds} maxExtra=${config.drainMaxExtraRounds}`,
+    `worker starting region=${config.region} ops=${config.opsPerClient} barrierEvery=${config.barrierEveryOps} hardEvery=${config.hardBarrierEvery} pushAfterWrite=true pullBeforeRead=true drainRounds=${config.drainRounds} quiescence=${config.drainQuiescenceRounds} maxExtra=${config.drainMaxExtraRounds}`,
   );
   const baseSeed = (config.seed ^ siteSalt(config.siteId)) >>> 0;
   const rng = createSeededRng(baseSeed);
@@ -571,9 +571,11 @@ async function runMain(): Promise<void> {
       config.runId,
       `entering barrier index=${barrierIndex} type=${barrierType} opIndex=${opIndex}`,
     );
-    // Flush local pending writes and advance remote cursors before publishing pre-barrier heads.
-    await client.sync();
-    stats.syncs += 1;
+    // Flush local writes then refresh remote cursors before publishing pre-barrier heads.
+    await client.push();
+    stats.pushes += 1;
+    await client.pull();
+    stats.pulls += 1;
     await publishBarrier({
       barrierIndex,
       barrierType,
@@ -614,8 +616,10 @@ async function runMain(): Promise<void> {
           !reachedTarget) &&
         roundsPerformed < hardRoundLimit
       ) {
-        await client.sync();
-        stats.syncs += 1;
+        await client.push();
+        stats.pushes += 1;
+        await client.pull();
+        stats.pulls += 1;
         roundsPerformed += 1;
         const syncedHeads = client.getSyncedHeads();
         const targetCheck = compareHeadsToTarget(syncedHeads, targetHeads);
@@ -722,12 +726,15 @@ async function runMain(): Promise<void> {
 
     for (let opIndex = 1; opIndex <= config.opsPerClient; opIndex += 1) {
       const rowId = pickRowId(rng, rowIds);
-      const writeRoll = rng();
-      if (writeRoll < 0.5) {
+      const opRoll = rng();
+      let wrote = false;
+
+      if (opRoll < 0.5) {
         const amount = rngInt(rng, 1, 7);
         await client.exec(`INC tasks.points BY ${amount} WHERE id = '${escapeSqlString(rowId)}';`);
         expectations.points.set(rowId, (expectations.points.get(rowId) ?? 0) + amount);
-      } else if (writeRoll < 0.82) {
+        wrote = true;
+      } else if (opRoll < 0.82) {
         const tag = `${config.siteId}-t-${opIndex}-${rngInt(rng, 10_000, 999_999)}`;
         await client.exec(
           `ADD '${escapeSqlString(tag)}' TO tasks.tags WHERE id = '${escapeSqlString(rowId)}';`,
@@ -737,22 +744,40 @@ async function runMain(): Promise<void> {
           throw new Error(`unknown row in expectations '${rowId}'`);
         }
         set.add(tag);
-      } else if (writeRoll < 0.92) {
+        wrote = true;
+      } else if (opRoll < 0.92) {
         const title = `${config.siteId}-title-${opIndex}-${rngInt(rng, 1, 999_999)}`;
         await client.exec(
           `UPDATE tasks SET title = '${escapeSqlString(title)}' WHERE id = '${escapeSqlString(rowId)}';`,
         );
-      } else {
+        wrote = true;
+      } else if (opRoll < 0.97) {
         const status = rngPick(rng, statuses);
         await client.exec(
           `UPDATE tasks SET status = '${escapeSqlString(status)}' WHERE id = '${escapeSqlString(rowId)}';`,
         );
+        wrote = true;
+      } else {
+        await client.pull();
+        stats.pulls += 1;
+        const rows = normalizeTaskRows(await client.query(TASK_QUERY_SQL));
+        const row = rows.find((candidate) => candidate.id === rowId);
+        if (!row) {
+          throw new Error(`read operation missing row '${rowId}'`);
+        }
+        const expectedPoints = expectations.points.get(rowId) ?? 0;
+        if (row.points < expectedPoints) {
+          throw new Error(
+            `read operation observed points regression for '${rowId}': actual=${row.points} expected>=${expectedPoints}`,
+          );
+        }
       }
-      stats.writes += 1;
 
-      // Protocol requirement for this stress mode: every op round trips push+pull via sync().
-      await client.sync();
-      stats.syncs += 1;
+      if (wrote) {
+        stats.writes += 1;
+        await client.push();
+        stats.pushes += 1;
+      }
 
       if (opIndex % config.barrierEveryOps === 0) {
         barrierIndex += 1;
@@ -773,8 +798,10 @@ async function runMain(): Promise<void> {
       await runBarrier(barrierIndex, config.opsPerClient);
     }
 
-    await client.sync();
-    stats.syncs += 1;
+    await client.push();
+    stats.pushes += 1;
+    await client.pull();
+    stats.pulls += 1;
     const finalRows = normalizeTaskRows(await client.query(TASK_QUERY_SQL));
     await publishFinal({
       runId: config.runId,

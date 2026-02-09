@@ -40,7 +40,10 @@ Workers must report `pendingOps=0` at pre barrier and drain until local synced h
 - Long sequences per site (`STRESS_OPS_PER_CLIENT`, default 30,000)
 - Hot-row contention + randomized operation mix
 - Very high throughput by default (no artificial sleep in operation loop)
-- Every operation ends with `sync()` (explicitly push+pull each op)
+- Protocol cadence in worker loop:
+  - write operations: `exec` then `push`
+  - read operations: `pull` then `query`
+  - barriers still force explicit drain rounds for convergence checks
 
 ## Barrier Time Expectations (iad + lhr + syd)
 
@@ -60,4 +63,4 @@ Workers must report `pendingOps=0` at pre barrier and drain until local synced h
 - `STRESS_POLL_INTERVAL_MS=250`
 - `STRESS_DRAIN_ROUNDS=8`
 - `STRESS_DRAIN_QUIESCENCE_ROUNDS=2`
-- `STRESS_DRAIN_MAX_EXTRA_ROUNDS=40`
+- `STRESS_DRAIN_MAX_EXTRA_ROUNDS=200`

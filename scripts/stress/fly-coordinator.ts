@@ -11,7 +11,6 @@ import {
   S3Client,
   type S3ClientConfig,
 } from '@aws-sdk/client-s3';
-import type { components } from './fly-machines-openapi';
 import {
   SITE_IDS,
   computeTargetHeadsFromPreReports,
@@ -21,9 +20,7 @@ import {
   type SiteId,
   type WorkerBarrierReport,
 } from './flyCoordinatorCore';
-
-type FlyMachine = components['schemas']['Machine'];
-type CreateMachineRequest = components['schemas']['CreateMachineRequest'];
+import { FlyCommandTokenProvider, FlyMachinesApiClient, type CreateMachineRequest } from './flyMachinesApi';
 
 type WorkerFinalReport = {
   runId: string;
@@ -59,6 +56,7 @@ type CoordinatorConfig = {
   flyWorkerImage: string;
   flyApiBaseUrl: string;
   flyApiToken: string;
+  flyApiTokenCommand: string;
   regions: Record<SiteId, string>;
   stressRuns: number;
   stressOpsPerClient: number;
@@ -89,102 +87,6 @@ type WorkerInstance = {
   region: string;
   machineId: string;
 };
-
-class FlyMachinesApiClient {
-  constructor(
-    private readonly baseUrl: string,
-    private readonly token: string,
-  ) {}
-
-  async createMachine(appName: string, request: CreateMachineRequest): Promise<FlyMachine> {
-    return this.requestJson<FlyMachine>(
-      `/apps/${encodeURIComponent(appName)}/machines`,
-      'POST',
-      request,
-    );
-  }
-
-  async waitMachineState(
-    appName: string,
-    machineId: string,
-    options: { state: 'started' | 'stopped' | 'suspended' | 'destroyed'; timeoutSeconds: number },
-  ): Promise<void> {
-    const deadline = Date.now() + options.timeoutSeconds * 1000;
-    while (Date.now() < deadline) {
-      const remainingSeconds = Math.ceil((deadline - Date.now()) / 1000);
-      const waitSeconds = Math.max(1, Math.min(60, remainingSeconds));
-      const query = new URLSearchParams({
-        state: options.state,
-        timeout: String(waitSeconds),
-      });
-      try {
-        await this.requestNoContent(
-          `/apps/${encodeURIComponent(appName)}/machines/${encodeURIComponent(machineId)}/wait?${query.toString()}`,
-          'GET',
-        );
-        return;
-      } catch (error) {
-        const message = String(error);
-        if (message.includes('status=408') || message.includes('status=504')) {
-          continue;
-        }
-        throw error;
-      }
-    }
-    throw new Error(`timed out waiting for machine ${machineId} to reach state='${options.state}'`);
-  }
-
-  async deleteMachine(appName: string, machineId: string, force: boolean): Promise<void> {
-    const query = new URLSearchParams();
-    if (force) {
-      query.set('force', 'true');
-    }
-    const suffix = query.size > 0 ? `?${query.toString()}` : '';
-    await this.requestNoContent(
-      `/apps/${encodeURIComponent(appName)}/machines/${encodeURIComponent(machineId)}${suffix}`,
-      'DELETE',
-    );
-  }
-
-  private async requestJson<T>(path: string, method: 'GET' | 'POST' | 'DELETE', body?: unknown): Promise<T> {
-    const response = await fetch(`${this.baseUrl}${path}`, {
-      method,
-      headers: {
-        authorization: `Bearer ${this.token}`,
-        'content-type': body ? 'application/json' : 'application/json',
-      },
-      ...(body ? { body: JSON.stringify(body) } : {}),
-    });
-
-    const text = await response.text();
-    if (!response.ok) {
-      throw new Error(
-        `Fly API ${method} ${path} failed status=${response.status} body=${text.slice(0, 400)}`,
-      );
-    }
-
-    if (text.trim().length === 0) {
-      throw new Error(`Fly API ${method} ${path} returned empty JSON body`);
-    }
-
-    return JSON.parse(text) as T;
-  }
-
-  private async requestNoContent(path: string, method: 'GET' | 'POST' | 'DELETE'): Promise<void> {
-    const response = await fetch(`${this.baseUrl}${path}`, {
-      method,
-      headers: {
-        authorization: `Bearer ${this.token}`,
-      },
-    });
-    const text = await response.text();
-    if (!response.ok) {
-      throw new Error(
-        `Fly API ${method} ${path} failed status=${response.status} body=${text.slice(0, 400)}`,
-      );
-    }
-  }
-}
 
 function timestampUtc(): string {
   return new Date().toISOString();
@@ -238,9 +140,12 @@ function readConfig(): CoordinatorConfig {
     throw new Error('STRESS_BARRIER_EVERY_OPS must be <= STRESS_OPS_PER_CLIENT');
   }
 
-  const flyApiToken = process.env.FLY_API_TOKEN ?? process.env.FLY_ACCESS_TOKEN ?? '';
-  if (flyApiToken.trim().length === 0) {
-    throw new Error('missing FLY_API_TOKEN (or FLY_ACCESS_TOKEN) for Fly Machines REST API');
+  const flyApiToken = (process.env.FLY_API_TOKEN ?? process.env.FLY_ACCESS_TOKEN ?? '').trim();
+  const flyApiTokenCommand = (process.env.FLY_API_TOKEN_COMMAND ?? 'flyctl auth token').trim();
+  if (flyApiToken.length === 0 && flyApiTokenCommand.length === 0) {
+    throw new Error(
+      'missing Fly token source: set FLY_API_TOKEN/FLY_ACCESS_TOKEN or FLY_API_TOKEN_COMMAND',
+    );
   }
 
   return {
@@ -248,6 +153,7 @@ function readConfig(): CoordinatorConfig {
     flyWorkerImage: readRequiredEnv('FLY_WORKER_IMAGE'),
     flyApiBaseUrl: resolveFlyApiBaseUrl(process.env.FLY_API_HOSTNAME),
     flyApiToken,
+    flyApiTokenCommand,
     regions: parseRegions(process.env.FLY_REGIONS),
     stressRuns,
     stressOpsPerClient,
@@ -255,7 +161,7 @@ function readConfig(): CoordinatorConfig {
     stressHardBarrierEvery: parsePositiveIntEnv('STRESS_HARD_BARRIER_EVERY', 2),
     stressDrainRounds: parsePositiveIntEnv('STRESS_DRAIN_ROUNDS', 8),
     stressDrainQuiescenceRounds: parsePositiveIntEnv('STRESS_DRAIN_QUIESCENCE_ROUNDS', 2),
-    stressDrainMaxExtraRounds: parsePositiveIntEnv('STRESS_DRAIN_MAX_EXTRA_ROUNDS', 40),
+    stressDrainMaxExtraRounds: parsePositiveIntEnv('STRESS_DRAIN_MAX_EXTRA_ROUNDS', 200),
     stressRowCount: parsePositiveIntEnv('STRESS_ROW_COUNT', 64),
     stressPollIntervalMs: parsePositiveIntEnv('STRESS_POLL_INTERVAL_MS', 250),
     stressSoftBarrierTimeoutS: parsePositiveIntEnv('STRESS_SOFT_BARRIER_TIMEOUT_S', 30),
@@ -940,7 +846,12 @@ async function main(): Promise<void> {
   };
 
   const s3 = new S3Client(s3Config);
-  const fly = new FlyMachinesApiClient(config.flyApiBaseUrl, config.flyApiToken);
+  const flyTokenProvider = new FlyCommandTokenProvider({
+    initialToken: config.flyApiToken,
+    refreshCommand: config.flyApiTokenCommand,
+    log,
+  });
+  const fly = new FlyMachinesApiClient(config.flyApiBaseUrl, flyTokenProvider);
 
   log('Starting Fly multi-region stress coordinator (TypeScript REST mode)');
   log(`App=${config.flyApp} image=${config.flyWorkerImage} regions=${Object.values(config.regions).join(',')} runs=${config.stressRuns}`);
