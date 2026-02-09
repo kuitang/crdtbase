@@ -20,7 +20,7 @@
             Backend
             <select id="backend">
               <option value="http">HTTP</option>
-              <option value="s3-presign">S3 (Pre-Signed URLs)</option>
+              <option value="s3">S3 (Direct Credentials)</option>
             </select>
           </label>
           <label>
@@ -37,22 +37,26 @@
         </div>
 
         <div id="s3-fields" class="grid hidden">
-          <label>
-            Bucket
-            <input id="s3-bucket" value="crdtbase" />
-          </label>
-          <label>
-            Prefix
-            <input id="s3-prefix" value="deltas" />
-          </label>
           <label class="wide">
-            Pre-Sign Service URL
-            <input id="presign-base-url" value="http://127.0.0.1:8787" />
+            S3 Config (JSON or KEY=value pairs)
+            <textarea
+              id="s3-config"
+              rows="7"
+              spellcheck="false"
+            >{
+  "bucket": "crdtbase",
+  "prefix": "deltas",
+  "endpoint": "http://127.0.0.1:9000",
+  "region": "us-east-1",
+  "accessKeyId": "minioadmin",
+  "secretAccessKey": "minioadmin",
+  "forcePathStyle": true
+}</textarea>
           </label>
-          <label class="wide">
-            Pre-Sign Auth Token (optional)
-            <input id="presign-auth-token" value="" />
-          </label>
+          <p class="wide">
+            Accepts either JSON object or loose KEY=value tokens (whitespace-separated). Example:
+            <code>bucket=crdtbase endpoint=http://127.0.0.1:9000 accessKeyId=minioadmin secretAccessKey=minioadmin forcePathStyle=true</code>
+          </p>
         </div>
 
         <div class="actions">

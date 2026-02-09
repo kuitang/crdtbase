@@ -31,7 +31,6 @@ function sleep(ms: number): Promise<void> {
 
 async function startHarnessWithRetry(params: {
   kind: BackendMatrixKind;
-  authToken?: string;
 }): Promise<Awaited<ReturnType<typeof startBackendMatrixHarness>>> {
   let lastError: unknown = null;
   for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -80,10 +79,7 @@ async function runRestartScenarioOnBackend(params: {
   drainRounds: number;
   quiescenceRounds: number;
 }): Promise<BackendRestartOutcome> {
-  const harness = await startHarnessWithRetry({
-    kind: params.kind,
-    authToken: params.kind === 's3-presign-auth' ? `auth-${params.seed}` : undefined,
-  });
+  const harness = await startHarnessWithRetry({ kind: params.kind });
 
   try {
     const dataRoot = join(harness.rootDir, 'restart-clients');
@@ -213,17 +209,8 @@ describe.sequential('Crash/restart chaos properties across backends', () => {
         drainRounds,
         quiescenceRounds,
       });
-      const s3MinioPresign = await runRestartScenarioOnBackend({
-        kind: 's3-minio-presign',
-        seed,
-        trace,
-        restartPlan,
-        rowIds,
-        drainRounds,
-        quiescenceRounds,
-      });
-      const s3PresignAuth = await runRestartScenarioOnBackend({
-        kind: 's3-presign-auth',
+      const s3Minio = await runRestartScenarioOnBackend({
+        kind: 's3-minio',
         seed,
         trace,
         restartPlan,
@@ -233,7 +220,6 @@ describe.sequential('Crash/restart chaos properties across backends', () => {
       });
 
       // Restart behavior should still converge to backend-independent state.
-      expect(http.rows).toEqual(s3MinioPresign.rows);
-      expect(s3MinioPresign.rows).toEqual(s3PresignAuth.rows);
+      expect(http.rows).toEqual(s3Minio.rows);
     }, timeoutMs);
 });

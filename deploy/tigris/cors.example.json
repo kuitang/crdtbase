@@ -1,0 +1,14 @@
+{
+  "CORSRules": [
+    {
+      "AllowedOrigins": [
+        "http://127.0.0.1:4173",
+        "http://0.0.0.0:4173"
+      ],
+      "AllowedMethods": ["GET", "PUT", "POST", "DELETE", "HEAD"],
+      "AllowedHeaders": ["*"],
+      "ExposeHeaders": ["ETag"],
+      "MaxAgeSeconds": 3000
+    }
+  ]
+}

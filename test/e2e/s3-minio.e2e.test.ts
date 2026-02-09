@@ -5,17 +5,13 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { GetObjectCommand, ListObjectsV2Command, S3Client } from '@aws-sdk/client-s3';
 import { afterEach, describe, expect, it } from 'vitest';
+import { S3ReplicatedLog } from '../../src/backend/s3ReplicatedLog';
 import { TigrisSnapshotStore } from '../../src/backend/tigrisSnapshotStore';
 import { decodeBin } from '../../src/core/encoding';
 import { SqlSchema } from '../../src/core/sql';
 import { compactReplicatedLog } from '../../src/platform/node/compactor';
 import { NodeCrdtClient } from '../../src/platform/node/nodeClient';
-import {
-  HttpS3PresignProvider,
-  PresignedS3ReplicatedLog,
-} from '../../src/platform/shared/presignedS3ReplicatedLog';
 import { MinioHarness } from './minioHarness';
-import { PresignHarness } from './presignHarness';
 import {
   normalizeTaskRows,
   runThreeClientChaosScenario,
@@ -36,16 +32,11 @@ async function objectBodyToBytes(body: unknown): Promise<Uint8Array> {
   throw new Error('unsupported object body type');
 }
 
-describe('S3 pre-signed replication over MinIO chaos', () => {
+describe('S3 direct replication over MinIO chaos', () => {
   let tempRoot: string | null = null;
   let minio: MinioHarness | null = null;
-  let presign: PresignHarness | null = null;
 
   afterEach(async () => {
-    if (presign) {
-      await presign.stop();
-      presign = null;
-    }
     if (minio) {
       await minio.stop();
       minio = null;
@@ -57,15 +48,12 @@ describe('S3 pre-signed replication over MinIO chaos', () => {
   });
 
   it.each(CHAOS.seeds)(
-    'converges under random delayed concurrent client activity through pre-signed S3 transport [seed=%s]',
+    'converges under random delayed concurrent client activity through direct S3 transport [seed=%s]',
     async (seed) => {
       tempRoot = await mkdtemp(join(tmpdir(), 'crdtbase-minio-chaos-e2e-'));
       minio = await MinioHarness.start({
         rootDir: tempRoot,
         bucket: 'crdtbase',
-      });
-      presign = await PresignHarness.start({
-        endpoint: minio.getEndpoint(),
       });
 
       const s3Config = minio.getS3ClientConfig();
@@ -76,14 +64,11 @@ describe('S3 pre-signed replication over MinIO chaos', () => {
       const observerDir = join(tempRoot, 'observer');
       const clientDDir = join(tempRoot, 'client-d');
 
-      const provider = new HttpS3PresignProvider({
-        baseUrl: presign.getBaseUrl(),
-      });
-      const makeLog = (): PresignedS3ReplicatedLog =>
-        new PresignedS3ReplicatedLog({
+      const makeLog = (): S3ReplicatedLog =>
+        new S3ReplicatedLog({
           bucket,
           prefix: 'deltas',
-          presign: provider,
+          clientConfig: s3Config,
         });
 
       const logA = makeLog();

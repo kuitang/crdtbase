@@ -74,6 +74,15 @@ Reports are written to:
 
 `test:coverage` lowers chaos/DRT run counts and forces single-worker execution to avoid MinIO port races while still exercising end-to-end merge/sync paths.
 
+## CI
+
+GitHub CI runs on every push to `main` and every PR targeting `main`:
+- Lean proofs/oracle build (`CrdtBase`, `CrdtBaseDRT`) with mathlib cache
+- full TypeScript test suite (`npm test`)
+
+Workflow file:
+- `.github/workflows/ci.yml`
+
 ## Backend: HTTP (File Replicated Log)
 
 Start HTTP backend:
@@ -84,31 +93,15 @@ npm run backend:http -- --host 0.0.0.0 --port 8788 --root-dir ./.crdtbase-http-s
 
 This server exposes `GET/POST/PUT` endpoints for logs and snapshots and now includes CORS headers for browser use.
 
-## Backend: S3 with Pre-Signed URLs
+## Backend: Direct S3 / Tigris
 
-For REPL S3 mode, clients use a pre-sign service that returns short-lived signed URLs for:
-- `ListObjectsV2`
-- `GetObject`
-- `PutObject`
+S3 mode uses direct signed AWS SDK requests (`S3ReplicatedLog`) with credentials.
+No intermediate signing service is used in this repository.
 
-Start pre-sign service:
-
-```bash
-npm run presign:server -- \
-  --host 0.0.0.0 \
-  --port 8787 \
-  --endpoint http://127.0.0.1:9000 \
-  --region us-east-1 \
-  --force-path-style true \
-  --access-key-id minioadmin \
-  --secret-access-key minioadmin
-```
-
-### How pre-signed flow works
-
-1. Client asks pre-sign service for a signed request (`/v1/presign/*`).
-2. Service signs S3 operation using server-side credentials.
-3. Client executes returned signed URL directly via `fetch`.
+Tigris service setup (bucket, credentials, env template, CORS example):
+- `deploy/tigris/README.md`
+- `deploy/tigris/env.tigris.example`
+- `deploy/tigris/cors.example.json`
 
 ### Browser note for S3
 
@@ -151,26 +144,34 @@ npm run repl:node -- \
   --http-base-url http://127.0.0.1:8788
 ```
 
-Start Node REPL (S3 pre-sign backend):
+Start Node REPL (S3 backend):
 
 ```bash
 npm run repl:node -- \
-  --backend s3-presign \
+  --backend s3 \
   --site-id site-a \
   --bucket crdtbase \
   --prefix deltas \
-  --presign-base-url http://127.0.0.1:8787
+  --s3-endpoint http://127.0.0.1:9000 \
+  --s3-region us-east-1 \
+  --s3-access-key-id minioadmin \
+  --s3-secret-access-key minioadmin \
+  --s3-force-path-style true
 ```
 
 Start Node REPL with persistent local state (opt-in):
 
 ```bash
 npm run repl:node -- \
-  --backend s3-presign \
+  --backend s3 \
   --site-id site-a \
   --bucket crdtbase \
   --prefix deltas \
-  --presign-base-url http://127.0.0.1:8787 \
+  --s3-endpoint http://127.0.0.1:9000 \
+  --s3-region us-east-1 \
+  --s3-access-key-id minioadmin \
+  --s3-secret-access-key minioadmin \
+  --s3-force-path-style true \
   --data-dir ./.crdtbase-cli/site-a
 ```
 
@@ -200,11 +201,22 @@ http://0.0.0.0:4173
 ```
 
 The browser REPL uses a black-and-white ChatGPT-like style and supports:
-- backend switch (`HTTP` or `S3 (Pre-Signed URLs)`)
+- backend switch (`HTTP` or `S3 (Direct Credentials)`)
 - `.push` / `.pull` / `.sync` buttons
 - SQL execution (Ctrl/Cmd + Enter)
 - plain table output formatting
 - clickable example queries
+
+For S3 mode, use a single connection textarea that accepts either:
+- JSON object
+- loose `KEY=value` pairs separated by whitespace/newlines
+
+Accepted keys include:
+- `bucket`, `prefix`, `endpoint`, `region`
+- `accessKeyId` / `AWS_ACCESS_KEY_ID`
+- `secretAccessKey` / `AWS_SECRET_ACCESS_KEY`
+- `sessionToken` / `AWS_SESSION_TOKEN` (optional)
+- `forcePathStyle` (optional, typically `true` for MinIO)
 
 Browser REPL state safety:
 - local client state is in-memory only (no browser persistence across page reload)
@@ -233,7 +245,7 @@ SELECT * FROM tasks;
 
 ## Manual Consistency Check
 
-1. Start backend (`backend:http` or S3+presign).
+1. Start backend (`backend:http` or S3 direct).
 2. Open two clients (two Node REPLs, or Node + browser) with different `site-id`s.
 3. On client A: run DDL + insert + `INC` + `ADD`, then `.push`.
 4. On client B: `.pull`, run concurrent writes, `.push`.

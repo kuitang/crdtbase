@@ -1,9 +1,6 @@
 import { HttpReplicatedLog } from '../../src/platform/node/httpReplicatedLog';
 import { BrowserCrdtClient } from '../../src/platform/browser/browserClient';
-import {
-  HttpS3PresignProvider,
-  PresignedS3ReplicatedLog,
-} from '../../src/platform/shared/presignedS3ReplicatedLog';
+import { S3ReplicatedLog } from '../../src/backend/s3ReplicatedLog';
 
 type BrowserBridgeClient = BrowserCrdtClient;
 
@@ -15,18 +12,22 @@ type CreateHttpClient = {
   nowMs: number;
 };
 
-type CreateS3PresignClient = {
+type CreateS3Client = {
   clientId: string;
   siteId: string;
-  kind: 's3-presign';
+  kind: 's3';
   bucket: string;
   prefix: string;
-  presignBaseUrl: string;
-  presignAuthToken?: string;
+  endpoint: string;
+  region: string;
+  accessKeyId: string;
+  secretAccessKey: string;
+  sessionToken?: string;
+  forcePathStyle: boolean;
   nowMs: number;
 };
 
-type CreateClientParams = CreateHttpClient | CreateS3PresignClient;
+type CreateClientParams = CreateHttpClient | CreateS3Client;
 
 const clients = new Map<string, BrowserBridgeClient>();
 
@@ -57,13 +58,19 @@ async function createClient(params: CreateClientParams): Promise<void> {
 
   const client = await BrowserCrdtClient.open({
     siteId: params.siteId,
-    log: new PresignedS3ReplicatedLog({
+    log: new S3ReplicatedLog({
       bucket: params.bucket,
       prefix: params.prefix,
-      presign: new HttpS3PresignProvider({
-        baseUrl: params.presignBaseUrl,
-        authToken: params.presignAuthToken,
-      }),
+      clientConfig: {
+        endpoint: params.endpoint,
+        region: params.region,
+        forcePathStyle: params.forcePathStyle,
+        credentials: {
+          accessKeyId: params.accessKeyId,
+          secretAccessKey: params.secretAccessKey,
+          ...(params.sessionToken ? { sessionToken: params.sessionToken } : {}),
+        },
+      },
     }),
     now,
   });

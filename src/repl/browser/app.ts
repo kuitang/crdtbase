@@ -1,13 +1,22 @@
+import type { S3ClientConfig } from '@aws-sdk/client-s3';
 import { parseSql } from '../../core/sql';
 import { BrowserCrdtClient } from '../../platform/browser/browserClient';
+import { S3ReplicatedLog } from '../../backend/s3ReplicatedLog';
 import { HttpReplicatedLog } from '../../platform/node/httpReplicatedLog';
-import {
-  HttpS3PresignProvider,
-  PresignedS3ReplicatedLog,
-} from '../../platform/shared/presignedS3ReplicatedLog';
 import { formatRowsAsTable } from '../tableFormat';
 
-type BackendMode = 'http' | 's3-presign';
+type BackendMode = 'http' | 's3';
+
+type ParsedS3Config = {
+  bucket: string;
+  prefix: string;
+  endpoint: string;
+  region: string;
+  accessKeyId: string;
+  secretAccessKey: string;
+  sessionToken?: string;
+  forcePathStyle: boolean;
+};
 
 const EXAMPLES = [
   'CREATE TABLE tasks (id STRING PRIMARY KEY, title LWW<STRING>, points COUNTER, tags SET<STRING>, status REGISTER<STRING>);',
@@ -21,10 +30,7 @@ const EXAMPLES = [
 const backendSelect = document.getElementById('backend') as HTMLSelectElement;
 const siteIdInput = document.getElementById('site-id') as HTMLInputElement;
 const httpBaseUrlInput = document.getElementById('http-base-url') as HTMLInputElement;
-const s3BucketInput = document.getElementById('s3-bucket') as HTMLInputElement;
-const s3PrefixInput = document.getElementById('s3-prefix') as HTMLInputElement;
-const presignBaseUrlInput = document.getElementById('presign-base-url') as HTMLInputElement;
-const presignAuthTokenInput = document.getElementById('presign-auth-token') as HTMLInputElement;
+const s3ConfigInput = document.getElementById('s3-config') as HTMLTextAreaElement;
 
 const httpFields = document.getElementById('http-fields') as HTMLDivElement;
 const s3Fields = document.getElementById('s3-fields') as HTMLDivElement;
@@ -76,13 +82,167 @@ function disconnectActiveSession(reason: string): void {
 }
 
 function currentBackend(): BackendMode {
-  return backendSelect.value === 's3-presign' ? 's3-presign' : 'http';
+  return backendSelect.value === 's3' ? 's3' : 'http';
 }
 
 function refreshBackendVisibility(): void {
   const mode = currentBackend();
   httpFields.classList.toggle('hidden', mode !== 'http');
-  s3Fields.classList.toggle('hidden', mode !== 's3-presign');
+  s3Fields.classList.toggle('hidden', mode !== 's3');
+}
+
+function normalizeConfigKey(key: string): string {
+  return key.toLowerCase().replace(/[^a-z0-9]/gu, '');
+}
+
+function parseBooleanValue(raw: string, label: string): boolean {
+  const value = raw.trim().toLowerCase();
+  if (value === '1' || value === 'true' || value === 'yes' || value === 'on') {
+    return true;
+  }
+  if (value === '0' || value === 'false' || value === 'no' || value === 'off') {
+    return false;
+  }
+  throw new Error(`invalid ${label}: '${raw}'`);
+}
+
+function unquoteValue(raw: string): string {
+  if (raw.length >= 2 && raw.startsWith('"') && raw.endsWith('"')) {
+    return JSON.parse(raw) as string;
+  }
+  if (raw.length >= 2 && raw.startsWith("'") && raw.endsWith("'")) {
+    return raw.slice(1, -1).replace(/\\'/gu, "'");
+  }
+  return raw;
+}
+
+function parseLooseKeyValueMap(raw: string): Record<string, string> {
+  const entries: Record<string, string> = {};
+  const pattern = /([A-Za-z_][A-Za-z0-9_.-]*)\s*=\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^\s]+)/gu;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(raw)) !== null) {
+    const key = normalizeConfigKey(match[1]!);
+    const valueToken = match[2]!.replace(/[;,]+$/u, '');
+    entries[key] = unquoteValue(valueToken);
+  }
+  if (Object.keys(entries).length === 0) {
+    throw new Error('S3 config must be JSON or include KEY=value pairs');
+  }
+  return entries;
+}
+
+function asNormalizedStringMap(value: unknown): Record<string, string> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error('S3 JSON config must be an object');
+  }
+  const out: Record<string, string> = {};
+  for (const [key, inner] of Object.entries(value as Record<string, unknown>)) {
+    const normalized = normalizeConfigKey(key);
+    if (inner === null || inner === undefined) {
+      continue;
+    }
+    out[normalized] = String(inner);
+  }
+  return out;
+}
+
+function resolveValue(
+  map: Record<string, string>,
+  aliases: string[],
+): string | undefined {
+  for (const alias of aliases) {
+    const value = map[normalizeConfigKey(alias)];
+    if (value !== undefined && value.trim().length > 0) {
+      return value.trim();
+    }
+  }
+  return undefined;
+}
+
+function parseS3Config(raw: string): ParsedS3Config {
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) {
+    throw new Error('S3 config is required');
+  }
+
+  let values: Record<string, string>;
+  if (trimmed.startsWith('{')) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      throw new Error('invalid S3 JSON config');
+    }
+    values = asNormalizedStringMap(parsed);
+  } else {
+    values = parseLooseKeyValueMap(trimmed);
+  }
+
+  const bucket = resolveValue(values, ['bucket', 's3_bucket', 'crdtbase_s3_bucket']);
+  const prefix = resolveValue(values, ['prefix', 's3_prefix', 'crdtbase_s3_prefix']) ?? 'deltas';
+  const endpoint = resolveValue(values, ['endpoint', 's3_endpoint', 'aws_endpoint_url_s3', 'aws_endpoint_url']);
+  const region = resolveValue(values, ['region', 's3_region', 'aws_region']) ?? 'auto';
+  const accessKeyId = resolveValue(values, [
+    'accessKeyId',
+    'access_key_id',
+    's3_access_key_id',
+    'crdtbase_s3_access_key_id',
+    'aws_access_key_id',
+  ]);
+  const secretAccessKey = resolveValue(values, [
+    'secretAccessKey',
+    'secret_access_key',
+    's3_secret_access_key',
+    'crdtbase_s3_secret_access_key',
+    'aws_secret_access_key',
+  ]);
+  const sessionToken = resolveValue(values, [
+    'sessionToken',
+    'session_token',
+    's3_session_token',
+    'crdtbase_s3_session_token',
+    'aws_session_token',
+  ]);
+  const forcePathStyleRaw = resolveValue(values, [
+    'forcePathStyle',
+    'force_path_style',
+    's3_force_path_style',
+    'crdtbase_s3_force_path_style',
+  ]);
+  const forcePathStyle =
+    forcePathStyleRaw === undefined
+      ? false
+      : parseBooleanValue(forcePathStyleRaw, 'forcePathStyle');
+
+  if (!bucket) {
+    throw new Error('S3 config missing bucket');
+  }
+  if (!endpoint) {
+    throw new Error('S3 config missing endpoint');
+  }
+  if (!accessKeyId) {
+    throw new Error('S3 config missing accessKeyId');
+  }
+  if (!secretAccessKey) {
+    throw new Error('S3 config missing secretAccessKey');
+  }
+
+  try {
+    new URL(endpoint);
+  } catch {
+    throw new Error(`invalid S3 endpoint URL '${endpoint}'`);
+  }
+
+  return {
+    bucket,
+    prefix,
+    endpoint,
+    region,
+    accessKeyId,
+    secretAccessKey,
+    sessionToken,
+    forcePathStyle,
+  };
 }
 
 async function connect(): Promise<void> {
@@ -114,35 +274,32 @@ async function connect(): Promise<void> {
     return;
   }
 
-  const bucket = s3BucketInput.value.trim();
-  const prefix = s3PrefixInput.value.trim() || 'deltas';
-  const presignBaseUrl = presignBaseUrlInput.value.trim();
-  const authToken = presignAuthTokenInput.value.trim();
-
-  if (!bucket) {
-    throw new Error('bucket is required for S3 backend');
-  }
-  if (!presignBaseUrl) {
-    throw new Error('pre-sign service URL is required for S3 backend');
-  }
+  const config = parseS3Config(s3ConfigInput.value);
+  const clientConfig: S3ClientConfig = {
+    endpoint: config.endpoint,
+    region: config.region,
+    forcePathStyle: config.forcePathStyle,
+    credentials: {
+      accessKeyId: config.accessKeyId,
+      secretAccessKey: config.secretAccessKey,
+      ...(config.sessionToken ? { sessionToken: config.sessionToken } : {}),
+    },
+  };
 
   client = await BrowserCrdtClient.open({
     siteId,
-    log: new PresignedS3ReplicatedLog({
-      bucket,
-      prefix,
-      presign: new HttpS3PresignProvider({
-        baseUrl: presignBaseUrl,
-        authToken: authToken.length > 0 ? authToken : undefined,
-      }),
+    log: new S3ReplicatedLog({
+      bucket: config.bucket,
+      prefix: config.prefix,
+      clientConfig,
     }),
     now: nowCounter,
   });
 
   setActionsEnabled(true);
-  setStatus(`Connected: S3 pre-sign (${bucket}/${prefix})`);
+  setStatus(`Connected: S3 (${config.bucket}/${config.prefix})`);
   appendOutput(
-    `connected site='${siteId}' backend=s3-presign bucket='${bucket}' prefix='${prefix}' presign='${presignBaseUrl}'`,
+    `connected site='${siteId}' backend=s3 bucket='${config.bucket}' prefix='${config.prefix}' endpoint='${config.endpoint}'`,
   );
 }
 
@@ -220,14 +377,7 @@ backendSelect.addEventListener('change', () => {
   disconnectActiveSession('backend changed; reconnect required');
 });
 
-for (const field of [
-  siteIdInput,
-  httpBaseUrlInput,
-  s3BucketInput,
-  s3PrefixInput,
-  presignBaseUrlInput,
-  presignAuthTokenInput,
-]) {
+for (const field of [siteIdInput, httpBaseUrlInput, s3ConfigInput]) {
   field.addEventListener('change', () => {
     disconnectActiveSession('connection settings changed; reconnect required');
   });

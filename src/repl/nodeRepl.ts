@@ -2,16 +2,14 @@ import { mkdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import readline from 'node:readline';
+import { S3ClientConfig } from '@aws-sdk/client-s3';
 import { parseSql } from '../core/sql';
+import { S3ReplicatedLog } from '../backend/s3ReplicatedLog';
 import { HttpReplicatedLog } from '../platform/node/httpReplicatedLog';
 import { NodeCrdtClient } from '../platform/node/nodeClient';
-import {
-  HttpS3PresignProvider,
-  PresignedS3ReplicatedLog,
-} from '../platform/shared/presignedS3ReplicatedLog';
 import { formatRowsAsTable } from './tableFormat';
 
-type BackendMode = 'http' | 's3-presign';
+type BackendMode = 'http' | 's3';
 
 type Config = {
   backend: BackendMode;
@@ -22,8 +20,12 @@ type Config = {
   httpBaseUrl: string;
   bucket: string;
   prefix: string;
-  presignBaseUrl: string;
-  presignAuthToken: string | null;
+  s3Endpoint: string;
+  s3Region: string;
+  s3AccessKeyId: string;
+  s3SecretAccessKey: string;
+  s3SessionToken: string;
+  s3ForcePathStyle: boolean;
 };
 
 const EXAMPLE_QUERIES = [
@@ -41,15 +43,19 @@ function printUsage(): void {
       'Usage: npm run repl:node -- [options]',
       '',
       'Options:',
-      '  --backend <http|s3-presign>        (default: http)',
+      '  --backend <http|s3>                (default: http)',
       '  --site-id <site-id>                (default: cli-site)',
       '  --data-dir <path>                  Optional persistent local state dir',
       '  --reset-state                      Delete data-dir before starting',
       '  --http-base-url <url>              Required when backend=http',
-      '  --bucket <name>                    Required when backend=s3-presign',
+      '  --bucket <name>                    Required when backend=s3',
       '  --prefix <prefix>                  (default: deltas)',
-      '  --presign-base-url <url>           Required when backend=s3-presign',
-      '  --presign-auth-token <token>       Optional bearer token for presign service',
+      '  --s3-endpoint <url>                Required when backend=s3',
+      '  --s3-region <region>               (default: auto)',
+      '  --s3-access-key-id <key>           Required when backend=s3',
+      '  --s3-secret-access-key <secret>    Required when backend=s3',
+      '  --s3-session-token <token>         Optional session token',
+      '  --s3-force-path-style <true|false> (default: false)',
       '',
       'REPL commands:',
       '  .help      show this help',
@@ -63,10 +69,21 @@ function printUsage(): void {
 }
 
 function parseBackend(value: string): BackendMode {
-  if (value === 'http' || value === 's3-presign') {
+  if (value === 'http' || value === 's3') {
     return value;
   }
   throw new Error(`unsupported backend '${value}'`);
+}
+
+function parseBooleanFlag(value: string, label: string): boolean {
+  const lowered = value.trim().toLowerCase();
+  if (lowered === '1' || lowered === 'true' || lowered === 'yes' || lowered === 'on') {
+    return true;
+  }
+  if (lowered === '0' || lowered === 'false' || lowered === 'no' || lowered === 'off') {
+    return false;
+  }
+  throw new Error(`invalid ${label}: '${value}'`);
 }
 
 function buildEphemeralDataDir(siteId: string): string {
@@ -83,8 +100,22 @@ function parseConfig(argv: string[]): Config {
   let httpBaseUrl = process.env.CRDTBASE_HTTP_BASE_URL ?? '';
   let bucket = process.env.CRDTBASE_S3_BUCKET ?? '';
   let prefix = process.env.CRDTBASE_S3_PREFIX ?? 'deltas';
-  let presignBaseUrl = process.env.CRDTBASE_S3_PRESIGN_BASE_URL ?? '';
-  let presignAuthToken = process.env.CRDTBASE_S3_PRESIGN_AUTH_TOKEN ?? null;
+  let s3Endpoint =
+    process.env.CRDTBASE_S3_ENDPOINT ??
+    process.env.AWS_ENDPOINT_URL_S3 ??
+    process.env.AWS_ENDPOINT_URL ??
+    '';
+  let s3Region = process.env.CRDTBASE_S3_REGION ?? process.env.AWS_REGION ?? 'auto';
+  let s3AccessKeyId =
+    process.env.CRDTBASE_S3_ACCESS_KEY_ID ?? process.env.AWS_ACCESS_KEY_ID ?? '';
+  let s3SecretAccessKey =
+    process.env.CRDTBASE_S3_SECRET_ACCESS_KEY ?? process.env.AWS_SECRET_ACCESS_KEY ?? '';
+  let s3SessionToken =
+    process.env.CRDTBASE_S3_SESSION_TOKEN ?? process.env.AWS_SESSION_TOKEN ?? '';
+  let s3ForcePathStyle = parseBooleanFlag(
+    process.env.CRDTBASE_S3_FORCE_PATH_STYLE ?? 'false',
+    'CRDTBASE_S3_FORCE_PATH_STYLE',
+  );
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]!;
@@ -125,13 +156,33 @@ function parseConfig(argv: string[]): Config {
       index += 1;
       continue;
     }
-    if (arg === '--presign-base-url' && value) {
-      presignBaseUrl = value;
+    if ((arg === '--s3-endpoint' || arg === '--endpoint') && value) {
+      s3Endpoint = value;
       index += 1;
       continue;
     }
-    if (arg === '--presign-auth-token' && value) {
-      presignAuthToken = value;
+    if ((arg === '--s3-region' || arg === '--region') && value) {
+      s3Region = value;
+      index += 1;
+      continue;
+    }
+    if ((arg === '--s3-access-key-id' || arg === '--access-key-id') && value) {
+      s3AccessKeyId = value;
+      index += 1;
+      continue;
+    }
+    if ((arg === '--s3-secret-access-key' || arg === '--secret-access-key') && value) {
+      s3SecretAccessKey = value;
+      index += 1;
+      continue;
+    }
+    if ((arg === '--s3-session-token' || arg === '--session-token') && value) {
+      s3SessionToken = value;
+      index += 1;
+      continue;
+    }
+    if (arg === '--s3-force-path-style' && value) {
+      s3ForcePathStyle = parseBooleanFlag(value, '--s3-force-path-style');
       index += 1;
       continue;
     }
@@ -153,12 +204,18 @@ function parseConfig(argv: string[]): Config {
     throw new Error('missing --http-base-url for backend=http');
   }
 
-  if (backend === 's3-presign') {
+  if (backend === 's3') {
     if (!bucket) {
-      throw new Error('missing --bucket for backend=s3-presign');
+      throw new Error('missing --bucket for backend=s3');
     }
-    if (!presignBaseUrl) {
-      throw new Error('missing --presign-base-url for backend=s3-presign');
+    if (!s3Endpoint) {
+      throw new Error('missing --s3-endpoint for backend=s3');
+    }
+    if (!s3AccessKeyId) {
+      throw new Error('missing --s3-access-key-id for backend=s3');
+    }
+    if (!s3SecretAccessKey) {
+      throw new Error('missing --s3-secret-access-key for backend=s3');
     }
   }
 
@@ -171,8 +228,12 @@ function parseConfig(argv: string[]): Config {
     httpBaseUrl,
     bucket,
     prefix,
-    presignBaseUrl,
-    presignAuthToken,
+    s3Endpoint,
+    s3Region,
+    s3AccessKeyId,
+    s3SecretAccessKey,
+    s3SessionToken,
+    s3ForcePathStyle,
   };
 }
 
@@ -195,16 +256,24 @@ async function main(): Promise<void> {
   }
   await mkdir(config.dataDir, { recursive: true });
 
+  const s3ClientConfig: S3ClientConfig = {
+    endpoint: config.s3Endpoint,
+    region: config.s3Region,
+    forcePathStyle: config.s3ForcePathStyle,
+    credentials: {
+      accessKeyId: config.s3AccessKeyId,
+      secretAccessKey: config.s3SecretAccessKey,
+      ...(config.s3SessionToken ? { sessionToken: config.s3SessionToken } : {}),
+    },
+  };
+
   const log =
     config.backend === 'http'
       ? new HttpReplicatedLog(config.httpBaseUrl)
-      : new PresignedS3ReplicatedLog({
+      : new S3ReplicatedLog({
           bucket: config.bucket,
           prefix: config.prefix,
-          presign: new HttpS3PresignProvider({
-            baseUrl: config.presignBaseUrl,
-            authToken: config.presignAuthToken ?? undefined,
-          }),
+          clientConfig: s3ClientConfig,
         });
 
   const client = await NodeCrdtClient.open({

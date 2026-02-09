@@ -31,7 +31,6 @@ function sleep(ms: number): Promise<void> {
 
 async function startHarnessWithRetry(params: {
   kind: BackendMatrixKind;
-  authToken?: string;
 }): Promise<Awaited<ReturnType<typeof startBackendMatrixHarness>>> {
   let lastError: unknown = null;
   for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -53,10 +52,7 @@ async function runTraceOnBackend(params: {
   drainRounds: number;
   quiescenceRounds: number;
 }): Promise<BackendOutcome> {
-  const harness = await startHarnessWithRetry({
-    kind: params.kind,
-    authToken: params.kind === 's3-presign-auth' ? `auth-${params.seed}` : undefined,
-  });
+  const harness = await startHarnessWithRetry({ kind: params.kind });
 
   try {
     const dataRoot = join(harness.rootDir, 'clients');
@@ -155,16 +151,8 @@ describe.sequential('Cross-backend deterministic parity properties', () => {
         drainRounds,
         quiescenceRounds,
       });
-      const s3MinioPresign = await runTraceOnBackend({
-        kind: 's3-minio-presign',
-        seed,
-        trace,
-        rowIds,
-        drainRounds,
-        quiescenceRounds,
-      });
-      const s3PresignAuth = await runTraceOnBackend({
-        kind: 's3-presign-auth',
+      const s3Minio = await runTraceOnBackend({
+        kind: 's3-minio',
         seed,
         trace,
         rowIds,
@@ -172,10 +160,7 @@ describe.sequential('Cross-backend deterministic parity properties', () => {
         quiescenceRounds,
       });
 
-      expect(http.rows).toEqual(s3MinioPresign.rows);
-      expect(s3MinioPresign.rows).toEqual(s3PresignAuth.rows);
-
-      expect(http.heads).toEqual(s3MinioPresign.heads);
-      expect(s3MinioPresign.heads).toEqual(s3PresignAuth.heads);
+      expect(http.rows).toEqual(s3Minio.rows);
+      expect(http.heads).toEqual(s3Minio.heads);
     }, timeoutMs);
 });

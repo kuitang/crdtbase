@@ -4,29 +4,24 @@ import { join } from 'node:path';
 import { ListObjectsV2Command, S3Client } from '@aws-sdk/client-s3';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import type { Browser, BrowserContext } from 'playwright-core';
-import {
-  HttpS3PresignProvider,
-  PresignedS3ReplicatedLog,
-} from '../../src/platform/shared/presignedS3ReplicatedLog';
+import { S3ReplicatedLog } from '../../src/backend/s3ReplicatedLog';
 import { assertAckedWritesVisible, loadChaosEnv } from './chaosShared';
 import { MinioHarness } from './minioHarness';
 import { runThreeClientChaosScenario } from './orchestrator';
-import { PresignHarness } from './presignHarness';
 import {
   buildBrowserBridgeBundle,
-  createBrowserS3PresignAdapter,
+  createBrowserS3Adapter,
   destroyBrowserAdapters,
   launchPlaywrightBrowser,
 } from './playwrightBrowserHarness';
 
-describe('Browser x S3-MinIO pre-signed chaos end-to-end sync', () => {
+describe('Browser x S3-MinIO direct transport chaos end-to-end sync', () => {
   const CHAOS = loadChaosEnv();
   let browser: Browser | null = null;
   let bridgeBundle = '';
 
   let tempRoot: string | null = null;
   let minio: MinioHarness | null = null;
-  let presign: PresignHarness | null = null;
   let context: BrowserContext | null = null;
 
   beforeAll(async () => {
@@ -46,10 +41,6 @@ describe('Browser x S3-MinIO pre-signed chaos end-to-end sync', () => {
       await context.close();
       context = null;
     }
-    if (presign) {
-      await presign.stop();
-      presign = null;
-    }
     if (minio) {
       await minio.stop();
       minio = null;
@@ -61,7 +52,7 @@ describe('Browser x S3-MinIO pre-signed chaos end-to-end sync', () => {
   });
 
   it.each(CHAOS.seeds)(
-    'converges under random delayed concurrent browser activity through pre-signed S3 transport [seed=%s]',
+    'converges under random delayed concurrent browser activity through direct S3 transport [seed=%s]',
     async (seed) => {
       if (!browser) {
         throw new Error('browser is not started');
@@ -72,9 +63,6 @@ describe('Browser x S3-MinIO pre-signed chaos end-to-end sync', () => {
         rootDir: tempRoot,
         bucket: 'crdtbase',
       });
-      presign = await PresignHarness.start({
-        endpoint: minio.getEndpoint(),
-      });
 
       const s3Config = minio.getS3ClientConfig();
       const bucket = minio.getBucket();
@@ -83,7 +71,7 @@ describe('Browser x S3-MinIO pre-signed chaos end-to-end sync', () => {
 
       context = await browser.newContext();
 
-      const clientA = await createBrowserS3PresignAdapter({
+      const clientA = await createBrowserS3Adapter({
         context,
         bridgeBundle,
         siteId: 'site-a',
@@ -91,10 +79,14 @@ describe('Browser x S3-MinIO pre-signed chaos end-to-end sync', () => {
         pageUrl,
         bucket,
         prefix: 'deltas',
-        presignBaseUrl: presign.getBaseUrl(),
+        endpoint: s3Config.endpoint,
+        region: s3Config.region,
+        accessKeyId: s3Config.credentials.accessKeyId,
+        secretAccessKey: s3Config.credentials.secretAccessKey,
+        forcePathStyle: true,
         nowMs: 1_000,
       });
-      const clientB = await createBrowserS3PresignAdapter({
+      const clientB = await createBrowserS3Adapter({
         context,
         bridgeBundle,
         siteId: 'site-b',
@@ -102,10 +94,14 @@ describe('Browser x S3-MinIO pre-signed chaos end-to-end sync', () => {
         pageUrl,
         bucket,
         prefix: 'deltas',
-        presignBaseUrl: presign.getBaseUrl(),
+        endpoint: s3Config.endpoint,
+        region: s3Config.region,
+        accessKeyId: s3Config.credentials.accessKeyId,
+        secretAccessKey: s3Config.credentials.secretAccessKey,
+        forcePathStyle: true,
         nowMs: 2_000,
       });
-      const clientC = await createBrowserS3PresignAdapter({
+      const clientC = await createBrowserS3Adapter({
         context,
         bridgeBundle,
         siteId: 'site-c',
@@ -113,10 +109,14 @@ describe('Browser x S3-MinIO pre-signed chaos end-to-end sync', () => {
         pageUrl,
         bucket,
         prefix: 'deltas',
-        presignBaseUrl: presign.getBaseUrl(),
+        endpoint: s3Config.endpoint,
+        region: s3Config.region,
+        accessKeyId: s3Config.credentials.accessKeyId,
+        secretAccessKey: s3Config.credentials.secretAccessKey,
+        forcePathStyle: true,
         nowMs: 3_000,
       });
-      const observer = await createBrowserS3PresignAdapter({
+      const observer = await createBrowserS3Adapter({
         context,
         bridgeBundle,
         siteId: 'site-observer',
@@ -124,7 +124,11 @@ describe('Browser x S3-MinIO pre-signed chaos end-to-end sync', () => {
         pageUrl,
         bucket,
         prefix: 'deltas',
-        presignBaseUrl: presign.getBaseUrl(),
+        endpoint: s3Config.endpoint,
+        region: s3Config.region,
+        accessKeyId: s3Config.credentials.accessKeyId,
+        secretAccessKey: s3Config.credentials.secretAccessKey,
+        forcePathStyle: true,
         nowMs: 3_500,
       });
 
@@ -162,12 +166,10 @@ describe('Browser x S3-MinIO pre-signed chaos end-to-end sync', () => {
           expectedTagsByRow: result.expectedTagsByRow,
         });
 
-        const log = new PresignedS3ReplicatedLog({
+        const log = new S3ReplicatedLog({
           bucket,
           prefix: 'deltas',
-          presign: new HttpS3PresignProvider({
-            baseUrl: presign.getBaseUrl(),
-          }),
+          clientConfig: s3Config,
         });
         expect(await log.getHead('site-a')).toBeGreaterThan(0);
         expect(await log.getHead('site-b')).toBeGreaterThan(0);

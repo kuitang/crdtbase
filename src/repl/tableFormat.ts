@@ -1,3 +1,5 @@
+import { table } from 'table';
+
 function stringifyValue(value: unknown): string {
   if (value === null || value === undefined) {
     return 'NULL';
@@ -16,17 +18,6 @@ function stringifyValue(value: unknown): string {
   } catch {
     return String(value);
   }
-}
-
-function pad(text: string, width: number): string {
-  if (text.length >= width) {
-    return text;
-  }
-  return text + ' '.repeat(width - text.length);
-}
-
-function border(widths: number[]): string {
-  return `+${widths.map((width) => '-'.repeat(width + 2)).join('+')}+`;
 }
 
 function collectColumns(rows: Record<string, unknown>[]): string[] {
@@ -54,30 +45,28 @@ export function formatRowsAsTable(rows: Record<string, unknown>[]): string {
   }
 
   const matrix = rows.map((row) => columns.map((column) => stringifyValue(row[column])));
-  const widths = columns.map((column, index) => {
-    let max = column.length;
-    for (const line of matrix) {
-      const len = line[index]!.length;
-      if (len > max) {
-        max = len;
-      }
-    }
-    return max;
-  });
+  const rendered = table([columns, ...matrix], {
+    border: {
+      topBody: '─',
+      topJoin: '┬',
+      topLeft: '┌',
+      topRight: '┐',
+      bottomBody: '─',
+      bottomJoin: '┴',
+      bottomLeft: '└',
+      bottomRight: '┘',
+      bodyLeft: '│',
+      bodyRight: '│',
+      bodyJoin: '│',
+      joinBody: '─',
+      joinLeft: '├',
+      joinRight: '┤',
+      joinJoin: '┼',
+    },
+    drawHorizontalLine: (lineIndex, rowCount) =>
+      lineIndex === 0 || lineIndex === 1 || lineIndex === rowCount,
+    singleLine: false,
+  }).trimEnd();
 
-  const lines: string[] = [];
-  lines.push(border(widths));
-  lines.push(
-    `| ${columns.map((column, index) => pad(column, widths[index]!)).join(' | ')} |`,
-  );
-  lines.push(border(widths));
-
-  for (const line of matrix) {
-    lines.push(`| ${line.map((cell, index) => pad(cell, widths[index]!)).join(' | ')} |`);
-  }
-
-  lines.push(border(widths));
-  lines.push(`(${rows.length} row${rows.length === 1 ? '' : 's'})`);
-
-  return lines.join('\n');
+  return `${rendered}\n(${rows.length} row${rows.length === 1 ? '' : 's'})`;
 }

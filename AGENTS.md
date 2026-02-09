@@ -28,9 +28,9 @@ cd lean && lake build CrdtBase CrdtBaseDRT
 npx vitest run test/drt/*.drt.test.ts
 ```
 
-- Run current Node E2E matrix rows (`node x http-server`, `node x s3-minio (presign transport)`, `node x s3-presign`):
+- Run current Node E2E matrix rows (`node x http-server`, `node x s3-minio (direct S3 transport)`):
 ```bash
-npx vitest run test/e2e/three-clients.e2e.test.ts test/e2e/s3-minio.e2e.test.ts test/e2e/s3-presign.e2e.test.ts
+npx vitest run test/e2e/three-clients.e2e.test.ts test/e2e/s3-minio.e2e.test.ts
 ```
 
 - Run TypeScript coverage with property tests + DRT + Node E2E matrix:

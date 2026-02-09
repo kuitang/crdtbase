@@ -150,7 +150,7 @@ export async function createBrowserHttpAdapter(params: {
   return new PlaywrightClientAdapter(params.siteId, page, params.clientId);
 }
 
-export async function createBrowserS3PresignAdapter(params: {
+export async function createBrowserS3Adapter(params: {
   context: BrowserContext;
   bridgeBundle: string;
   siteId: string;
@@ -158,8 +158,12 @@ export async function createBrowserS3PresignAdapter(params: {
   pageUrl: string;
   bucket: string;
   prefix: string;
-  presignBaseUrl: string;
-  presignAuthToken?: string;
+  endpoint: string;
+  region: string;
+  accessKeyId: string;
+  secretAccessKey: string;
+  sessionToken?: string;
+  forcePathStyle: boolean;
   nowMs: number;
 }): Promise<PlaywrightClientAdapter> {
   const page = await preparePage({
@@ -172,11 +176,15 @@ export async function createBrowserS3PresignAdapter(params: {
     {
       clientId: params.clientId,
       siteId: params.siteId,
-      kind: 's3-presign',
+      kind: 's3',
       bucket: params.bucket,
       prefix: params.prefix,
-      presignBaseUrl: params.presignBaseUrl,
-      presignAuthToken: params.presignAuthToken,
+      endpoint: params.endpoint,
+      region: params.region,
+      accessKeyId: params.accessKeyId,
+      secretAccessKey: params.secretAccessKey,
+      sessionToken: params.sessionToken,
+      forcePathStyle: params.forcePathStyle,
       nowMs: params.nowMs,
     },
   ]);

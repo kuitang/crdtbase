@@ -715,18 +715,18 @@ Expected converged row:
 - `tags` contains `beta` and `gamma`
 - `status` contains both `open` and `review`
 
-### E2E B: Pre-signed S3 replication via MinIO
+### E2E B: Direct S3 replication via MinIO
 
 **Test file:** `test/e2e/s3-minio.e2e.test.ts`
 
 What it validates:
 
-1. Clients replicate through `PresignedS3ReplicatedLog` and fetch pre-signed requests from the pre-sign service.
+1. Clients replicate through `S3ReplicatedLog` using direct S3 credentials.
 2. Objects are written to `deltas/<site>/<seq>.delta.bin`.
 3. Downloaded S3 objects can be inspected with `node cli.mjs dump`.
 4. SQL convergence across three clients remains correct under S3 transport.
 
-The test starts local MinIO + pre-sign services and creates a test bucket automatically.
+The test starts local MinIO and creates a test bucket automatically.
 
 ### Commands: Run Again
 

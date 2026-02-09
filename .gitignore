@@ -1,4 +1,6 @@
 lean/.lake/*
+.tmp*
+.repl-dist/*
 
 # Logs
 logs

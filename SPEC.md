@@ -64,7 +64,7 @@ All code under `src/core/` imports nothing from `node:`, `window`, or any platfo
 | Binary encoding | `@msgpack/msgpack` | Self-describing, JSON-dumpable, browser+Node, ~8KB gzipped. Every file is a MessagePack document, making the entire database inspectable with a one-liner. |
 | Bloom filter | `bloomfilter` (jasondavies) | 3K weekly downloads, tiny, works in browser. Serializes to/from typed arrays. |
 | CLI | `commander` | Argument parsing for the CLI tool |
-| S3 client | `@aws-sdk/client-s3` (Node), raw `fetch` (browser) | Tigris is S3-compatible. Browser uses presigned URLs via `fetch`. Node uses the SDK. |
+| S3 client | `@aws-sdk/client-s3` (Node and browser) | Tigris is S3-compatible. This repository uses direct credentials and signed requests via the AWS SDK in both Node and browser runtimes. |
 | HTTP server | `Bun.serve` or `node:http` | For the in-memory dev server |
 | Test | `vitest` | Fast, TypeScript-native |
 
@@ -692,7 +692,8 @@ SnapshotStore:
 
 **Consistency for deltas:** Default (eventual) consistency is fine. Worst case, a sync pull misses a very recent delta — it catches up on the next pull. CRDTs guarantee convergence.
 
-**Browser access:** Use presigned URLs. A lightweight auth endpoint (Cloudflare Worker, Lambda, etc.) takes an auth token and returns presigned GET/PUT URLs for the user's partition. The browser then uses raw `fetch()` against those URLs. No S3 SDK needed in the browser.
+**Browser access (current repository):** Browser clients use direct S3 credentials through `S3ReplicatedLog`.
+For production hardening, prefer an auth gateway (Cloudflare Worker, Lambda, etc.) that issues scoped short-lived credentials or presigned URLs for the user's partition.
 
 ---
 
@@ -844,10 +845,10 @@ Build and test in this order. Each phase is independently useful.
 - [ ] Simple test page: create table, insert, select, dump state
 
 **Phase 7: Tigris**
-- [ ] TigrisReplicatedLog (S3 LIST/GET/PUT)
-- [ ] TigrisSnapshotStore (GET/PUT with ETag CAS)
-- [ ] Presigned URL auth endpoint
-- [ ] Test: Node engine syncing through Tigris, browser engine syncing through Tigris
+- [x] TigrisReplicatedLog (S3 LIST/GET/PUT)
+- [x] TigrisSnapshotStore (GET/PUT with ETag CAS)
+- [ ] Optional auth endpoint for browser hardening (presigned URLs or scoped short-lived credentials)
+- [x] Test: Node engine syncing through Tigris-compatible S3, browser engine syncing through Tigris-compatible S3
 
 ---
 

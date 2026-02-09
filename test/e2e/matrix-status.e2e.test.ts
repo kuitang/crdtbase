@@ -5,7 +5,7 @@ describe('E2E matrix status', () => {
     expect(true).toBe(true);
   });
 
-  it('covers node x s3-minio (presign transport) chaos eventual-consistency via test/e2e/s3-minio.e2e.test.ts', () => {
+  it('covers node x s3-minio (direct S3 transport) chaos eventual-consistency via test/e2e/s3-minio.e2e.test.ts', () => {
     expect(true).toBe(true);
   });
 
@@ -13,7 +13,7 @@ describe('E2E matrix status', () => {
     expect(true).toBe(true);
   });
 
-  it('covers browser x s3-minio (presign transport) chaos eventual-consistency via test/e2e/browser-s3-minio.e2e.test.ts', () => {
+  it('covers browser x s3-minio (direct S3 transport) chaos eventual-consistency via test/e2e/browser-s3-minio.e2e.test.ts', () => {
     expect(true).toBe(true);
   });
 });
