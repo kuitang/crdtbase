@@ -10,35 +10,92 @@ def OpsHaveValidTags (ops : List EncodedCrdtOp) : Prop :=
 def OpsAreSyncable (ops : List EncodedCrdtOp) : Prop :=
   ∀ op, op ∈ ops → EncodedCrdtOp.isSyncable op
 
+private theorem generated_tagsB_to_ops_have_valid_tags
+    (ops : List EncodedCrdtOp)
+    (hTags : generatedOpsHaveValidTagsB ops = true) :
+    OpsHaveValidTags ops := by
+  intro op hMem
+  have hAll : ∀ x, x ∈ ops → CrdtTypeTag.isValidb x.typ = true := by
+    simpa [generatedOpsHaveValidTagsB] using (List.all_eq_true.mp hTags)
+  have hTagBool : CrdtTypeTag.isValidb op.typ = true := hAll op hMem
+  exact decide_eq_true_eq.mp (by simpa [CrdtTypeTag.isValidb] using hTagBool)
+
+private theorem generated_syncB_to_ops_are_syncable
+    (ops : List EncodedCrdtOp)
+    (hSync : generatedOpsAreSyncableB ops = true) :
+    OpsAreSyncable ops := by
+  intro op hMem
+  have hAll : ∀ x, x ∈ ops → EncodedCrdtOp.isSyncableb x = true := by
+    simpa [generatedOpsAreSyncableB] using (List.all_eq_true.mp hSync)
+  have hSyncBool : EncodedCrdtOp.isSyncableb op = true := hAll op hMem
+  exact decide_eq_true_eq.mp (by simpa [EncodedCrdtOp.isSyncableb] using hSyncBool)
+
+private theorem validateGeneratedOps_type_sound
+    (rawOps out : List EncodedCrdtOp)
+    (h : validateGeneratedOps rawOps = Except.ok out) :
+    OpsHaveValidTags out := by
+  unfold validateGeneratedOps at h
+  by_cases hTags : generatedOpsHaveValidTagsB rawOps = true
+  · by_cases hSync : generatedOpsAreSyncableB rawOps = true
+    · simp [hTags, hSync] at h
+      cases h
+      exact generated_tagsB_to_ops_have_valid_tags rawOps hTags
+    · simp [hTags, hSync] at h
+  · simp [hTags] at h
+
+private theorem validateGeneratedOps_syncable
+    (rawOps out : List EncodedCrdtOp)
+    (h : validateGeneratedOps rawOps = Except.ok out) :
+    OpsAreSyncable out := by
+  unfold validateGeneratedOps at h
+  by_cases hTags : generatedOpsHaveValidTagsB rawOps = true
+  · by_cases hSync : generatedOpsAreSyncableB rawOps = true
+    · simp [hTags, hSync] at h
+      cases h
+      exact generated_syncB_to_ops_are_syncable rawOps hSync
+    · simp [hTags, hSync] at h
+  · simp [hTags] at h
+
 /-- A batch is type-sound when every emitted op carries one of the supported CRDT tags. -/
 theorem write_ops_type_sound
+    (statement : SqlWriteStatement)
+    (context : SqlGenerationContext)
     (ops : List EncodedCrdtOp)
-    (hTag :
-      ∀ op, op ∈ ops →
-        op.typ = 1 ∨ op.typ = 2 ∨ op.typ = 3 ∨ op.typ = 4)
+    (hGen : generateCrdtOps statement context = Except.ok ops)
     : OpsHaveValidTags ops := by
-  intro op hMem
-  rcases hTag op hMem with h1 | h2 | h3 | h4
-  · simpa [CrdtTypeTag.isValid, h1]
-  · simpa [CrdtTypeTag.isValid, h2]
-  · simpa [CrdtTypeTag.isValid, h3]
-  · simpa [CrdtTypeTag.isValid, h4]
+  unfold generateCrdtOps at hGen
+  cases hCore : generateCrdtOpsCore statement context with
+  | error err =>
+      simp [hCore] at hGen
+      cases hGen
+  | ok rawOps =>
+      simp [hCore] at hGen
+      exact validateGeneratedOps_type_sound rawOps ops hGen
 
 /-- A batch is syncable when each emitted op carries non-empty sync-critical identifiers. -/
 theorem write_ops_syncable
+    (statement : SqlWriteStatement)
+    (context : SqlGenerationContext)
     (ops : List EncodedCrdtOp)
-    (hFields :
-      ∀ op, op ∈ ops →
-        op.tbl ≠ "" ∧ op.col ≠ "" ∧ op.hlc ≠ "" ∧ op.site ≠ "")
+    (hGen : generateCrdtOps statement context = Except.ok ops)
     : OpsAreSyncable ops := by
-  intro op hMem
-  exact hFields op hMem
+  unfold generateCrdtOps at hGen
+  cases hCore : generateCrdtOpsCore statement context with
+  | error err =>
+      simp [hCore] at hGen
+      cases hGen
+  | ok rawOps =>
+      simp [hCore] at hGen
+      exact validateGeneratedOps_syncable rawOps ops hGen
 
 /-- Restatement of syncability as explicit non-empty field constraints for every op. -/
 theorem no_nonsync_for_valid_crdt_writes
+    (statement : SqlWriteStatement)
+    (context : SqlGenerationContext)
     (ops : List EncodedCrdtOp)
-    (hSync : OpsAreSyncable ops)
+    (hGen : generateCrdtOps statement context = Except.ok ops)
     : ∀ op, op ∈ ops → op.tbl ≠ "" ∧ op.col ≠ "" ∧ op.hlc ≠ "" ∧ op.site ≠ "" := by
+  have hSync : OpsAreSyncable ops := write_ops_syncable statement context ops hGen
   intro op hMem
   exact hSync op hMem
 

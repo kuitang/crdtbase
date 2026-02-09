@@ -327,8 +327,16 @@ instance : ToJson EncodedCrdtOp where
 def CrdtTypeTag.isValid (tag : Nat) : Prop :=
   tag = 1 ∨ tag = 2 ∨ tag = 3 ∨ tag = 4
 
+instance (tag : Nat) : Decidable (CrdtTypeTag.isValid tag) := by
+  unfold CrdtTypeTag.isValid
+  infer_instance
+
 def EncodedCrdtOp.isSyncable (op : EncodedCrdtOp) : Prop :=
   op.tbl ≠ "" ∧ op.col ≠ "" ∧ op.hlc ≠ "" ∧ op.site ≠ ""
+
+instance (op : EncodedCrdtOp) : Decidable (EncodedCrdtOp.isSyncable op) := by
+  unfold EncodedCrdtOp.isSyncable
+  infer_instance
 
 inductive SelectQueryRoute where
   | singlePartition (partition : String)
@@ -587,7 +595,7 @@ private def generateDeleteOps
   let (hlc, remaining) ← nextHlc hlcSequence
   pure ([createOp statement.table key "_deleted" 1 hlc site (toJson true)], remaining)
 
-def generateCrdtOps
+def generateCrdtOpsCore
     (statement : SqlWriteStatement)
     (context : SqlGenerationContext)
     : Except String (List EncodedCrdtOp) := do
@@ -618,6 +626,34 @@ def generateCrdtOps
     | .delete stmt =>
         generateDeleteOps stmt tableSchema context.site context.hlcSequence
   pure result.fst
+
+def CrdtTypeTag.isValidb (tag : Nat) : Bool :=
+  decide (CrdtTypeTag.isValid tag)
+
+def EncodedCrdtOp.isSyncableb (op : EncodedCrdtOp) : Bool :=
+  decide (EncodedCrdtOp.isSyncable op)
+
+def generatedOpsHaveValidTagsB (ops : List EncodedCrdtOp) : Bool :=
+  ops.all (fun op => CrdtTypeTag.isValidb op.typ)
+
+def generatedOpsAreSyncableB (ops : List EncodedCrdtOp) : Bool :=
+  ops.all EncodedCrdtOp.isSyncableb
+
+def validateGeneratedOps (ops : List EncodedCrdtOp) : Except String (List EncodedCrdtOp) :=
+  if hTags : generatedOpsHaveValidTagsB ops = true then
+    if hSync : generatedOpsAreSyncableB ops = true then
+      pure ops
+    else
+      throw "internal error: generated non-syncable CRDT op"
+  else
+    throw "internal error: generated CRDT op with invalid type tag"
+
+def generateCrdtOps
+    (statement : SqlWriteStatement)
+    (context : SqlGenerationContext)
+    : Except String (List EncodedCrdtOp) := do
+  let ops ← generateCrdtOpsCore statement context
+  validateGeneratedOps ops
 
 def pickPartitionCondition
     (whereClause : List SqlWhereCondition)
