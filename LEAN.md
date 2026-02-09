@@ -352,6 +352,8 @@ For each CRDT merge, prove three properties. The general strategy:
 2. `merge` returns the greater of its two arguments under this order.
 3. "Max of max(a,b) and c" equals "max of a and max(b,c)" — a standard property of max under a total order.
 
+Current status: these LWW proofs now use the proved `compareWithSite_*` lemmas from `CrdtBase/Hlc/Props.lean` directly; comparator swap/transitivity/reflexivity are no longer theorem parameters.
+
 For PN-Counter, associativity of `mergeMaxMaps` reduces to `Nat.max` being associative (`max(max(a,b),c) = max(a,max(b,c))`), applied pointwise. This is in Batteries.
 
 **Idempotency** — For LWW: `compare(a, a) = .eq`, so `merge(a, a) = a`. For PN-Counter: `Nat.max(n, n) = n`. For OR-Set: `dedup` on the union of identical lists.

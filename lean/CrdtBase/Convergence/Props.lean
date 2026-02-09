@@ -104,31 +104,15 @@ theorem convergence_lww
     applyOps LwwRegister.merge init ops₁ = applyOps LwwRegister.merge init ops₂ := by
   exact convergence_of_comm_assoc LwwRegister.merge hComm hAssoc init hPerm
 
-/-- LWW convergence under global event-consistency and comparator axioms. -/
+/-- LWW convergence under global event-consistency. -/
 theorem convergence_lww_of_consistent
     (init : LwwRegister α) {ops₁ ops₂ : List (LwwRegister α)}
     (hPerm : List.Perm ops₁ ops₂)
-    (hCons : ∀ a b : LwwRegister α, LwwConsistentPair a b)
-    (hSwapLt : ∀ a b : LwwRegister α,
-      Hlc.compareWithSite (a.hlc, a.site) (b.hlc, b.site) = .lt →
-        Hlc.compareWithSite (b.hlc, b.site) (a.hlc, a.site) = .gt)
-    (hSwapGt : ∀ a b : LwwRegister α,
-      Hlc.compareWithSite (a.hlc, a.site) (b.hlc, b.site) = .gt →
-        Hlc.compareWithSite (b.hlc, b.site) (a.hlc, a.site) = .lt)
-    (hTransLt : ∀ a b c : LwwRegister α,
-      Hlc.compareWithSite (a.hlc, a.site) (b.hlc, b.site) = .lt →
-        Hlc.compareWithSite (b.hlc, b.site) (c.hlc, c.site) = .lt →
-        Hlc.compareWithSite (a.hlc, a.site) (c.hlc, c.site) = .lt)
-    (hTransGt : ∀ a b c : LwwRegister α,
-      Hlc.compareWithSite (a.hlc, a.site) (b.hlc, b.site) = .gt →
-        Hlc.compareWithSite (b.hlc, b.site) (c.hlc, c.site) = .gt →
-        Hlc.compareWithSite (a.hlc, a.site) (c.hlc, c.site) = .gt)
-    (hSelf : ∀ x : LwwRegister α,
-      Hlc.compareWithSite (x.hlc, x.site) (x.hlc, x.site) = .eq) :
+    (hCons : ∀ a b : LwwRegister α, LwwConsistentPair a b) :
     applyOps LwwRegister.merge init ops₁ = applyOps LwwRegister.merge init ops₂ := by
   apply convergence_lww init hPerm
-  · exact lww_merge_comm_global_of_consistent hCons hSwapLt hSwapGt hSelf
-  · exact lww_merge_assoc_global_of_consistent hCons hTransLt hTransGt hSelf
+  · exact lww_merge_comm_global_of_consistent hCons
+  · exact lww_merge_assoc_global_of_consistent hCons
 
 end Lww
 
