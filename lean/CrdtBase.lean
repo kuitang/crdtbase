@@ -8,5 +8,7 @@ import CrdtBase.Crdt.OrSet.Defs
 import CrdtBase.Crdt.OrSet.Props
 import CrdtBase.Crdt.MvRegister.Defs
 import CrdtBase.Crdt.MvRegister.Props
+import CrdtBase.Compaction.Defs
+import CrdtBase.Compaction.Props
 import CrdtBase.Sql.Defs
 import CrdtBase.Sql.Props

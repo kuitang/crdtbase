@@ -250,6 +250,16 @@ instance : ToJson SqlTableSchema where
     ("columns", toJson tableSchema.columns)
   ]
 
+def canonicalizeHlcHex (raw : String) : String :=
+  let withoutPrefix :=
+    if raw.startsWith "0x" || raw.startsWith "0X" then
+      raw.drop 2
+    else
+      raw
+  let trimmed := (withoutPrefix.dropWhile (fun ch => ch = '0')).toString
+  let body := if trimmed.isEmpty then "0" else trimmed
+  s!"0x{body}"
+
 structure SetRemoveTag where
   hlc : String
   site : String

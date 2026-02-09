@@ -29,6 +29,11 @@ Theorems for each CRDT type:
 - `lww_merge_idem`: `merge(a, a) = a`
 - Same three for `pn_counter_merge`, `or_set_merge`, `mv_register_merge`
 
+OR-Set canonicalization properties are also proven to lock tombstone semantics:
+- `or_set_canonicalize_idem`
+- `or_set_canonicalize_no_tombstoned_tags`
+- `or_set_canonicalize_preserves_visible_values`
+
 **12 theorems total.** These are the non-negotiable core.
 
 ### Tier 2: HLC Ordering (Critical)
@@ -104,12 +109,12 @@ Theorems:
 
 **3 theorems.**
 
-### Tier 6: SQL Translation + Planner Soundness (Important)
+### Tier 6: SQL Translation + Planner + Evaluator Soundness (Important)
 
 The SQL frontend is split into parser and semantics:
 
 - **Parser:** handled in TypeScript property tests (`parse/print/parse` stability).
-- **Semantics:** modeled in Lean as AST-to-CRDT-op translation and SELECT planning.
+- **Semantics:** modeled in Lean as AST-to-CRDT-op translation, SELECT planning, and AST evaluation over SQL eval state (`result + nextState`).
 
 The core guarantee for writes is that valid SQL write statements compile only to
 syncable CRDT operations with schema-correct CRDT tags. This is the
@@ -126,6 +131,8 @@ Initial theorem targets:
 - `no_nonsync_for_valid_crdt_writes`
 - `planner_partition_sound`
 - `planner_filter_preservation`
+
+Evaluator parity currently relies on differential tests (`sql_eval`) against the TypeScript evaluator and is designed so future end-to-end SQL semantic theorems can be added without changing the wire protocol.
 
 ### What We Do NOT Verify
 
@@ -182,7 +189,7 @@ lean/
 │   │   └── Props.lean             # tombstone theorems (Tier 5)
 │   │
 │   ├── Sql/
-│   │   ├── Defs.lean              # SQL AST subset + translation/planner model
+│   │   ├── Defs.lean              # SQL AST subset + translation/planner/eval model
 │   │   └── Props.lean             # SQL soundness proofs (Tier 6)
 │   │
 │   └── DiffTest/
@@ -417,8 +424,11 @@ The Lean executable processes JSONL commands with shape:
 - `{"type":"lww_merge", ... }`
 - `{"type":"sql_generate_ops", "statement": <write-ast>, "context": <sql-context>}`
 - `{"type":"sql_build_select_plan", "statement": <select-ast>, "schema": <planner-schema>}`
+- `{"type":"sql_eval", "statement": <sql-ast>, "context": <eval-context>, "state": <eval-state>}`
 
-`sql_generate_ops` uses an AST+context envelope (not raw SQL text) to avoid parser duplication.
+`sql_generate_ops` and `sql_eval` use AST+context envelopes (not raw SQL text) to avoid parser duplication.
+
+In tests, SQL is still generated as **text**; TypeScript parses once, then sends the same AST payload to Lean and the TS evaluator/planner for differential comparison.
 
 `sql_build_select_plan` verifies the same planner routing/filter behavior used by TypeScript.
 

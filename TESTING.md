@@ -52,6 +52,9 @@ For higher confidence without broad coupling, increase DRT runs:
 
 ```bash
 DRT_NUM_RUNS=1000 DRT_TIMEOUT_MS=120000 npx vitest run test/drt/*.drt.test.ts
+
+# Replay a specific SQL eval failing seed
+DRT_NUM_RUNS=200 DRT_SEED=-1196022201 npx vitest run test/drt/sql-eval.drt.test.ts
 ```
 
 ---
@@ -83,7 +86,7 @@ The Lean model is the test oracle. fast-check generates random inputs, both Lean
 
 For LWW, generators should default to invariant-respecting states when testing semilattice properties. Add a separate adversarial suite that intentionally violates invariants to verify rejection/detection paths.
 
-For SQL, differential tests use **AST + context** as the oracle input (not raw SQL text). The parser stays tested at Level 2 (`parse/print/parse` properties), while Lean verifies semantic translation/planning.
+For SQL, differential tests generate **SQL text** and parse it once in TypeScript. The parsed AST is then fed to both implementations with shared context/state. Parser correctness stays covered at Level 2 (`parse/print/parse`), while Lean verifies semantic translation/planning/evaluation.
 
 ```typescript
 import { test, fc } from '@fast-check/vitest';
@@ -137,8 +140,9 @@ test.prop([fc.array(arbLww, { minLength: 2, maxLength: 20 })])(
 | HLC recv | Current state + remote HLC | New HLC equality (or null on drift/bounds rejection) |
 | Apply ops sequence | Random op list, random order | Final state equality |
 | Conflict guard | Same `(site, hlc, table, key, col)` with differing payloads | Must reject/quarantine |
-| SQL write op generation | Random write SQL AST + schema/site/HLC context | Lean `sql_generate_ops` equals TS `generateCrdtOps` |
-| SQL SELECT planner | Random SELECT AST + planner schema | Lean `sql_build_select_plan` equals TS `buildSelectPlan` |
+| SQL write op generation | Random write SQL text + schema/site/HLC context (parsed once to AST) | Lean `sql_generate_ops` equals TS `generateCrdtOps` |
+| SQL SELECT planner | Random SELECT SQL text + planner schema (parsed once to AST) | Lean `sql_build_select_plan` equals TS `buildSelectPlan` |
+| SQL AST evaluation | Random SQL text + eval state + eval context (parsed once to AST) | Lean `sql_eval` equals TS `evaluateSqlAst` |
 
 **Run configuration:**
 - Local dev: 1,000 iterations per target (~10 seconds total)
@@ -436,13 +440,13 @@ test/
 ├── drt/
 │   ├── harness.ts            # Spawns Lean executable, manages stdin/stdout
 │   ├── lww.drt.test.ts       # DRT: LWW merge
-│   ├── pn-counter.drt.test.ts
-│   ├── or-set.drt.test.ts
-│   ├── mv-register.drt.test.ts
-│   ├── hlc.drt.test.ts       # DRT: HLC operations
-│   ├── apply-ops.drt.test.ts # DRT: full operation sequences
-│   ├── sql-generate-ops.drt.test.ts  # DRT: SQL write AST -> CRDT ops
-│   └── sql-planner.drt.test.ts       # DRT: SQL SELECT planner output
+│   ├── pnCounter.drt.test.ts
+│   ├── orSet.drt.test.ts
+│   ├── mvRegister.drt.test.ts
+│   ├── compaction.drt.test.ts
+│   ├── sql-generate-ops.drt.test.ts  # DRT: SQL text -> parsed AST -> CRDT ops
+│   ├── sql-planner.drt.test.ts       # DRT: SQL text -> parsed AST -> SELECT planner output
+│   └── sql-eval.drt.test.ts          # DRT: SQL text -> parsed AST -> eval result + next state
 │
 ├── properties/
 │   ├── arbitraries.ts        # All custom fast-check generators

@@ -30,18 +30,30 @@ structure OrSet (α : Type) (Hlc : Type) where
   cases hTombstones
   rfl
 
+/-- Canonicalize by dropping all tombstoned add-tags from elements. -/
+@[simp]
+def OrSet.canonicalize {α Hlc : Type} [DecidableEq α] [DecidableEq Hlc]
+    (s : OrSet α Hlc) : OrSet α Hlc :=
+  { elements := s.elements.filter (fun e => e.tag ∉ s.tombstones)
+    tombstones := s.tombstones }
+
 /-- Merge: union elements and tombstones, then filter elements by tombstones. -/
 @[simp]
 def OrSet.merge {α Hlc : Type} [DecidableEq α] [DecidableEq Hlc]
     (a b : OrSet α Hlc) : OrSet α Hlc :=
-  let mergedElems := a.elements ∪ b.elements
-  let mergedTombs := a.tombstones ∪ b.tombstones
-  let filtered := mergedElems.filter (fun e => e.tag ∉ mergedTombs)
-  { elements := filtered, tombstones := mergedTombs }
+  OrSet.canonicalize {
+    elements := a.elements ∪ b.elements
+    tombstones := a.tombstones ∪ b.tombstones
+  }
 
 /-- Materialize: project to visible values (tags suppressed by tombstones). -/
 def OrSet.values {α Hlc : Type} [DecidableEq α] [DecidableEq Hlc]
     (s : OrSet α Hlc) : Finset α :=
   Finset.image (fun e => e.val) s.elements
+
+/-- Visible values after enforcing tombstone suppression. -/
+def OrSet.visibleValues {α Hlc : Type} [DecidableEq α] [DecidableEq Hlc]
+    (s : OrSet α Hlc) : Finset α :=
+  Finset.image (fun e => e.val) (OrSet.canonicalize s).elements
 
 end CrdtBase

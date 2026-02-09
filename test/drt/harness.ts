@@ -85,6 +85,15 @@ export class LeanDrtClient {
     });
   }
 
+  async sqlEval<T>(statement: unknown, context: unknown, state: unknown): Promise<T> {
+    return this.send<T>({
+      type: 'sql_eval',
+      statement,
+      context,
+      state,
+    });
+  }
+
   close(): void {
     this.proc.kill();
   }

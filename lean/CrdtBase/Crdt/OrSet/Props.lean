@@ -5,6 +5,28 @@ set_option autoImplicit false
 
 namespace CrdtBase
 
+/-- Canonicalization is idempotent. -/
+theorem or_set_canonicalize_idem {α Hlc : Type} [DecidableEq α] [DecidableEq Hlc]
+    (a : OrSet α Hlc) :
+    OrSet.canonicalize (OrSet.canonicalize a) = OrSet.canonicalize a := by
+  ext x
+  · simp [OrSet.canonicalize]
+  · simp [OrSet.canonicalize]
+
+/-- Canonicalization removes all elements whose tags are tombstoned. -/
+theorem or_set_canonicalize_no_tombstoned_tags {α Hlc : Type} [DecidableEq α] [DecidableEq Hlc]
+    (a : OrSet α Hlc) :
+    ∀ x, x ∈ (OrSet.canonicalize a).elements → x.tag ∉ (OrSet.canonicalize a).tombstones := by
+  intro x hx
+  exact (Finset.mem_filter.mp hx).2
+
+/-- Canonicalization preserves visible (non-tombstoned) value semantics. -/
+theorem or_set_canonicalize_preserves_visible_values {α Hlc : Type} [DecidableEq α] [DecidableEq Hlc]
+    (a : OrSet α Hlc) :
+    OrSet.visibleValues (OrSet.canonicalize a) = OrSet.visibleValues a := by
+  ext x
+  simp [OrSet.visibleValues, OrSet.canonicalize, and_assoc]
+
 /-- OR-Set merge is commutative. -/
 theorem or_set_merge_comm {α Hlc : Type} [DecidableEq α] [DecidableEq Hlc]
     (a b : OrSet α Hlc) : OrSet.merge a b = OrSet.merge b a := by
