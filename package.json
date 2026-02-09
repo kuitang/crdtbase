@@ -16,7 +16,10 @@
     "backend:http": "tsx src/backend/fileLogServerMain.ts",
     "backend:minio": "tsx scripts/start-minio-dev.ts",
     "repl:node": "tsx src/repl/nodeRepl.ts",
-    "repl:browser": "node scripts/serve-browser-repl.mjs"
+    "repl:browser": "node scripts/serve-browser-repl.mjs",
+    "stress:fly:worker": "tsx test/stress/flyWorker.ts",
+    "stress:fly:coordinator": "bash scripts/stress/fly-coordinator.sh",
+    "stress:fly:openapi": "npx --yes openapi-typescript@7.10.1 https://docs.machines.dev/spec/openapi3.json -o scripts/stress/fly-machines-openapi.d.ts"
   },
   "devDependencies": {
     "@fast-check/vitest": "^0.1.4",

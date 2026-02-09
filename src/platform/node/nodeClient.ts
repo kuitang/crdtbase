@@ -225,6 +225,14 @@ export class NodeCrdtClient {
     await this.pull();
   }
 
+  getSyncedHeads(): Record<string, LogPosition> {
+    return Object.fromEntries(this.syncedSeqBySite.entries());
+  }
+
+  getPendingOpsCount(): number {
+    return this.pendingOps.length;
+  }
+
   getDataDir(): string {
     return this.dataDir;
   }

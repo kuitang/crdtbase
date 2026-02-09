@@ -1,0 +1,26 @@
+FROM node:20.19.2-slim AS build
+
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+# Needed only in build stage for bundling; runtime image has no npm install step.
+RUN npm ci --ignore-scripts
+
+COPY src ./src
+COPY test/stress ./test/stress
+
+RUN npx esbuild test/stress/flyWorker.ts \
+  --bundle \
+  --platform=node \
+  --format=esm \
+  --target=node20 \
+  --banner:js="import { createRequire } from \"module\"; const require = createRequire(import.meta.url);" \
+  --outfile=/out/flyWorker.mjs
+
+FROM node:20.19.2-slim AS runtime
+
+WORKDIR /app
+
+COPY --from=build /out/flyWorker.mjs /app/flyWorker.mjs
+
+ENTRYPOINT ["node", "/app/flyWorker.mjs"]
