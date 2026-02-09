@@ -619,7 +619,7 @@ def generateCrdtOps
         generateDeleteOps stmt tableSchema context.site context.hlcSequence
   pure result.fst
 
-private def pickPartitionCondition
+def pickPartitionCondition
     (whereClause : List SqlWhereCondition)
     (partitionBy : String)
     : Option (String × List SqlWhereCondition) :=

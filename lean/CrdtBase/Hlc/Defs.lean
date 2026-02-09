@@ -32,9 +32,16 @@ instance : Ord Hlc where
 
 /-- Extended comparison including site ID for tiebreaking. -/
 def compareWithSite (a b : Hlc × String) : Ordering :=
-  match compare a.1.pack b.1.pack with
-  | .eq => compare a.2 b.2
-  | ord => ord
+  if hPackLt : a.1.pack < b.1.pack then
+    .lt
+  else if hPackGt : b.1.pack < a.1.pack then
+    .gt
+  else if hSiteLt : a.2 < b.2 then
+    .lt
+  else if hSiteGt : b.2 < a.2 then
+    .gt
+  else
+    .eq
 
 /-- Construct an HLC only if both fields are within bounds. -/
 def mk? (wallMs counter : Nat) : Option Hlc :=

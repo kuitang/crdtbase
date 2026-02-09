@@ -8,7 +8,11 @@ import CrdtBase.Crdt.OrSet.Defs
 import CrdtBase.Crdt.OrSet.Props
 import CrdtBase.Crdt.MvRegister.Defs
 import CrdtBase.Crdt.MvRegister.Props
+import CrdtBase.Convergence.Defs
+import CrdtBase.Convergence.Props
 import CrdtBase.Compaction.Defs
 import CrdtBase.Compaction.Props
+import CrdtBase.Tombstone.Defs
+import CrdtBase.Tombstone.Props
 import CrdtBase.Sql.Defs
 import CrdtBase.Sql.Props

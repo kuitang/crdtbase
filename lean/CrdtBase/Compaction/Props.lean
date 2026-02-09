@@ -31,6 +31,26 @@ theorem foldPrefixSuffix_eq_foldl_all {α β : Type}
   intro split
   exact foldPrefixSuffix_eq_foldl step init ops split
 
+/-- Canonical compaction law: compacting a prefix and folding the suffix
+is equivalent to folding the full stream. -/
+theorem compaction_preserves_state {α β : Type}
+    (step : β → α → β) (init : β) (preOps postOps : List α) :
+    List.foldl step (List.foldl step init preOps) postOps =
+      List.foldl step init (preOps ++ postOps) := by
+  simpa using
+    (List.foldl_append
+      (f := step)
+      (b := init)
+      (l := preOps)
+      (l' := postOps)).symm
+
+/-- Idempotence of compaction with no new deltas: compacting again leaves state unchanged. -/
+theorem compaction_idempotent {α β : Type}
+    (step : β → α → β) (init : β) (ops : List α) (split : Nat) :
+    foldPrefixSuffix step (foldPrefixSuffix step init ops split) [] split =
+      foldPrefixSuffix step init ops split := by
+  simp [foldPrefixSuffix]
+
 /-- PN-counter compaction preserves state for any prefix/suffix split. -/
 theorem pn_counter_compaction_preserves_state
     (ops : List PnCounter) (split : Nat) :
