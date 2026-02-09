@@ -28,7 +28,27 @@ cd lean && lake build CrdtBase CrdtBaseDRT
 npx vitest run test/drt/*.drt.test.ts
 ```
 
-- Run current E2E matrix rows implemented in CI today (`node x http-server`, `node x s3-minio`):
+- Run current Node E2E matrix rows (`node x http-server`, `node x s3-minio (presign transport)`, `node x s3-presign`):
 ```bash
-npx vitest run test/e2e/three-clients.e2e.test.ts test/e2e/s3-minio.e2e.test.ts
+npx vitest run test/e2e/three-clients.e2e.test.ts test/e2e/s3-minio.e2e.test.ts test/e2e/s3-presign.e2e.test.ts
 ```
+
+- Run TypeScript coverage with property tests + DRT + Node E2E matrix:
+```bash
+npm run test:coverage
+```
+
+- Run full TypeScript coverage (includes browser E2E if Playwright Chromium is available):
+```bash
+npm run test:coverage:all
+```
+
+- Coverage reports are emitted under:
+```text
+coverage/index.html
+coverage/lcov.info
+coverage/coverage-summary.json
+```
+
+Coverage is generated via `c8` wrapped around Vitest (stable for this property-heavy suite).
+Coverage commands run Vitest with single-worker settings to avoid MinIO port collisions between parallel suites.

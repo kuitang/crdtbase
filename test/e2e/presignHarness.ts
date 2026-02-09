@@ -26,11 +26,14 @@ async function pickFreePort(): Promise<number> {
   });
 }
 
-async function waitForHealth(baseUrl: string): Promise<void> {
+async function waitForHealth(baseUrl: string, authToken?: string): Promise<void> {
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
     try {
-      const response = await fetch(`${baseUrl}/health`);
+      const headers = authToken
+        ? { authorization: `Bearer ${authToken}` }
+        : undefined;
+      const response = await fetch(`${baseUrl}/health`, { headers });
       if (response.ok) {
         return;
       }
@@ -102,7 +105,7 @@ export class PresignHarness {
     });
 
     try {
-      await waitForHealth(baseUrl);
+      await waitForHealth(baseUrl, options.authToken);
     } catch (error) {
       child.kill('SIGTERM');
       throw new Error(

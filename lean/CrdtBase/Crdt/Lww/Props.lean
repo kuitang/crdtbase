@@ -17,7 +17,7 @@ theorem lww_equal_key_implies_equal_payload {α : Type} (a b : LwwRegister α)
     (hEq : Hlc.compareWithSite (a.hlc, a.site) (b.hlc, b.site) = .eq) :
     a.val = b.val := by
   have hStateEq : a = b := hCons hEq
-  simpa [hStateEq]
+  simp [hStateEq]
 
 /-- Conflicting payloads on the same `(hlc, site)` violate LWW event-consistency. -/
 theorem dedup_rejects_conflicting_same_key {α : Type} (a b : LwwRegister α)
@@ -27,7 +27,7 @@ theorem dedup_rejects_conflicting_same_key {α : Type} (a b : LwwRegister α)
   intro hCons
   have hStateEq : a = b := hCons hEq
   apply hValNe
-  simpa [hStateEq]
+  simp [hStateEq]
 
 /-- LWW merge is commutative under event-consistency. -/
 theorem lww_merge_comm_of_consistent {α : Type} (a b : LwwRegister α)

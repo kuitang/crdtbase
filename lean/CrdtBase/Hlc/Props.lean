@@ -19,7 +19,7 @@ theorem recv_some_bounds
     (localHlc remote : Hlc)
     (now : Nat)
     (out : Hlc)
-    (h : Hlc.recv localHlc remote now = some out)
+    (_h : Hlc.recv localHlc remote now = some out)
     : out.wallMs < wallMsMax ∧ out.counter < counterMax := by
   exact ⟨out.wallMs_lt, out.counter_lt⟩
 
@@ -28,7 +28,7 @@ theorem now_some_bounds
     (localHlc : Hlc)
     (wall : Nat)
     (out : Hlc)
-    (h : Hlc.now localHlc wall = some out)
+    (_h : Hlc.now localHlc wall = some out)
     : out.wallMs < wallMsMax ∧ out.counter < counterMax := by
   exact ⟨out.wallMs_lt, out.counter_lt⟩
 
@@ -163,8 +163,10 @@ private theorem compareWithSite_eq_lt_iff (a b : Hlc × String) :
         exfalso
         rcases hLt with hLt | ⟨hEq, _⟩
         · exact hPackLt hLt
-        · have : hb.pack < hb.pack := by simpa [hEq] using hPackGt
-          exact (Nat.lt_irrefl hb.pack this)
+        · have hPackGt' : hb.pack < hb.pack := by
+            rw [hEq] at hPackGt
+            exact hPackGt
+          exact Nat.lt_irrefl hb.pack hPackGt'
     · have hPackEq : ha.pack = hb.pack := by
         exact Nat.le_antisymm (Nat.le_of_not_gt hPackGt) (Nat.le_of_not_gt hPackLt)
       constructor
@@ -183,7 +185,7 @@ private theorem compareWithSite_eq_lt_iff (a b : Hlc × String) :
         · have hSiteGt : ¬ sb < sa := by
             intro hSiteGt
             exact String.lt_asymm hSiteLt hSiteGt
-          simp [hPackLt, hPackGt, hSiteLt, hSiteGt]
+          simp [hPackLt, hPackGt, hSiteLt]
 
 private theorem siteLexLt_trans
     {a b c : Hlc × String}
@@ -216,12 +218,16 @@ private theorem compareWithSite_gt_of_siteLexLt
     simp [Hlc.compareWithSite, hPackGt, hPackLt]
   · have hPackLtFalse : ¬ ha.pack < hb.pack := by
       intro hPackLt
-      have : hb.pack < hb.pack := by simpa [hPackEq] using hPackLt
-      exact (Nat.lt_irrefl hb.pack this)
+      have hPackLt' : hb.pack < hb.pack := by
+        rw [hPackEq] at hPackLt
+        exact hPackLt
+      exact Nat.lt_irrefl hb.pack hPackLt'
     have hPackGtFalse : ¬ hb.pack < ha.pack := by
       intro hPackGt
-      have : ha.pack < ha.pack := by simpa [hPackEq] using hPackGt
-      exact (Nat.lt_irrefl ha.pack this)
+      have hPackGt' : ha.pack < ha.pack := by
+        rw [← hPackEq] at hPackGt
+        exact hPackGt
+      exact Nat.lt_irrefl ha.pack hPackGt'
     have hSiteGtFalse : ¬ sb < sa := by
       intro hSiteGt
       exact String.lt_asymm hSiteLt hSiteGt
@@ -243,15 +249,13 @@ theorem compareWithSite_swap_gt
   rcases a with ⟨ha, sa⟩
   rcases b with ⟨hb, sb⟩
   by_cases hPackGt : hb.pack < ha.pack
-  · have hPackLtFalse : ¬ ha.pack < hb.pack := by
-      intro hPackLt
-      exact Nat.lt_asymm hPackLt hPackGt
-    simp [Hlc.compareWithSite, hPackGt, hPackLtFalse]
+  · simp [Hlc.compareWithSite, hPackGt]
   · by_cases hPackLt : ha.pack < hb.pack
     · have hImpossible : Hlc.compareWithSite (ha, sa) (hb, sb) = .lt := by
-        simp [Hlc.compareWithSite, hPackLt, hPackGt]
+        simp [Hlc.compareWithSite, hPackLt]
       have : False := by
-        simpa [hImpossible] using h
+        have hContr : Ordering.lt = Ordering.gt := hImpossible.symm.trans h
+        cases hContr
       exact False.elim this
     · have hSiteGt : sb < sa := by
         have hSite :
@@ -262,10 +266,7 @@ theorem compareWithSite_swap_gt
         · exact hSiteGt
         · exfalso
           by_cases hSiteLt : sa < sb <;> simp [hSiteGt, hSiteLt] at hSite
-      have hSiteLtFalse : ¬ sa < sb := by
-        intro hSiteLt
-        exact String.lt_asymm hSiteLt hSiteGt
-      simp [Hlc.compareWithSite, hPackGt, hPackLt, hSiteGt, hSiteLtFalse]
+      simp [Hlc.compareWithSite, hPackGt, hPackLt, hSiteGt]
 
 /-- Transitivity of `.lt` for `compareWithSite`. -/
 theorem compareWithSite_trans_lt
@@ -337,7 +338,7 @@ theorem hlc_now_monotonic
     have hOutWallEq : out.wallMs = localHlc.wallMs := by
       simpa [hWallEq] using hOutWall
     have hCounterLt : localHlc.counter < out.counter := by
-      simpa [hCounterEq] using Nat.lt_succ_self localHlc.counter
+      simp [hCounterEq]
     have hOutPackLt : localHlc.pack < out.pack := by
       exact pack_lt_of_same_wall_counter_lt localHlc out hOutWallEq.symm hCounterLt
     exact hOutPackLt
@@ -421,7 +422,7 @@ theorem hlc_recv_monotonic
                 Hlc.recvWall localHlc remote now = localHlc.wallMs := hRecvWallLocal
                 _ = remote.wallMs := hEqLocalRemote
             simp [Hlc.recvCounter, hRecvWallLocal, hLocalNeRemote]
-          simpa [hCounterEq] using Nat.lt_succ_self localHlc.counter
+          simp [hCounterEq]
       have hCounterOut : localHlc.counter < out.counter := by
         simpa [hCounter] using hCounterGtLocal
       exact pack_lt_of_same_wall_counter_lt localHlc out hLocalWallEq.symm hCounterOut
@@ -458,7 +459,7 @@ theorem hlc_recv_monotonic
                 Hlc.recvWall localHlc remote now = remote.wallMs := hRecvWallRemote
                 _ = localHlc.wallMs := hEqRemoteLocal
             simp [Hlc.recvCounter, hRecvWallRemote, hRemoteNeLocal]
-          simpa [hCounterEq] using Nat.lt_succ_self remote.counter
+          simp [hCounterEq]
       have hCounterOut : remote.counter < out.counter := by
         simpa [hCounter] using hCounterGtRemote
       exact pack_lt_of_same_wall_counter_lt remote out hRemoteWallEq.symm hCounterOut

@@ -640,8 +640,8 @@ def generatedOpsAreSyncableB (ops : List EncodedCrdtOp) : Bool :=
   ops.all EncodedCrdtOp.isSyncableb
 
 def validateGeneratedOps (ops : List EncodedCrdtOp) : Except String (List EncodedCrdtOp) :=
-  if hTags : generatedOpsHaveValidTagsB ops = true then
-    if hSync : generatedOpsAreSyncableB ops = true then
+  if _ : generatedOpsHaveValidTagsB ops = true then
+    if _ : generatedOpsAreSyncableB ops = true then
       pure ops
     else
       throw "internal error: generated non-syncable CRDT op"

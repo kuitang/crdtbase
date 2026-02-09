@@ -22,7 +22,7 @@ theorem foldPrefixSuffix_eq_foldl {α β : Type}
               (l := List.take split ops)
               (l' := List.drop split ops)).symm
     _ = List.foldl step init ops := by
-          simpa using congrArg (List.foldl step init) (List.take_append_drop split ops)
+          exact congrArg (List.foldl step init) (List.take_append_drop split ops)
 
 /-- Same law as `foldPrefixSuffix_eq_foldl`, stated explicitly for all split points. -/
 theorem foldPrefixSuffix_eq_foldl_all {α β : Type}
@@ -37,7 +37,7 @@ theorem compaction_preserves_state {α β : Type}
     (step : β → α → β) (init : β) (preOps postOps : List α) :
     List.foldl step (List.foldl step init preOps) postOps =
       List.foldl step init (preOps ++ postOps) := by
-  simpa using
+  exact
     (List.foldl_append
       (f := step)
       (b := init)
