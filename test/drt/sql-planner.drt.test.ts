@@ -7,8 +7,11 @@ import {
   parseSql,
   type SelectPlannerSchema,
   type SelectStatement,
+  type SqlSchema,
 } from '../../src/core/sql';
+import { type SqlEvalState } from '../../src/core/sqlEval';
 import { arbGeneratedSelectPlanCase } from '../properties/sql.generators';
+import { toLeanSchema, toLeanState, type LeanScriptEvalOutcome } from './sql-script-utils';
 
 const leanBin = LeanDrtClient.findBinary();
 const drt = leanBin ? test : test.skip;
@@ -30,7 +33,7 @@ describe('DRT: SQL planner', () => {
 
   drt
     .prop([arbGeneratedSelectPlanCase], { numRuns: drtRuns })
-    ('Lean sql_build_select_plan matches TypeScript buildSelectPlan', async (input) => {
+    ('Lean sql_script_eval select plan matches TypeScript buildSelectPlan', async (input) => {
       const parsed = parseSql(input.sql);
       fc.pre(parsed.kind === 'select');
       const statement = parsed as SelectStatement;
@@ -39,10 +42,35 @@ describe('DRT: SQL planner', () => {
         partitionBy: input.partitionBy ?? null,
       };
       const tsPlan = buildSelectPlan(statement, schema);
-      const lean = await client!.sqlBuildSelectPlan<{ result: typeof tsPlan }>(statement, schema);
 
+      const tableSchema: SqlSchema = {
+        [statement.table]: {
+          pk: 'id',
+          partitionBy: input.partitionBy ?? null,
+          columns: {},
+        },
+      };
+
+      const initialState: SqlEvalState = {
+        schema: tableSchema,
+        rows: [],
+      };
+
+      const lean = await client!.sqlScriptEval<{ result: LeanScriptEvalOutcome }>(
+        [statement],
+        {
+          schema: toLeanSchema(tableSchema),
+          hlcSequence: [],
+          removeTags: null,
+        },
+        toLeanState(initialState),
+      );
+
+      expect(lean.result.outcomes).toHaveLength(1);
+      const outcome = lean.result.outcomes[0]!;
+      expect(outcome.kind).toBe('read');
+      expect(outcome.kind === 'read' ? outcome.select : null).toEqual(input.expectedPlan);
       expect(tsPlan).toEqual(input.expectedPlan);
-      expect(lean.result).toEqual(input.expectedPlan);
-      expect(lean.result).toEqual(tsPlan);
+      expect(outcome.kind === 'read' ? outcome.select : null).toEqual(tsPlan);
     }, drtTimeoutMs);
 });

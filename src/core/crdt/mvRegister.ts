@@ -1,4 +1,4 @@
-import { Hlc } from '../hlc';
+import { Hlc, compareHlc } from '../hlc';
 
 export type MvRegisterValue<T> = {
   val: T;
@@ -74,10 +74,28 @@ function dedupeByEvent<T>(values: Array<MvRegisterValue<T>>): Array<MvRegisterVa
   return [...seen.values()];
 }
 
+function pruneDominatedBySameSite<T>(values: Array<MvRegisterValue<T>>): Array<MvRegisterValue<T>> {
+  const maxBySite = new Map<string, Hlc>();
+  for (const entry of values) {
+    const currentMax = maxBySite.get(entry.site);
+    if (!currentMax || compareHlc(entry.hlc, currentMax) > 0) {
+      maxBySite.set(entry.site, entry.hlc);
+    }
+  }
+  return values.filter((entry) => {
+    const max = maxBySite.get(entry.site);
+    if (!max) {
+      return true;
+    }
+    return compareHlc(entry.hlc, max) === 0;
+  });
+}
+
 export function canonicalizeMvRegister<T>(state: MvRegister<T>): MvRegister<T> {
   assertMvEventConsistency(state.values);
   const deduped = dedupeByEvent(state.values);
-  const values = deduped.sort((left, right) => compareKeys(entrySortKey(left), entrySortKey(right)));
+  const undominated = pruneDominatedBySameSite(deduped);
+  const values = undominated.sort((left, right) => compareKeys(entrySortKey(left), entrySortKey(right)));
   return { values };
 }
 

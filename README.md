@@ -15,6 +15,16 @@ This README focuses on manual validation expectations and operator notes.
 - Direct S3 replicated log backend (`S3ReplicatedLog`)
 - Property tests, differential random tests (Lean parity), and chaos E2E suites
 
+## Lean DRT SQL Interface
+
+Lean SQL parity tests use a single DRT command, `sql_script_eval`, which accepts
+a list of SQL AST statements plus eval context/state, executes the sequence
+end-to-end, and returns per-statement outcomes and final state.
+
+Individual DRT suites (`lww`, `pnCounter`, `orSet`, `mvRegister`, SQL planner,
+SQL op generation, SQL eval, and split-law checks) are preserved and now route
+through this same SQL-script pipeline.
+
 ## Table CRDT Model
 
 Table state is modeled as a key-to-row map where each row has mixed CRDT columns plus an

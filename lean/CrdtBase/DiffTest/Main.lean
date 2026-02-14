@@ -228,6 +228,13 @@ structure SqlEvalCmd where
   state : SqlEvalStateCmd
   deriving FromJson
 
+structure SqlScriptEvalCmd where
+  type : String
+  statements : List Json
+  context : SqlEvalContextCmd
+  state : SqlEvalStateCmd
+  deriving FromJson
+
 structure ReplicationEntryJson where
   siteId : String
   seq : Nat
@@ -390,6 +397,11 @@ def mvEventKey (value : MvValueJson) : String :=
 def mvValueSortKey (value : MvValueJson) : String :=
   s!"{mvEventKey value}:{(toJson value.val).compress}"
 
+def compareHlcJson (left right : HlcJson) : Ordering :=
+  match compare left.wallMs right.wallMs with
+  | .eq => compare left.counter right.counter
+  | ord => ord
+
 def validateMvHlcBounds (input : MvJson) : Except String Unit := do
   for value in input.values do
     let _ ← toHlc value.hlc
@@ -400,8 +412,12 @@ def assertMvConsistent (values : List MvValueJson) : Except String Unit := do
   checkConsistentPairs pairs "conflicting MV-Register event identity"
 
 def mergeMvJson (a b : MvJson) : MvJson :=
-  let merged := dedupeByKey mvEventKey (a.values ++ b.values)
-  { values := sortByKey mvValueSortKey merged }
+  let deduped := dedupeByKey mvEventKey (a.values ++ b.values)
+  let undominated := deduped.filter (fun entry =>
+    not (deduped.any (fun other =>
+      other.site == entry.site &&
+      compareHlcJson other.hlc entry.hlc = .gt)))
+  { values := sortByKey mvValueSortKey undominated }
 
 def handleMvMerge (aJson bJson : Json) : Except String String := do
   let a : MvJson ← fromJson? aJson
@@ -477,8 +493,21 @@ def evalColumnTypeTag (state : EvalColumnState) : Nat :=
   | .mvRegister _ => 4
 
 def compareEventKey (hlcA siteA hlcB siteB : String) : Ordering :=
-  match compare hlcA hlcB with
+  let leftBody := (canonicalizeHlcHex hlcA).drop 2
+  let rightBody := (canonicalizeHlcHex hlcB).drop 2
+  let hlcOrder :=
+    match compare leftBody.length rightBody.length with
+    | .eq => compare leftBody rightBody
+    | ord => ord
+  match hlcOrder with
   | .eq => compare siteA siteB
+  | ord => ord
+
+def compareCanonicalHlcHex (left right : String) : Ordering :=
+  let leftBody := (canonicalizeHlcHex left).drop 2
+  let rightBody := (canonicalizeHlcHex right).drop 2
+  match compare leftBody.length rightBody.length with
+  | .eq => compare leftBody rightBody
   | ord => ord
 
 def lookupColumnState (columns : List EvalColumn) (column : String) : Option EvalColumnState :=
@@ -545,7 +574,11 @@ def normalizeMvState (state : EvalMvState) : Except String EvalMvState := do
   let eventPairs := state.values.map (fun entry =>
     (s!"{entry.hlc}:{entry.site}", entry.val.compress))
   checkConsistentPairs eventPairs "conflicting MV-Register event identity"
-  let values := dedupeByKey (fun entry => s!"{entry.hlc}:{entry.site}") state.values
+  let deduped := dedupeByKey (fun entry => s!"{entry.hlc}:{entry.site}") state.values
+  let values := deduped.filter (fun entry =>
+    not (deduped.any (fun other =>
+      other.site == entry.site &&
+      compareCanonicalHlcHex other.hlc entry.hlc = .gt)))
   pure {
     values := sortByKey (fun entry => s!"{entry.hlc}:{entry.site}:{entry.val.compress}") values
   }
@@ -769,33 +802,83 @@ def applyOpsToRows (rows : List EvalRow) (ops : List EncodedCrdtOp) : Except Str
         loop next tail
   loop rows ops
 
+def resolveSetRemoveTagsFromRows
+    (rows : List EvalRow)
+    (table : String)
+    (key : Json)
+    (column : String)
+    (value : Json)
+    : List SetRemoveTag :=
+  match rows.find? (fun row => row.table == table && row.key.compress == key.compress) with
+  | none => []
+  | some row =>
+      match lookupColumnState row.columns column with
+      | some (.orSet state) =>
+          state.elements.filterMap (fun entry =>
+            if entry.val.compress == value.compress then
+              some ({ hlc := entry.hlc, site := entry.site } : SetRemoveTag)
+            else
+              none)
+      | _ => []
+
+def ensurePrimaryKeyJson (table pk : String) (value : Json) : Except String Json := do
+  match value with
+  | .str _ => pure value
+  | .num _ => pure value
+  | _ => throw s!"primary key '{table}.{pk}' must be STRING or NUMBER"
+
+def findPrimaryKeyValueInWhere
+    (whereClause : List SqlWhereCondition)
+    (table : String)
+    (pk : String)
+    : Except String Json := do
+  match whereClause.find? (fun condition => condition.column == pk && condition.op == .eq) with
+  | none => throw s!"write on '{table}' requires WHERE {pk} = <value>"
+  | some condition => ensurePrimaryKeyJson table pk condition.value
+
 def runWriteStatement
     (statement : SqlWriteStatement)
-    (context : SqlEvalContextCmd)
+    (schema : List SqlTableSchema)
+    (site : String)
+    (hlcSequence : List String)
+    (removeTags : Option (List SetRemoveTag))
     (rows : List EvalRow)
-    : Except String (Json × List EvalRow) := do
-  let site ←
-    match context.site with
-    | some value => pure value
-    | none => throw "write planning requires schema, site, and nextHlc"
-  let hlcSequence ←
-    match context.hlcSequence with
-    | some values => pure values
-    | none => throw "write planning requires schema, site, and nextHlc"
-  let generationContext : SqlGenerationContext := {
-    schema := context.schema
-    site := site
-    hlcSequence := hlcSequence
-    removeTags := context.removeTags.getD []
-  }
-  let ops ← generateCrdtOps statement generationContext
+    : Except String (Json × List EvalRow × Nat) := do
+  let ops ←
+    match statement, removeTags with
+    | .remove removeStatement, none =>
+        let tableSchema ← requireTableSchema schema removeStatement.table
+        let key ← findPrimaryKeyValueInWhere removeStatement.whereClause removeStatement.table tableSchema.pk
+        let resolvedTags :=
+          resolveSetRemoveTagsFromRows
+            rows
+            removeStatement.table
+            key
+            removeStatement.column
+            removeStatement.value
+        if resolvedTags.isEmpty then
+          pure []
+        else
+          generateCrdtOps statement {
+            schema := schema
+            site := site
+            hlcSequence := hlcSequence
+            removeTags := resolvedTags
+          }
+    | _, _ =>
+        generateCrdtOps statement {
+          schema := schema
+          site := site
+          hlcSequence := hlcSequence
+          removeTags := removeTags.getD []
+        }
   let nextRows ← applyOpsToRows rows ops
   let result := Json.mkObj [
     ("kind", toJson "write"),
     ("statementKind", toJson (writeStatementKind statement)),
     ("ops", toJson ops)
   ]
-  pure (result, nextRows)
+  pure (result, nextRows, ops.length)
 
 def decodeWriteStatement? (statement : Json) : Except String SqlWriteStatement := do
   let kind ← statement.getObjValAs? String "kind"
@@ -809,25 +892,83 @@ def decodeWriteStatement? (statement : Json) : Except String SqlWriteStatement :
   | "delete" => pure (.delete (← fromJson? statement))
   | _ => throw s!"unsupported SQL eval statement kind '{kind}'"
 
+def runSqlEvalStatement
+    (statement : Json)
+    (schema : List SqlTableSchema)
+    (site : Option String)
+    (hlcSequence : Option (List String))
+    (removeTags : Option (List SetRemoveTag))
+    (rows : List EvalRow)
+    : Except String (Json × List EvalRow × Nat) := do
+  let kind ← statement.getObjValAs? String "kind"
+  if kind = "select" then
+    let select : SelectStatement ← fromJson? statement
+    let result ← runSelectStatement select schema rows
+    pure (result, rows, 0)
+  else
+    let write ← decodeWriteStatement? statement
+    let writeSite ←
+      match site with
+      | some value => pure value
+      | none => throw "write planning requires schema, site, and nextHlc"
+    let writeHlcSequence ←
+      match hlcSequence with
+      | some values => pure values
+      | none => throw "write planning requires schema, site, and nextHlc"
+    runWriteStatement write schema writeSite writeHlcSequence removeTags rows
+
 def handleSqlEval (json : Json) : Except String String := do
   let cmd : SqlEvalCmd ← fromJson? json
-  let kind ← cmd.statement.getObjValAs? String "kind"
   let schema := cmd.context.schema
   let rows ← normalizeEvalRows cmd.state.rows
-  let (result, nextRows) ←
-    if kind = "select" then
-      let statement : SelectStatement ← fromJson? cmd.statement
-      let result ← runSelectStatement statement schema rows
-      pure (result, rows)
-    else
-      let statement ← decodeWriteStatement? cmd.statement
-      runWriteStatement statement cmd.context rows
+  let (result, nextRows, _) ← runSqlEvalStatement
+    cmd.statement
+    schema
+    cmd.context.site
+    cmd.context.hlcSequence
+    cmd.context.removeTags
+    rows
   let nextState := Json.mkObj [
     ("schema", toJson schema),
     ("rows", toJson nextRows)
   ]
   pure (resultLine (Json.mkObj [
     ("result", result),
+    ("nextState", nextState)
+  ]))
+
+def handleSqlScriptEval (json : Json) : Except String String := do
+  let cmd : SqlScriptEvalCmd ← fromJson? json
+  let schema := cmd.context.schema
+  let rows ← normalizeEvalRows cmd.state.rows
+  let rec loop
+      (currentRows : List EvalRow)
+      (remainingHlc : Option (List String))
+      (statements : List Json)
+      (acc : List Json)
+      : Except String (List Json × List EvalRow) := do
+    match statements with
+    | [] => pure (acc.reverse, currentRows)
+    | statement :: tail =>
+        let (result, nextRows, consumedHlc) ← runSqlEvalStatement
+          statement
+          schema
+          cmd.context.site
+          remainingHlc
+          cmd.context.removeTags
+          currentRows
+        let nextHlc :=
+          match remainingHlc with
+          | some values => some (values.drop consumedHlc)
+          | none => none
+        loop nextRows nextHlc tail (result :: acc)
+  let (outcomes, nextRows) ← loop rows cmd.context.hlcSequence cmd.statements []
+  let nextState := Json.mkObj [
+    ("schema", toJson schema),
+    ("rows", toJson nextRows)
+  ]
+  pure (resultLine (Json.mkObj [
+    ("outcomes", toJson outcomes),
     ("nextState", nextState)
   ]))
 
@@ -863,21 +1004,7 @@ def handleLine (line : String) : Except String String := do
   let json ← Json.parse line
   let typ ← json.getObjValAs? String "type"
   match typ with
-  | "lww_merge" =>
-      let cmd : MergeCmd ← fromJson? json
-      handleLwwMerge cmd.a cmd.b
-  | "pn_merge" =>
-      let cmd : MergeCmd ← fromJson? json
-      handlePnMerge cmd.a cmd.b
-  | "or_set_merge" =>
-      let cmd : MergeCmd ← fromJson? json
-      handleOrSetMerge cmd.a cmd.b
-  | "mv_merge" =>
-      let cmd : MergeCmd ← fromJson? json
-      handleMvMerge cmd.a cmd.b
-  | "sql_generate_ops" => handleSqlGenerateOps json
-  | "sql_build_select_plan" => handleSqlBuildSelectPlan json
-  | "sql_eval" => handleSqlEval json
+  | "sql_script_eval" => handleSqlScriptEval json
   | "replication_list_sites" => handleReplicationListSites json
   | "replication_get_head" => handleReplicationGetHead json
   | "replication_read_since" => handleReplicationReadSince json

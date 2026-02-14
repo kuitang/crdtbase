@@ -1,4 +1,6 @@
 import {
+  DEFAULT_OR_SET_TOMBSTONE_TTL_MS,
+  DEFAULT_ROW_TOMBSTONE_TTL_MS,
   ManifestFile,
   ManifestSegmentRef,
   SegmentFile,
@@ -8,6 +10,7 @@ import {
   makeEmptyManifest,
   maxHlcHex,
   mergeRuntimeRowMaps,
+  pruneRuntimeRowsForCompaction,
   segmentFileToRuntimeRows,
 } from '../../core/compaction';
 import { decodeBin, encodeBin } from '../../core/encoding';
@@ -44,6 +47,9 @@ export type SnapshotCompactorOptions = {
   log: ReplicatedLog;
   snapshots: SnapshotStore;
   schema?: SqlSchema;
+  now?: () => number;
+  orSetTombstoneTtlMs?: number;
+  rowTombstoneTtlMs?: number;
 };
 
 export type NodeCompactionResult = {
@@ -87,6 +93,12 @@ export async function compactReplicatedLog(
     }
     sitesCompacted[siteId] = nextHead;
   }
+
+  pruneRuntimeRowsForCompaction(rows, {
+    nowMs: (options.now ?? (() => Date.now()))(),
+    orSetTombstoneTtlMs: options.orSetTombstoneTtlMs ?? DEFAULT_OR_SET_TOMBSTONE_TTL_MS,
+    rowTombstoneTtlMs: options.rowTombstoneTtlMs ?? DEFAULT_ROW_TOMBSTONE_TTL_MS,
+  });
 
   const builtSegments = buildSegmentsFromRows({
     schema,

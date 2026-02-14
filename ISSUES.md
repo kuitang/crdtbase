@@ -82,7 +82,11 @@ and permanently orphan segment data that was the latest compacted state.
 
 ## P1 (High) -- Could cause incorrect behavior under specific conditions
 
-### P1-1: Browser client does not persist HLC high-water mark
+### ~~P1-1: Browser client does not persist HLC high-water mark~~ FIXED
+
+**Status:** Fixed. `BrowserCrdtClient` now persists a per-site local HLC
+high-water mark via browser storage (`localStorage` by default, overridable via
+`BrowserCrdtClientOptions.storage`) and restores it at open time.
 
 **Source:** Ch1 s5.4 Warning "Browser HLC Gap"; Ch5 s5.8 Concern 4
 
@@ -132,7 +136,11 @@ for precondition-free idempotence.
 
 ## P2 (Medium) -- Missing safety guardrails, incomplete proofs
 
-### P2-1: OR-Set tombstone growth is unbounded
+### ~~P2-1: OR-Set tombstone growth is unbounded~~ FIXED
+
+**Status:** Fixed. Compaction now prunes OR-Set tombstones using TTL policy
+(default 7 days) via `pruneRuntimeRowsForCompaction`, wired through
+`compactReplicatedLog` with configurable retention options.
 
 **Source:** Ch5 s5.8 Concern 2; Ch6 s6.9 Warning "Tombstone Retention Is Permanent"; Ch6 s6.11 Warning "Tradeoff 4"
 
@@ -155,7 +163,11 @@ degrade performance over time.
 
 ---
 
-### P2-2: MV-Register never prunes dominated values
+### ~~P2-2: MV-Register never prunes dominated values~~ FIXED
+
+**Status:** Fixed. `canonicalizeMvRegister` now prunes values dominated by a
+newer HLC from the same site (after event dedupe), bounding stale per-site
+versions in MV-register state.
 
 **Source:** Ch5 s5.8 Concern 3
 
@@ -176,7 +188,11 @@ storage and serialization cost. Materialized query results may contain more
 
 ---
 
-### P2-3: Row-level tombstone TTL not implemented
+### ~~P2-3: Row-level tombstone TTL not implemented~~ FIXED
+
+**Status:** Fixed. Compaction now drops rows whose `_exists = false` tombstone
+HLC is older than the configured row tombstone TTL (default 7 days), using the
+same retention policy path as OR-Set tombstone pruning.
 
 **Source:** Ch6 s6.9.2; Ch6 s6.11 Warning "Tradeoff 4"
 
@@ -196,7 +212,14 @@ with frequent delete/re-insert cycles, segment files grow without bound.
 
 ---
 
-### P2-4: TypeScript/Lean equivalence bridged only by testing, not formal refinement
+### ~~P2-4: TypeScript/Lean equivalence bridged only by testing, not formal refinement~~ MITIGATED
+
+**Status:** Mitigated (not eliminated). DRT was expanded and unified behind a
+single SQL-script entrypoint (`sql_script_eval`) that executes full statement
+sequences end-to-end, while preserving per-domain DRT suites (`lww`,
+`pnCounter`, `orSet`, `mvRegister`, planner/op-generation, and split-law
+coverage). Lean SQL DRT behavior was aligned with TypeScript for event ordering
+and dynamic OR-Set remove-tag resolution.
 
 **Source:** Ch3 s3.11 Warning "Verification Gaps" bullet 1
 

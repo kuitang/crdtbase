@@ -302,6 +302,11 @@ const arbContext: fc.Arbitrary<SqlEvalContext> = fc.record({
   hlcSequence: fc.array(arbHlcHex, { minLength: 24, maxLength: 40 }),
 });
 
+const arbTraceContext: fc.Arbitrary<SqlEvalContext> = fc.record({
+  site: arbSiteId,
+  hlcSequence: fc.array(arbHlcHex, { minLength: 64, maxLength: 160 }),
+});
+
 export type GeneratedSqlEvalCase = {
   sql: string;
   context: SqlEvalContext;
@@ -311,5 +316,17 @@ export type GeneratedSqlEvalCase = {
 export const arbSqlEvalCase: fc.Arbitrary<GeneratedSqlEvalCase> = fc.record({
   sql: arbSqlText,
   context: arbContext,
+  state: arbEvalState,
+});
+
+export type GeneratedSqlEvalTraceCase = {
+  statements: string[];
+  context: SqlEvalContext;
+  state: SqlEvalState;
+};
+
+export const arbSqlEvalTraceCase: fc.Arbitrary<GeneratedSqlEvalTraceCase> = fc.record({
+  statements: fc.array(arbSqlText, { minLength: 2, maxLength: 8 }),
+  context: arbTraceContext,
   state: arbEvalState,
 });

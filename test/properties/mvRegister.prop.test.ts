@@ -3,9 +3,11 @@ import { test } from '@fast-check/vitest';
 import fc from 'fast-check';
 import { arbMvRegister } from './arbitraries';
 import {
+  canonicalizeMvRegister,
   hasConflictingMvEvents,
   mergeMvRegister,
 } from '../../src/core/crdt/mvRegister';
+import { arbMvValue } from './arbitraries';
 
 function eventKey(value: {
   hlc: { wallMs: number; counter: number };
@@ -43,6 +45,20 @@ describe('MV-Register properties', () => {
       const merged = mergeMvRegister(a, b);
       const keys = merged.values.map((value) => eventKey(value));
       expect(new Set(keys).size).toBe(keys.length);
+    },
+  );
+
+  test.prop([fc.array(arbMvValue(), { maxLength: 40 })])(
+    'canonicalization prunes values dominated by newer writes from the same site',
+    (values) => {
+      const canonical = canonicalizeMvRegister({ values });
+      const perSite = new Map<string, number>();
+      for (const entry of canonical.values) {
+        perSite.set(entry.site, (perSite.get(entry.site) ?? 0) + 1);
+      }
+      for (const count of perSite.values()) {
+        expect(count).toBe(1);
+      }
     },
   );
 });

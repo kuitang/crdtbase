@@ -1,4 +1,5 @@
 import { packHlc } from './hlc';
+import { canonicalizeOrSet } from './crdt/orSet';
 import { EncodedCrdtOp, SqlPrimaryKey, SqlSchema, SqlTableSchema } from './sql';
 import {
   RuntimeRowState,
@@ -50,6 +51,15 @@ export type BuiltSegment = {
   segment: SegmentFile;
 };
 
+export const DEFAULT_OR_SET_TOMBSTONE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+export const DEFAULT_ROW_TOMBSTONE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+export type CompactionRetentionPolicy = {
+  nowMs: number;
+  orSetTombstoneTtlMs: number;
+  rowTombstoneTtlMs: number;
+};
+
 type PartitionGroup = {
   table: string;
   partition: string;
@@ -73,6 +83,16 @@ function normalizeHlcHex(value: string): string {
 
 function parseHlcHex(value: string): bigint {
   return BigInt(normalizeHlcHex(value));
+}
+
+function assertFiniteNonNegativeMs(value: number, label: string): void {
+  if (!Number.isFinite(value) || value < 0) {
+    throw new Error(`${label} must be a finite non-negative number`);
+  }
+}
+
+function isHlcExpired(hlcWallMs: number, cutoffMs: number): boolean {
+  return hlcWallMs <= cutoffMs;
 }
 
 function sortObjectByKey<T>(record: Record<string, T>): Record<string, T> {
@@ -398,6 +418,49 @@ export function makeEmptyManifest(): ManifestFile {
     segments: [],
     sites_compacted: {},
   };
+}
+
+export function pruneRuntimeRowsForCompaction(
+  rows: Map<string, RuntimeRowState>,
+  policy: CompactionRetentionPolicy,
+): void {
+  assertFiniteNonNegativeMs(policy.nowMs, 'compaction retention nowMs');
+  assertFiniteNonNegativeMs(policy.orSetTombstoneTtlMs, 'OR-Set tombstone TTL');
+  assertFiniteNonNegativeMs(policy.rowTombstoneTtlMs, 'row tombstone TTL');
+
+  const orSetCutoffMs = policy.nowMs - policy.orSetTombstoneTtlMs;
+  const rowCutoffMs = policy.nowMs - policy.rowTombstoneTtlMs;
+
+  for (const [storageKey, row] of [...rows.entries()]) {
+    const exists = row.columns.get('_exists');
+    if (
+      exists?.typ === 1 &&
+      exists.state.val === false &&
+      isHlcExpired(exists.state.hlc.wallMs, rowCutoffMs)
+    ) {
+      rows.delete(storageKey);
+      continue;
+    }
+
+    for (const [column, state] of row.columns.entries()) {
+      if (state.typ !== 3) {
+        continue;
+      }
+      const retainedTombstones = state.state.tombstones.filter(
+        (tag) => !isHlcExpired(tag.addHlc.wallMs, orSetCutoffMs),
+      );
+      if (retainedTombstones.length === state.state.tombstones.length) {
+        continue;
+      }
+      row.columns.set(column, {
+        typ: 3,
+        state: canonicalizeOrSet({
+          elements: state.state.elements,
+          tombstones: retainedTombstones,
+        }),
+      });
+    }
+  }
 }
 
 export function isValidPackedHlcHex(value: string): boolean {
