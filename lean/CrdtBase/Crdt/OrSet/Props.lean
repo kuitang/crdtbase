@@ -58,4 +58,19 @@ theorem or_set_merge_idem {α Hlc : Type} [DecidableEq α] [DecidableEq Hlc]
       simp [OrSet.merge, hx, hNotInTombs]
   · simp [OrSet.merge]
 
+/-- OR-Set merge always produces canonicalized output (no element has its tag in tombstones). -/
+theorem or_set_merge_canonicalized {α Hlc : Type} [DecidableEq α] [DecidableEq Hlc]
+    (a b : OrSet α Hlc) :
+    ∀ x ∈ (OrSet.merge a b).elements, x.tag ∉ (OrSet.merge a b).tombstones := by
+  intro x hx
+  simp [OrSet.merge] at hx ⊢
+  exact hx.2
+
+/-- OR-Set merge is idempotent for arbitrary inputs (no canonicalization precondition).
+    For any `a b`, `merge (merge a b) (merge a b) = merge a b`. -/
+theorem or_set_merge_idem_general {α Hlc : Type} [DecidableEq α] [DecidableEq Hlc]
+    (a b : OrSet α Hlc) :
+    OrSet.merge (OrSet.merge a b) (OrSet.merge a b) = OrSet.merge a b := by
+  exact or_set_merge_idem (OrSet.merge a b) (or_set_merge_canonicalized a b)
+
 end CrdtBase

@@ -1,4 +1,8 @@
 import CrdtBase.Crdt.Table.Defs
+import CrdtBase.Crdt.Lww.Props
+import CrdtBase.Crdt.PnCounter.Props
+import CrdtBase.Crdt.OrSet.Props
+import CrdtBase.Crdt.MvRegister.Props
 
 set_option autoImplicit false
 
@@ -35,6 +39,121 @@ theorem table_merge_idem_of_row_idem
   exact hRowIdem (a key)
 
 end TableMerge
+
+/-! ### Validity predicate and instantiated row-level CRDT theorems -/
+
+section ValidTableRow
+
+variable {α β γ Hlc : Type}
+variable [DecidableEq β] [DecidableEq Hlc] [DecidableEq γ]
+
+/-- A valid table row state requires LWW event-consistency between any two
+    rows being merged (for the `alive` and `lwwCol` columns) and that the
+    OR-Set column is canonicalized (no element tag appears in tombstones).
+
+    This predicate captures the system-level invariant that:
+    1. Each `(hlc, site)` pair uniquely determines the LWW payload
+       (event-consistency), and
+    2. OR-Set state has been canonicalized (as it always is after a merge). -/
+structure ValidTableRowPair (a b : TableRowState α β γ Hlc) : Prop where
+  alive_consistent   : LwwConsistentPair a.alive b.alive
+  lwwCol_consistent  : LwwConsistentPair a.lwwCol b.lwwCol
+  setCol_a_clean     : ∀ x ∈ a.setCol.elements, x.tag ∉ a.setCol.tombstones
+  setCol_b_clean     : ∀ x ∈ b.setCol.elements, x.tag ∉ b.setCol.tombstones
+
+/-- Row merge is commutative under the validity predicate, by case-splitting
+    on each column's CRDT type and applying the appropriate per-type theorem. -/
+theorem mergeTableRow_comm_of_valid
+    (a b : TableRowState α β γ Hlc)
+    (hValid : ValidTableRowPair a b)
+    : mergeTableRow a b = mergeTableRow b a := by
+  simp only [mergeTableRow, TableRowState.mk.injEq]
+  exact ⟨lww_merge_comm_of_consistent a.alive b.alive hValid.alive_consistent,
+         lww_merge_comm_of_consistent a.lwwCol b.lwwCol hValid.lwwCol_consistent,
+         pn_counter_merge_comm a.counterCol b.counterCol,
+         or_set_merge_comm a.setCol b.setCol,
+         mv_register_merge_comm a.registerCol b.registerCol⟩
+
+/-- Pairwise validity for three-way associativity proofs: event-consistency
+    must hold for all LWW column pairs (a,b), (b,c). -/
+structure ValidTableRowTriple (a b c : TableRowState α β γ Hlc) : Prop where
+  alive_ab : LwwConsistentPair a.alive b.alive
+  alive_bc : LwwConsistentPair b.alive c.alive
+  lww_ab   : LwwConsistentPair a.lwwCol b.lwwCol
+  lww_bc   : LwwConsistentPair b.lwwCol c.lwwCol
+
+/-- Row merge is associative under pairwise LWW event-consistency. -/
+theorem mergeTableRow_assoc_of_valid
+    (a b c : TableRowState α β γ Hlc)
+    (hValid : ValidTableRowTriple a b c)
+    : mergeTableRow (mergeTableRow a b) c = mergeTableRow a (mergeTableRow b c) := by
+  simp only [mergeTableRow, TableRowState.mk.injEq]
+  exact ⟨lww_merge_assoc_of_consistent a.alive b.alive c.alive
+           hValid.alive_ab hValid.alive_bc,
+         lww_merge_assoc_of_consistent a.lwwCol b.lwwCol c.lwwCol
+           hValid.lww_ab hValid.lww_bc,
+         pn_counter_merge_assoc a.counterCol b.counterCol c.counterCol,
+         or_set_merge_assoc a.setCol b.setCol c.setCol,
+         mv_register_merge_assoc a.registerCol b.registerCol c.registerCol⟩
+
+/-- Row merge is idempotent. LWW idempotence is unconditional; OR-Set
+    idempotence requires canonicalization, which holds for any merge output
+    (see `or_set_merge_canonicalized`).
+
+    We require that each row's OR-Set column is canonicalized, which is
+    automatically the case after any merge operation. -/
+theorem mergeTableRow_idem_of_valid
+    (a : TableRowState α β γ Hlc)
+    (hSetClean : ∀ x ∈ a.setCol.elements, x.tag ∉ a.setCol.tombstones)
+    : mergeTableRow a a = a := by
+  cases a with | mk aAlive aLww aCounter aSet aReg =>
+  simp only [mergeTableRow, TableRowState.mk.injEq]
+  exact ⟨lww_merge_idem aAlive,
+         lww_merge_idem aLww,
+         pn_counter_merge_idem aCounter,
+         or_set_merge_idem aSet hSetClean,
+         mv_register_merge_idem aReg⟩
+
+/-! ### Lifted whole-table theorems under validity -/
+
+/-- Whole-table validity: every pair of rows satisfies the LWW consistency
+    and OR-Set canonicalization invariants. -/
+def ValidTableState {κ : Type} (a b : TableState κ α β γ Hlc) : Prop :=
+  ∀ key : κ, ValidTableRowPair (a key) (b key)
+
+/-- Whole-table merge is commutative under validity. -/
+theorem mergeTable_comm_of_valid {κ : Type}
+    (a b : TableState κ α β γ Hlc)
+    (hValid : ValidTableState a b)
+    : mergeTable a b = mergeTable b a := by
+  funext key
+  exact mergeTableRow_comm_of_valid (a key) (b key) (hValid key)
+
+/-- Whole-table triple validity: pairwise LWW consistency for all rows. -/
+def ValidTableStateTriple {κ : Type} (a b c : TableState κ α β γ Hlc) : Prop :=
+  ∀ key : κ, ValidTableRowTriple (a key) (b key) (c key)
+
+/-- Whole-table merge is associative under pairwise validity. -/
+theorem mergeTable_assoc_of_valid {κ : Type}
+    (a b c : TableState κ α β γ Hlc)
+    (hValid : ValidTableStateTriple a b c)
+    : mergeTable (mergeTable a b) c = mergeTable a (mergeTable b c) := by
+  funext key
+  exact mergeTableRow_assoc_of_valid (a key) (b key) (c key) (hValid key)
+
+/-- Whole-table idempotence validity: every row's OR-Set is canonicalized. -/
+def ValidTableStateIdem {κ : Type} (a : TableState κ α β γ Hlc) : Prop :=
+  ∀ key : κ, ∀ x ∈ (a key).setCol.elements, x.tag ∉ (a key).setCol.tombstones
+
+/-- Whole-table merge is idempotent under OR-Set canonicalization. -/
+theorem mergeTable_idem_of_valid {κ : Type}
+    (a : TableState κ α β γ Hlc)
+    (hValid : ValidTableStateIdem a)
+    : mergeTable a a = a := by
+  funext key
+  exact mergeTableRow_idem_of_valid (a key) (hValid key)
+
+end ValidTableRow
 
 section OperatorComposition
 
