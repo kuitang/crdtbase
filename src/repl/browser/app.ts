@@ -1,4 +1,5 @@
 import type { S3ClientConfig } from '@aws-sdk/client-s3';
+import { createHlcClock } from '../../core/hlc';
 import { parseSql } from '../../core/sql';
 import { BrowserCrdtClient } from '../../platform/browser/browserClient';
 import { S3ReplicatedLog } from '../../backend/s3ReplicatedLog';
@@ -257,7 +258,7 @@ async function connect(): Promise<void> {
     client = await BrowserCrdtClient.open({
       siteId,
       log: new HttpReplicatedLog(baseUrl),
-      now: nowCounter,
+      clock: createHlcClock({ nowWallMs: nowCounter }),
     });
 
     setActionsEnabled(true);
@@ -285,7 +286,7 @@ async function connect(): Promise<void> {
       prefix: config.prefix,
       clientConfig,
     }),
-    now: nowCounter,
+    clock: createHlcClock({ nowWallMs: nowCounter }),
   });
 
   setActionsEnabled(true);

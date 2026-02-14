@@ -1,4 +1,4 @@
-import { HLC_LIMITS, Hlc } from '../../core/hlc';
+import { Hlc, HlcClock, createHlcClock } from '../../core/hlc';
 import { LogPosition, ReplicatedLog, takeContiguousEntriesSince } from '../../core/replication';
 import {
   EncodedCrdtOp,
@@ -16,20 +16,28 @@ import {
   runSelectPlan,
 } from '../../core/sqlEval';
 
-function nextMonotonicHlc(previous: Hlc | null, nowMs: number): Hlc {
-  const wallMs = previous === null ? nowMs : Math.max(nowMs, previous.wallMs);
-  const counter = previous !== null && wallMs === previous.wallMs ? previous.counter + 1 : 0;
-  if (wallMs >= HLC_LIMITS.wallMsMax || counter >= HLC_LIMITS.counterMax) {
-    throw new Error('unable to allocate monotonic HLC within bounds');
-  }
-  return { wallMs, counter };
-}
-
 export type BrowserCrdtClientOptions = {
   siteId: string;
   log: ReplicatedLog;
-  now?: () => number;
+  clock?: HlcClock;
+  storage?: BrowserHlcStorage | null;
 };
+
+export type BrowserHlcStorage = {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+};
+
+const BROWSER_HLC_KEY_PREFIX = 'crdtbase.browser.hlc.';
+
+function resolveDefaultBrowserHlcStorage(): BrowserHlcStorage | null {
+  try {
+    const storage = (globalThis as { localStorage?: BrowserHlcStorage }).localStorage;
+    return storage ?? null;
+  } catch {
+    return null;
+  }
+}
 
 export class BrowserCrdtClient {
   private readonly rows = new Map<string, RuntimeRowState>();
@@ -38,18 +46,30 @@ export class BrowserCrdtClient {
   private pendingOps: EncodedCrdtOp[] = [];
   private lastLocalHlc: Hlc | null = null;
   private schema: SqlSchema = {};
-  private readonly now: () => number;
+  private readonly hlcClock: HlcClock;
+  private readonly storage: BrowserHlcStorage | null;
+  private readonly hlcStorageKey: string;
 
   constructor(
     public readonly siteId: string,
     private readonly log: ReplicatedLog,
-    now?: () => number,
+    clock?: HlcClock,
+    storage?: BrowserHlcStorage | null,
   ) {
-    this.now = now ?? (() => Date.now());
+    this.hlcClock = clock ?? createHlcClock();
+    this.storage = storage ?? resolveDefaultBrowserHlcStorage();
+    this.hlcStorageKey = `${BROWSER_HLC_KEY_PREFIX}${this.siteId}`;
   }
 
   static async open(options: BrowserCrdtClientOptions): Promise<BrowserCrdtClient> {
-    return new BrowserCrdtClient(options.siteId, options.log, options.now);
+    const client = new BrowserCrdtClient(
+      options.siteId,
+      options.log,
+      options.clock,
+      options.storage,
+    );
+    client.loadPersistedLocalHlc();
+    return client;
   }
 
   async exec(sql: string): Promise<void> {
@@ -103,6 +123,7 @@ export class BrowserCrdtClient {
 
   async pull(): Promise<void> {
     const sites = await this.log.listSites();
+    let localClockAdvanced = false;
     for (const siteId of sites) {
       const since = this.syncedSeqBySite.get(siteId) ?? 0;
       let entries;
@@ -138,12 +159,17 @@ export class BrowserCrdtClient {
         entries = takeContiguousEntriesSince(probe.slice(1), since);
       }
       for (const entry of entries) {
+        this.lastLocalHlc = this.hlcClock.recv(this.lastLocalHlc, decodeHlcHex(entry.hlc));
+        localClockAdvanced = true;
         for (const op of entry.ops) {
           applyCrdtOpToRows(this.rows, op);
         }
         this.syncedSeqBySite.set(siteId, entry.seq);
         this.syncedHlcBySite.set(siteId, entry.hlc);
       }
+    }
+    if (localClockAdvanced && this.lastLocalHlc !== null) {
+      this.persistLocalHlc(encodeHlcHex(this.lastLocalHlc));
     }
   }
 
@@ -163,9 +189,11 @@ export class BrowserCrdtClient {
   }
 
   private nextLocalHlcHex(): string {
-    const next = nextMonotonicHlc(this.lastLocalHlc, this.now());
+    const next = this.hlcClock.next(this.lastLocalHlc);
     this.lastLocalHlc = next;
-    return encodeHlcHex(next);
+    const encoded = encodeHlcHex(next);
+    this.persistLocalHlc(encoded);
+    return encoded;
   }
 
   getSyncedHeads(): Record<string, LogPosition> {
@@ -211,5 +239,23 @@ export class BrowserCrdtClient {
     if (params.lastLocalHlcHex !== undefined) {
       this.lastLocalHlc = params.lastLocalHlcHex ? decodeHlcHex(params.lastLocalHlcHex) : null;
     }
+  }
+
+  private loadPersistedLocalHlc(): void {
+    if (!this.storage) {
+      return;
+    }
+    const encoded = this.storage.getItem(this.hlcStorageKey);
+    if (!encoded) {
+      return;
+    }
+    this.lastLocalHlc = decodeHlcHex(encoded);
+  }
+
+  private persistLocalHlc(encodedHlc: string): void {
+    if (!this.storage) {
+      return;
+    }
+    this.storage.setItem(this.hlcStorageKey, encodedHlc);
   }
 }

@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { encodeBin } from '../../src/core/encoding';
+import { createHlcClock } from '../../src/core/hlc';
 import { AppendLogEntry, LogEntry, LogPosition, ReplicatedLog } from '../../src/core/replication';
 import { EncodedCrdtOp } from '../../src/core/sql';
 import { BrowserCrdtClient } from '../../src/platform/browser/browserClient';
@@ -46,6 +47,10 @@ class StubReplicatedLog implements ReplicatedLog {
   async getHead(siteId: string): Promise<LogPosition> {
     const entries = this.entriesBySite.get(siteId) ?? [];
     return entries.length === 0 ? 0 : entries[entries.length - 1]!.seq;
+  }
+
+  getEntries(siteId: string): LogEntry[] {
+    return [...(this.entriesBySite.get(siteId) ?? [])];
   }
 }
 
@@ -147,6 +152,10 @@ function makeCounterEntry(seq: number, amount: number): LogEntry {
   };
 }
 
+function packHlcHex(wallMs: number, counter: number): string {
+  return `0x${((BigInt(wallMs) << 16n) | BigInt(counter)).toString(16)}`;
+}
+
 describe('client sync cursor safety', () => {
   const tempDirs: string[] = [];
 
@@ -177,7 +186,7 @@ describe('client sync cursor safety', () => {
       siteId: 'site-b',
       log,
       dataDir,
-      now: () => 1_000,
+      clock: createHlcClock({ nowWallMs: () => 1_000 }),
     });
 
     await expect(client.pull()).rejects.toThrow("local sync cursor for site 'site-a' (4) is ahead");
@@ -208,7 +217,7 @@ describe('client sync cursor safety', () => {
       siteId: 'site-b',
       log,
       dataDir,
-      now: () => 2_000,
+      clock: createHlcClock({ nowWallMs: () => 2_000 }),
     });
 
     await expect(client.pull()).rejects.toThrow("sync cursor mismatch for site 'site-a' at seq 1");
@@ -229,7 +238,7 @@ describe('client sync cursor safety', () => {
     const client = await BrowserCrdtClient.open({
       siteId: 'site-b',
       log,
-      now: () => 2_000,
+      clock: createHlcClock({ nowWallMs: () => 2_000 }),
     });
     client.hydrateForTest({
       syncedSeqBySite: {
@@ -255,7 +264,7 @@ describe('client sync cursor safety', () => {
     const client = await BrowserCrdtClient.open({
       siteId: 'site-b',
       log,
-      now: () => 4_000,
+      clock: createHlcClock({ nowWallMs: () => 4_000 }),
     });
     client.hydrateForTest({
       syncedSeqBySite: {
@@ -284,7 +293,7 @@ describe('client sync cursor safety', () => {
       siteId: 'site-b',
       log,
       dataDir,
-      now: () => 5_000,
+      clock: createHlcClock({ nowWallMs: () => 5_000 }),
     });
     await client.exec('CREATE TABLE tasks (id PRIMARY KEY, points COUNTER);');
 
@@ -306,7 +315,7 @@ describe('client sync cursor safety', () => {
     const client = await BrowserCrdtClient.open({
       siteId: 'site-b',
       log,
-      now: () => 6_000,
+      clock: createHlcClock({ nowWallMs: () => 6_000 }),
     });
     await client.exec('CREATE TABLE tasks (id PRIMARY KEY, points COUNTER);');
 
@@ -315,5 +324,81 @@ describe('client sync cursor safety', () => {
 
     await client.pull();
     expect(client.getSyncedHeads()['site-a']).toBe(3);
+  });
+
+  it('rejects drifted remote HLCs in node client pull', async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), 'crdtbase-node-drift-pull-'));
+    tempDirs.push(dataDir);
+    const driftedRemote = packHlcHex(100_000, 0);
+    const log = new StubReplicatedLog({
+      'site-a': [
+        {
+          siteId: 'site-a',
+          hlc: driftedRemote,
+          seq: 1,
+          ops: [],
+        },
+      ],
+    });
+    const client = await NodeCrdtClient.open({
+      siteId: 'site-b',
+      log,
+      dataDir,
+      clock: createHlcClock({ nowWallMs: () => 1_000 }),
+    });
+
+    await expect(client.pull()).rejects.toThrow(/drift/i);
+  });
+
+  it('rejects drifted remote HLCs in browser client pull', async () => {
+    const driftedRemote = packHlcHex(100_000, 0);
+    const log = new StubReplicatedLog({
+      'site-a': [
+        {
+          siteId: 'site-a',
+          hlc: driftedRemote,
+          seq: 1,
+          ops: [],
+        },
+      ],
+    });
+    const client = await BrowserCrdtClient.open({
+      siteId: 'site-b',
+      log,
+      clock: createHlcClock({ nowWallMs: () => 1_000 }),
+    });
+
+    await expect(client.pull()).rejects.toThrow(/drift/i);
+  });
+
+  it('advances local HLC from pulled remote timestamps before next local write', async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), 'crdtbase-node-hlc-recv-'));
+    tempDirs.push(dataDir);
+    const remoteHlc = packHlcHex(50_000, 0);
+    const log = new StubReplicatedLog({
+      'site-a': [
+        {
+          siteId: 'site-a',
+          hlc: remoteHlc,
+          seq: 1,
+          ops: [],
+        },
+      ],
+    });
+
+    const client = await NodeCrdtClient.open({
+      siteId: 'site-b',
+      log,
+      dataDir,
+      clock: createHlcClock({ nowWallMs: () => 1_000 }),
+    });
+    await client.exec('CREATE TABLE tasks (id PRIMARY KEY, title LWW<STRING>);');
+    await client.pull();
+    await client.exec("INSERT INTO tasks (id, title) VALUES ('t1', 'hello');");
+    await client.push();
+
+    const siteBEntries = log.getEntries('site-b');
+    expect(siteBEntries.length).toBe(1);
+    expect(BigInt(siteBEntries[0]!.hlc)).toBeGreaterThan(BigInt(remoteHlc));
   });
 });

@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { S3ReplicatedLog } from '../../src/backend/s3ReplicatedLog';
+import { createHlcClock } from '../../src/core/hlc';
 import { NodeCrdtClient } from '../../src/platform/node/nodeClient';
 
 const CREATE_TASKS_TABLE_SQL = [
@@ -514,13 +515,13 @@ async function runMain(): Promise<void> {
     siteId: config.siteId,
     log,
     dataDir: config.dataDir,
-    now: (() => {
+    clock: createHlcClock({ nowWallMs: (() => {
       let tick = 10_000;
       return () => {
         tick += 1;
         return tick;
       };
-    })(),
+    })() }),
   });
 
   const publishBarrier = async (params: {

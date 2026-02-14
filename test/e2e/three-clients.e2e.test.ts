@@ -6,6 +6,7 @@ import { promisify } from 'node:util';
 import { afterEach, describe, expect, it } from 'vitest';
 import { FileReplicatedLogServer } from '../../src/backend/fileLogServer';
 import { decodeBin } from '../../src/core/encoding';
+import { createHlcClock } from '../../src/core/hlc';
 import { SqlSchema } from '../../src/core/sql';
 import { compactReplicatedLog } from '../../src/platform/node/compactor';
 import { HttpReplicatedLog } from '../../src/platform/node/httpReplicatedLog';
@@ -57,25 +58,25 @@ describe('Filesystem SQL chaos end-to-end sync', () => {
         siteId: 'site-a',
         log: logA,
         dataDir: clientADir,
-        now: () => 1_000,
+        clock: createHlcClock({ nowWallMs: () => 1_000 }),
       });
       const clientB = await NodeCrdtClient.open({
         siteId: 'site-b',
         log: logB,
         dataDir: clientBDir,
-        now: () => 2_000,
+        clock: createHlcClock({ nowWallMs: () => 2_000 }),
       });
       const clientC = await NodeCrdtClient.open({
         siteId: 'site-c',
         log: logC,
         dataDir: clientCDir,
-        now: () => 3_000,
+        clock: createHlcClock({ nowWallMs: () => 3_000 }),
       });
       const observer = await NodeCrdtClient.open({
         siteId: 'site-observer',
         log: new HttpReplicatedLog(baseUrl),
         dataDir: observerDir,
-        now: () => 3_500,
+        clock: createHlcClock({ nowWallMs: () => 3_500 }),
       });
 
       const result = await runThreeClientChaosScenario({
@@ -193,7 +194,7 @@ describe('Filesystem SQL chaos end-to-end sync', () => {
         log: new HttpReplicatedLog(baseUrl),
         dataDir: clientDDir,
         snapshots,
-        now: () => 4_000,
+        clock: createHlcClock({ nowWallMs: () => 4_000 }),
       });
       await clientD.pull();
       const rowsD = normalizeTaskRows(await clientD.query('SELECT * FROM tasks;'));

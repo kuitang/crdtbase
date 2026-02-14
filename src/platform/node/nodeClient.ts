@@ -2,7 +2,7 @@ import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { ManifestFile, SegmentFile, mergeRuntimeRowMaps, segmentFileToRuntimeRows } from '../../core/compaction';
 import { decodeBin, encodeBin } from '../../core/encoding';
-import { HLC_LIMITS, Hlc } from '../../core/hlc';
+import { Hlc, HlcClock, createHlcClock } from '../../core/hlc';
 import { LogPosition, ReplicatedLog, takeContiguousEntriesSince } from '../../core/replication';
 import { SnapshotStore, assertSafeSnapshotRelativePath } from '../../core/snapshotStore';
 import {
@@ -58,21 +58,12 @@ type AtomicStateBundleFile = {
   sync: SyncFileV2;
 };
 
-function nextMonotonicHlc(previous: Hlc | null, nowMs: number): Hlc {
-  const wallMs = previous === null ? nowMs : Math.max(nowMs, previous.wallMs);
-  const counter = previous !== null && wallMs === previous.wallMs ? previous.counter + 1 : 0;
-  if (wallMs >= HLC_LIMITS.wallMsMax || counter >= HLC_LIMITS.counterMax) {
-    throw new Error('unable to allocate monotonic HLC within bounds');
-  }
-  return { wallMs, counter };
-}
-
 export type NodeCrdtClientOptions = {
   siteId: string;
   log: ReplicatedLog;
   dataDir: string;
   snapshots?: SnapshotStore;
-  now?: () => number;
+  clock?: HlcClock;
 };
 
 export class NodeCrdtClient {
@@ -83,7 +74,7 @@ export class NodeCrdtClient {
   private lastLocalHlc: Hlc | null = null;
   private schema: SqlSchema = {};
   private readonly ready: Promise<void>;
-  private readonly now: () => number;
+  private readonly hlcClock: HlcClock;
   private readonly snapshots: SnapshotStore | null;
   private localSnapshotManifestVersion = 0;
 
@@ -100,9 +91,9 @@ export class NodeCrdtClient {
     private readonly log: ReplicatedLog,
     private readonly dataDir: string,
     snapshots?: SnapshotStore,
-    now?: () => number,
+    clock?: HlcClock,
   ) {
-    this.now = now ?? (() => Date.now());
+    this.hlcClock = clock ?? createHlcClock();
     this.snapshots = snapshots ?? null;
     this.schemaPath = join(this.dataDir, 'schema.bin');
     this.atomicStateBundlePath = join(this.dataDir, 'state_bundle.bin');
@@ -120,7 +111,7 @@ export class NodeCrdtClient {
       options.log,
       options.dataDir,
       options.snapshots,
-      options.now,
+      options.clock,
     );
     await client.waitReady();
     return client;
@@ -220,6 +211,7 @@ export class NodeCrdtClient {
         entries = takeContiguousEntriesSince(probe.slice(1), since);
       }
       for (const entry of entries) {
+        this.lastLocalHlc = this.hlcClock.recv(this.lastLocalHlc, decodeHlcHex(entry.hlc));
         for (const op of entry.ops) {
           applyCrdtOpToRows(this.rows, op);
         }
@@ -258,7 +250,7 @@ export class NodeCrdtClient {
   }
 
   private nextLocalHlcHex(): string {
-    const next = nextMonotonicHlc(this.lastLocalHlc, this.now());
+    const next = this.hlcClock.next(this.lastLocalHlc);
     this.lastLocalHlc = next;
     return encodeHlcHex(next);
   }

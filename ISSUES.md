@@ -237,7 +237,15 @@ convergence.
 
 ---
 
-### P2-6: HLC real-time accuracy not formally modeled
+### ~~P2-6: HLC real-time accuracy not formally modeled~~ FIXED
+
+**Status:** Fixed in runtime guardrails. The implementation now uses a shared
+HLC clock API with:
+- monotonic wall-clock synthesis (`createMonotonicWallClock`, anchored to
+  `Date.now()` and monotonic `performance.now()` when available),
+- explicit 60s drift rejection (`assertHlcDrift`, `recvMonotonicHlc`),
+- unified local/remote HLC progression (`nextMonotonicHlc`, `recvMonotonicHlc`)
+  applied by both Node and Browser clients during local writes and pulls.
 
 **Source:** Ch3 s3.11 Warning "Verification Gaps" bullet 3
 
@@ -250,7 +258,11 @@ writer appears to "win").
 (a write with a lower real-world time could win due to a fast-running clock).
 
 **Files:**
-- `src/core/hlc.ts` (nextHlc uses Date.now())
+- `src/core/hlc.ts`
+- `src/platform/node/nodeClient.ts`
+- `src/platform/browser/browserClient.ts`
+- `test/properties/invariants.prop.test.ts`
+- `test/platform/client-sync-cursor.test.ts`
 
 **Fix type:** Code fix (add max-drift detection/rejection)
 **Complexity:** Moderate

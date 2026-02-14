@@ -5,6 +5,7 @@ import { test } from '@fast-check/vitest';
 import fc from 'fast-check';
 import { describe, expect } from 'vitest';
 import { encodeBin } from '../../src/core/encoding';
+import { createHlcClock } from '../../src/core/hlc';
 import { AppendLogEntry, LogEntry, LogPosition, ReplicatedLog } from '../../src/core/replication';
 import { EncodedCrdtOp } from '../../src/core/sql';
 import { NodeCrdtClient } from '../../src/platform/node/nodeClient';
@@ -104,7 +105,7 @@ describe('Node client persistence properties', () => {
           siteId: 'site-b',
           log,
           dataDir,
-          now: () => 5_000,
+          clock: createHlcClock({ nowWallMs: () => 5_000 }),
         });
         await initial.exec('CREATE TABLE tasks (id PRIMARY KEY, points COUNTER);');
         await initial.pull();
@@ -127,7 +128,7 @@ describe('Node client persistence properties', () => {
           siteId: 'site-b',
           log,
           dataDir,
-          now: () => 5_000,
+          clock: createHlcClock({ nowWallMs: () => 5_000 }),
         });
         await reopened.pull();
 

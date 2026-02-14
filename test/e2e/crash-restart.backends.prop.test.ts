@@ -2,7 +2,7 @@ import { join } from 'node:path';
 import { test } from '@fast-check/vitest';
 import fc from 'fast-check';
 import { describe, expect } from 'vitest';
-import { compareHlc } from '../../src/core/hlc';
+import { compareHlc, createHlcClock } from '../../src/core/hlc';
 import { NodeCrdtClient } from '../../src/platform/node/nodeClient';
 import { decodeHlcHex } from '../../src/core/sqlEval';
 import type { E2eSiteId } from './orchestrator';
@@ -100,19 +100,19 @@ async function runRestartScenarioOnBackend(params: {
         siteId: 'site-a',
         log: harness.createLog(),
         dataDir: dataDirs['site-a'],
-        now: nowBySite['site-a'],
+        clock: createHlcClock({ nowWallMs: nowBySite['site-a'] }),
       }),
       'site-b': await NodeCrdtClient.open({
         siteId: 'site-b',
         log: harness.createLog(),
         dataDir: dataDirs['site-b'],
-        now: nowBySite['site-b'],
+        clock: createHlcClock({ nowWallMs: nowBySite['site-b'] }),
       }),
       'site-c': await NodeCrdtClient.open({
         siteId: 'site-c',
         log: harness.createLog(),
         dataDir: dataDirs['site-c'],
-        now: nowBySite['site-c'],
+        clock: createHlcClock({ nowWallMs: nowBySite['site-c'] }),
       }),
     };
 
@@ -120,7 +120,7 @@ async function runRestartScenarioOnBackend(params: {
       siteId: 'site-observer',
       log: harness.createLog(),
       dataDir: join(dataRoot, 'site-observer'),
-      now: constantNow(3_500),
+      clock: createHlcClock({ nowWallMs: constantNow(3_500) }),
     });
 
     const reopen = async (siteId: E2eSiteId): Promise<void> => {
@@ -128,7 +128,7 @@ async function runRestartScenarioOnBackend(params: {
         siteId,
         log: harness.createLog(),
         dataDir: dataDirs[siteId],
-        now: nowBySite[siteId],
+        clock: createHlcClock({ nowWallMs: nowBySite[siteId] }),
       });
     };
 

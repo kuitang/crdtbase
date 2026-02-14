@@ -1,6 +1,7 @@
 import { HttpReplicatedLog } from '../../src/platform/node/httpReplicatedLog';
 import { BrowserCrdtClient } from '../../src/platform/browser/browserClient';
 import { S3ReplicatedLog } from '../../src/backend/s3ReplicatedLog';
+import { createHlcClock } from '../../src/core/hlc';
 
 type BrowserBridgeClient = BrowserCrdtClient;
 
@@ -50,7 +51,7 @@ async function createClient(params: CreateClientParams): Promise<void> {
     const client = await BrowserCrdtClient.open({
       siteId: params.siteId,
       log: new HttpReplicatedLog(params.baseUrl),
-      now,
+      clock: createHlcClock({ nowWallMs: now }),
     });
     clients.set(params.clientId, client);
     return;
@@ -72,7 +73,7 @@ async function createClient(params: CreateClientParams): Promise<void> {
         },
       },
     }),
-    now,
+    clock: createHlcClock({ nowWallMs: now }),
   });
   clients.set(params.clientId, client);
 }

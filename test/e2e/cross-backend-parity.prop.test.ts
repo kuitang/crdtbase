@@ -2,6 +2,7 @@ import { join } from 'node:path';
 import { test } from '@fast-check/vitest';
 import fc from 'fast-check';
 import { describe, expect } from 'vitest';
+import { createHlcClock } from '../../src/core/hlc';
 import { NodeCrdtClient } from '../../src/platform/node/nodeClient';
 import type { E2eSiteId } from './orchestrator';
 import { assertAckedWritesVisible, readPositiveIntEnv } from './chaosShared';
@@ -67,25 +68,25 @@ async function runTraceOnBackend(params: {
       siteId: 'site-a',
       log: harness.createLog(),
       dataDir: join(dataRoot, 'site-a'),
-      now: clocks['site-a'],
+      clock: createHlcClock({ nowWallMs: clocks['site-a'] }),
     });
     const clientB = await NodeCrdtClient.open({
       siteId: 'site-b',
       log: harness.createLog(),
       dataDir: join(dataRoot, 'site-b'),
-      now: clocks['site-b'],
+      clock: createHlcClock({ nowWallMs: clocks['site-b'] }),
     });
     const clientC = await NodeCrdtClient.open({
       siteId: 'site-c',
       log: harness.createLog(),
       dataDir: join(dataRoot, 'site-c'),
-      now: clocks['site-c'],
+      clock: createHlcClock({ nowWallMs: clocks['site-c'] }),
     });
     const observer = await NodeCrdtClient.open({
       siteId: 'site-observer',
       log: harness.createLog(),
       dataDir: join(dataRoot, 'site-observer'),
-      now: clocks['site-observer'],
+      clock: createHlcClock({ nowWallMs: clocks['site-observer'] }),
     });
 
     const result = await replayDeterministicTraceScenario({

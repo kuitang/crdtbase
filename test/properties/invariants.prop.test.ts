@@ -1,7 +1,16 @@
 import { describe, expect } from 'vitest';
 import { test } from '@fast-check/vitest';
 import fc from 'fast-check';
-import { HLC_LIMITS, PersistedHlcFence, assertHlcStrictlyIncreases } from '../../src/core/hlc';
+import {
+  HLC_DRIFT_LIMIT_MS,
+  HLC_LIMITS,
+  PersistedHlcFence,
+  assertHlcDrift,
+  assertHlcStrictlyIncreases,
+  createMonotonicWallClock,
+  nextMonotonicHlc,
+  recvMonotonicHlc,
+} from '../../src/core/hlc';
 import { mergeLww } from '../../src/core/crdt/lww';
 import { LwwConflictGuard } from '../../src/core/crdt/lwwConflictGuard';
 import { applyPnCounterDelta } from '../../src/core/crdt/pnCounter';
@@ -79,6 +88,79 @@ describe('HLC monotonic fence', () => {
     expect(() => fence.commit(next)).toThrow(/monotonicity violation/);
     expect(() => fence.commit(initial)).toThrow(/monotonicity violation/);
   });
+});
+
+describe('HLC runtime clock assumptions', () => {
+  test.prop([
+    fc.record({
+      wallMs: fc.integer({ min: 0, max: HLC_LIMITS.wallMsMax - 1 }),
+      counter: fc.integer({ min: 0, max: HLC_LIMITS.counterMax - 1 }),
+    }),
+  ])('drift assertion accepts in-range clocks', (hlc) => {
+    const now = hlc.wallMs + HLC_DRIFT_LIMIT_MS;
+    expect(() => assertHlcDrift(hlc, now)).not.toThrow();
+  });
+
+  test.prop([
+    fc.record({
+      wallMs: fc.integer({ min: 0, max: HLC_LIMITS.wallMsMax - 1 }),
+      counter: fc.integer({ min: 0, max: HLC_LIMITS.counterMax - 1 }),
+    }),
+  ])('drift assertion rejects clocks beyond limit', (hlc) => {
+    const now = hlc.wallMs >= HLC_DRIFT_LIMIT_MS + 1 ? hlc.wallMs - (HLC_DRIFT_LIMIT_MS + 1) : 0;
+    fc.pre(hlc.wallMs > now + HLC_DRIFT_LIMIT_MS);
+    expect(() => assertHlcDrift(hlc, now)).toThrow(/drift/i);
+  });
+
+  test.prop([
+    fc.record({
+      wallMs: fc.integer({ min: HLC_DRIFT_LIMIT_MS + 1, max: HLC_LIMITS.wallMsMax - 1 }),
+      counter: fc.integer({ min: 0, max: HLC_LIMITS.counterMax - 1 }),
+    }),
+  ])('nextMonotonicHlc rejects persisted high-water mark beyond drift limit', (previous) => {
+    const now = previous.wallMs - (HLC_DRIFT_LIMIT_MS + 1);
+    expect(() => nextMonotonicHlc(previous, now)).toThrow(/drift/i);
+  });
+
+  test.prop([
+    fc.record({
+      wallMs: fc.integer({ min: HLC_DRIFT_LIMIT_MS + 1, max: HLC_LIMITS.wallMsMax - 1 }),
+      counter: fc.integer({ min: 0, max: HLC_LIMITS.counterMax - 2 }),
+    }),
+  ])('recvMonotonicHlc rejects remote clock beyond drift limit', (remote) => {
+    const now = remote.wallMs - (HLC_DRIFT_LIMIT_MS + 1);
+    expect(() => recvMonotonicHlc(null, remote, now)).toThrow(/drift/i);
+  });
+
+  test.prop([
+    fc.record({
+      wallMs: fc.integer({ min: 0, max: HLC_LIMITS.wallMsMax - 2 }),
+      counter: fc.integer({ min: 0, max: HLC_LIMITS.counterMax - 2 }),
+    }),
+  ])('recvMonotonicHlc yields value strictly greater than remote when remote dominates wall time', (remote) => {
+    const now = remote.wallMs === 0 ? 0 : remote.wallMs - 1;
+    const received = recvMonotonicHlc(null, remote, now);
+    expect(received.wallMs).toBe(remote.wallMs);
+    expect(received.counter).toBe(remote.counter + 1);
+  });
+
+  test.prop([fc.array(fc.integer({ min: 0, max: 10_000 }), { minLength: 4, maxLength: 20 })])(
+    'monotonic wall clock wrapper never moves backward',
+    (wallSamples) => {
+      let index = 0;
+      const dateNow = () => wallSamples[Math.min(index++, wallSamples.length - 1)]!;
+      const monotonicWall = createMonotonicWallClock({
+        dateNow,
+        performance: null,
+      });
+      let previous = -1;
+      for (let i = 0; i < wallSamples.length; i += 1) {
+        const current = monotonicWall();
+        expect(current).toBeGreaterThanOrEqual(previous);
+        previous = current;
+      }
+    },
+  );
 });
 
 describe('PN-Counter invariant enforcement', () => {
