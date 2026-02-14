@@ -208,6 +208,16 @@ function manifestForVersion(version: number): ManifestFile {
   };
 }
 
+function manifestForVersionAndHlc(version: number, compactionHlc: string): ManifestFile {
+  return {
+    v: 1,
+    version,
+    compaction_hlc: compactionHlc,
+    segments: [],
+    sites_compacted: {},
+  };
+}
+
 describe('Snapshot store properties', () => {
   test.prop([arbManifestFile])('manifest encode/decode round-trip preserves validity', (manifest) => {
     validateManifestFile(manifest);
@@ -271,6 +281,41 @@ describe('Snapshot store properties', () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  test.prop([fc.nat({ max: 12 })], { numRuns: 40 })(
+    'filesystem snapshot store manifest CAS is atomic across concurrent writers',
+    async (currentVersion) => {
+      const root = await mkdtemp(join(tmpdir(), 'crdtbase-snapshots-cas-prop-'));
+      try {
+        const writerA = new FsSnapshotStore({ rootDir: root });
+        const writerB = new FsSnapshotStore({ rootDir: root });
+
+        for (let version = 1; version <= currentVersion; version += 1) {
+          const seeded = await writerA.putManifest(manifestForVersion(version), version - 1);
+          expect(seeded).toBe(true);
+        }
+
+        const expectedVersion = currentVersion;
+        const nextVersion = expectedVersion + 1;
+        const candidateA = manifestForVersionAndHlc(nextVersion, '0x1');
+        const candidateB = manifestForVersionAndHlc(nextVersion, '0x2');
+
+        const [appliedA, appliedB] = await Promise.all([
+          writerA.putManifest(candidateA, expectedVersion),
+          writerB.putManifest(candidateB, expectedVersion),
+        ]);
+
+        expect(Number(appliedA) + Number(appliedB)).toBe(1);
+
+        const finalManifest = await writerA.getManifest();
+        expect(finalManifest).not.toBeNull();
+        expect(finalManifest!.version).toBe(nextVersion);
+        expect(finalManifest).toEqual(appliedA ? candidateA : candidateB);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
 
   test.prop([arbIdentifier, arbIdentifier])('snapshot paths reject traversal but accept safe paths', (a, b) => {
     expect(() => assertSafeSnapshotRelativePath(`segments/${a}_${b}.seg.bin`)).not.toThrow();

@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { ManifestFile, SegmentFile, mergeRuntimeRowMaps, segmentFileToRuntimeRows } from '../../core/compaction';
 import { decodeBin, encodeBin } from '../../core/encoding';
@@ -51,6 +51,13 @@ type PendingFile = {
   pendingOps: EncodedCrdtOp[];
 };
 
+type AtomicStateBundleFile = {
+  v: 1;
+  state: StateFile;
+  pending: PendingFile;
+  sync: SyncFileV2;
+};
+
 function nextMonotonicHlc(previous: Hlc | null, nowMs: number): Hlc {
   const wallMs = previous === null ? nowMs : Math.max(nowMs, previous.wallMs);
   const counter = previous !== null && wallMs === previous.wallMs ? previous.counter + 1 : 0;
@@ -81,6 +88,7 @@ export class NodeCrdtClient {
   private localSnapshotManifestVersion = 0;
 
   private readonly schemaPath: string;
+  private readonly atomicStateBundlePath: string;
   private readonly statePath: string;
   private readonly pendingPath: string;
   private readonly syncPath: string;
@@ -97,6 +105,7 @@ export class NodeCrdtClient {
     this.now = now ?? (() => Date.now());
     this.snapshots = snapshots ?? null;
     this.schemaPath = join(this.dataDir, 'schema.bin');
+    this.atomicStateBundlePath = join(this.dataDir, 'state_bundle.bin');
     this.statePath = join(this.dataDir, 'state.bin');
     this.pendingPath = join(this.dataDir, 'pending.bin');
     this.syncPath = join(this.dataDir, 'sync.bin');
@@ -260,13 +269,18 @@ export class NodeCrdtClient {
 
   private async loadFromDisk(): Promise<void> {
     await mkdir(this.dataDir, { recursive: true });
-    const [schema, state, pending, sync, localManifest] = await Promise.all([
+    const [schema, atomicBundle, legacyState, legacyPending, legacySync, localManifest] = await Promise.all([
       this.readOptionalFile<SqlSchema>(this.schemaPath, {}),
+      this.readOptionalFile<AtomicStateBundleFile | null>(this.atomicStateBundlePath, null),
       this.readOptionalFile<StateFile>(this.statePath, { v: 1, rows: [], lastLocalHlc: null }),
       this.readOptionalFile<PendingFile>(this.pendingPath, { v: 1, pendingOps: [] }),
       this.readOptionalFile<SyncFile | SyncFileV2>(this.syncPath, { v: 2, syncedBySite: {} }),
       this.readOptionalFile<ManifestFile | null>(this.snapshotManifestPath, null),
     ]);
+
+    const state = atomicBundle?.state ?? legacyState;
+    const pending = atomicBundle?.pending ?? legacyPending;
+    const sync = atomicBundle?.sync ?? legacySync;
 
     this.schema = schema;
     this.pendingOps = [...pending.pendingOps];
@@ -295,7 +309,7 @@ export class NodeCrdtClient {
   }
 
   private async persistSchema(): Promise<void> {
-    await writeFile(this.schemaPath, encodeBin(this.schema));
+    await this.writeFileAtomically(this.schemaPath, encodeBin(this.schema));
   }
 
   private async persistStateFiles(): Promise<void> {
@@ -323,10 +337,21 @@ export class NodeCrdtClient {
       ),
     };
 
+    const atomicBundle: AtomicStateBundleFile = {
+      v: 1,
+      state: stateFile,
+      pending: pendingFile,
+      sync: syncFile,
+    };
+
+    // Commit the authoritative local state as one atomically-renamed bundle.
+    await this.writeFileAtomically(this.atomicStateBundlePath, encodeBin(atomicBundle));
+
+    // Legacy split files remain for backwards compatibility and tooling.
     await Promise.all([
-      writeFile(this.statePath, encodeBin(stateFile)),
-      writeFile(this.pendingPath, encodeBin(pendingFile)),
-      writeFile(this.syncPath, encodeBin(syncFile)),
+      this.writeFileAtomically(this.statePath, encodeBin(stateFile)),
+      this.writeFileAtomically(this.pendingPath, encodeBin(pendingFile)),
+      this.writeFileAtomically(this.syncPath, encodeBin(syncFile)),
     ]);
   }
 
@@ -339,6 +364,18 @@ export class NodeCrdtClient {
       if (code === 'ENOENT') {
         return fallback;
       }
+      throw error;
+    }
+  }
+
+  private async writeFileAtomically(path: string, bytes: Uint8Array): Promise<void> {
+    const tempPath = `${path}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(tempPath, bytes);
+    try {
+      await rename(tempPath, path);
+    } catch (error) {
+      await rm(tempPath, { force: true });
       throw error;
     }
   }
@@ -388,7 +425,7 @@ export class NodeCrdtClient {
       this.syncedHlcBySite.delete(siteId);
     }
 
-    await writeFile(this.snapshotManifestPath, encodeBin(manifest));
+    await this.writeFileAtomically(this.snapshotManifestPath, encodeBin(manifest));
     this.localSnapshotManifestVersion = manifest.version;
   }
 

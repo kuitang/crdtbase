@@ -6,7 +6,12 @@ Extracted from book chapters 1--7. Prioritized by severity.
 
 ## P0 (Critical) -- Could cause silent data corruption or loss
 
-### P0-1: PN-Counter double-application on crash recovery
+### ~~P0-1: PN-Counter double-application on crash recovery~~ FIXED
+
+**Status:** Fixed. `NodeCrdtClient` now commits local state via an atomic
+`state_bundle.bin` write (temp file + `rename`), and startup prefers that
+bundle over split legacy files. This prevents replaying already-applied
+PN-counter deltas when legacy `sync.bin` is stale.
 
 **Source:** Ch5 s5.8 Concern 1; Ch6 s6.6.4 Warning "PN-Counter Double-Application"
 
@@ -28,7 +33,11 @@ higher than the correct value, and no subsequent merge can correct it.
 
 ---
 
-### P0-2: Non-atomic local persistence (state.bin / pending.bin / sync.bin)
+### ~~P0-2: Non-atomic local persistence (state.bin / pending.bin / sync.bin)~~ FIXED
+
+**Status:** Fixed. Local persistence now uses an atomic bundle commit first,
+then writes `state.bin`, `pending.bin`, and `sync.bin` as compatibility
+artifacts. Correctness no longer depends on cross-file write ordering.
 
 **Source:** Ch5 s5.8 Concern 5
 
@@ -47,7 +56,11 @@ For PN-Counter columns this directly triggers P0-1 (counter inflation).
 
 ---
 
-### P0-3: FsSnapshotStore CAS is not truly atomic
+### ~~P0-3: FsSnapshotStore CAS is not truly atomic~~ FIXED
+
+**Status:** Fixed. `FsSnapshotStore.putManifest` now uses a filesystem lock
+(`manifest.bin.lock`) to serialize CAS writers, and manifest writes are done
+with temp-file + atomic `rename`.
 
 **Source:** Ch6 s6.5 (CAS table)
 
@@ -90,49 +103,30 @@ Under very tight timing, potential violation of the LWW total-order invariant.
 
 ---
 
-### P1-2: Composite row semilattice not directly proved end-to-end
+### ~~P1-2: Composite row semilattice not directly proved end-to-end~~ FIXED
+
+**Status:** Fixed in commit `27076be`. Added `ValidTableRowPair`/`Triple`
+predicates and proved `mergeTableRow_comm_of_valid`, `mergeTableRow_assoc_of_valid`,
+`mergeTableRow_idem_of_valid` directly under event-consistency, then lifted to
+whole-table `mergeTable_*_of_valid` theorems.
 
 **Source:** Ch3 s3.11 Warning "Verification Gaps" bullet 5
 
-**Problem:** The table composition proofs (`table_merge_comm_of_row_comm`, etc.)
-are conditional on the row merge being commutative. They do not directly prove
-that `mergeTableRow` is commutative, because that requires composing the LWW
-event-consistency condition across all LWW columns simultaneously. The
-operational invariant must be established at system initialization but this
-chain is informal, not mechanically verified.
-
-**Impact:** The end-to-end convergence proof has a logical gap: if event
-consistency is violated for any column, the whole-table convergence guarantee
-does not hold.
-
 **Files:**
 - `lean/CrdtBase/Crdt/Table/Props.lean`
-- `lean/CrdtBase/Crdt/Lww/Props.lean`
-
-**Fix type:** Proof fix (prove mergeTableRow comm/assoc/idem directly under a
-global event-consistency hypothesis)
-**Complexity:** Moderate
 
 ---
 
-### P1-3: OR-Set idempotence precondition not formally chained
+### ~~P1-3: OR-Set idempotence precondition not formally chained~~ FIXED
+
+**Status:** Fixed in commit `27076be`. Added `or_set_merge_canonicalized`
+(merge output is always clean) and composed it into `or_set_merge_idem_general`
+for precondition-free idempotence.
 
 **Source:** Ch3 s3.11 Warning "Verification Gaps" bullet 6
 
-**Problem:** `or_set_merge_idem` requires the input to already be canonicalized
-(`hClean` precondition). The argument that "merge always canonicalizes, so
-hClean always holds" is informal. There is no formal proof that the output of
-`OrSet.merge` always satisfies `hClean`.
-
-**Impact:** Without this chain, the idempotence proof for OR-Set has a gap. In
-theory, a non-canonical OR-Set entering the merge pipeline could violate
-idempotence, breaking the convergence guarantee.
-
 **Files:**
 - `lean/CrdtBase/Crdt/OrSet/Props.lean`
-
-**Fix type:** Proof fix (add lemma: `OrSet.merge` output satisfies `hClean`)
-**Complexity:** Trivial
 
 ---
 

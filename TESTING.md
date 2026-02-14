@@ -158,6 +158,8 @@ These tests validate assumptions required by the Lean model but enforced in syst
 - Replay consistency: duplicate `(site, hlc, table, key, col)` with identical payload is accepted as idempotent.
 - Conflict rejection: duplicate `(site, hlc, table, key, col)` with different payload is rejected and surfaced.
 - Snapshot rollback fence: startup rejects local clock state older than durable high-water mark.
+- Atomic local persistence: torn legacy `state.bin`/`sync.bin` combinations cannot replay PN-counter deltas after restart.
+- Filesystem manifest CAS atomicity: concurrent `FsSnapshotStore` writers produce exactly one successful manifest publish.
 
 These are property tests and scenario tests, not Lean theorems, because they involve I/O and persistence semantics.
 
