@@ -1,0 +1,379 @@
+/* CRDTBase Literate Program — Academic Style */
+
+:root {
+  --text: #1a1a1a;
+  --bg: #fafaf8;
+  --accent: #8b0000;
+  --accent-light: #a52a2a;
+  --border: #d4d0c8;
+  --code-bg: #f0ede6;
+  --theorem-bg: #f5f0e8;
+  --proof-bg: #eef2e8;
+  --note-bg: #e8eef5;
+  --warning-bg: #f5ece8;
+  --diagram-bg: #ffffff;
+  --sidebar-bg: #f0ede6;
+  --link: #2c5282;
+  --link-hover: #8b0000;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html {
+  font-size: 18px;
+  scroll-behavior: smooth;
+}
+
+body {
+  font-family: "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+  color: var(--text);
+  background: var(--bg);
+  line-height: 1.65;
+  max-width: 52rem;
+  margin: 0 auto;
+  padding: 2rem 1.5rem 4rem;
+}
+
+/* --- Typography --- */
+
+h1, h2, h3, h4, h5 {
+  font-family: "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+  font-weight: normal;
+  color: var(--text);
+  margin-top: 2.5rem;
+  margin-bottom: 0.8rem;
+  line-height: 1.25;
+}
+
+h1 {
+  font-size: 2rem;
+  text-align: center;
+  border-bottom: 2px solid var(--accent);
+  padding-bottom: 0.5rem;
+  margin-bottom: 1.5rem;
+  letter-spacing: 0.02em;
+}
+
+h1 .chapter-num {
+  display: block;
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+  color: var(--accent);
+  margin-bottom: 0.3rem;
+}
+
+h2 {
+  font-size: 1.45rem;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.3rem;
+}
+
+h3 { font-size: 1.2rem; font-style: italic; }
+h4 { font-size: 1.05rem; font-weight: bold; }
+
+p { margin-bottom: 1rem; text-align: justify; hyphens: auto; }
+
+a { color: var(--link); text-decoration: none; }
+a:hover { color: var(--link-hover); text-decoration: underline; }
+
+blockquote {
+  border-left: 3px solid var(--accent);
+  padding: 0.5rem 1rem;
+  margin: 1rem 0;
+  font-style: italic;
+  background: var(--note-bg);
+}
+
+/* --- Code --- */
+
+code {
+  font-family: "Iosevka", "JetBrains Mono", "Fira Code", "Cascadia Code", "Source Code Pro", monospace;
+  font-size: 0.82rem;
+  background: var(--code-bg);
+  padding: 0.15em 0.35em;
+  border-radius: 3px;
+}
+
+pre {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  padding: 1rem 1.25rem;
+  margin: 1rem 0;
+  overflow-x: auto;
+  line-height: 1.45;
+  border-radius: 2px;
+}
+
+pre code {
+  background: none;
+  padding: 0;
+  font-size: 0.8rem;
+}
+
+.file-ref {
+  font-family: "Iosevka", "JetBrains Mono", "Fira Code", monospace;
+  font-size: 0.75rem;
+  color: #666;
+  display: block;
+  margin-bottom: 0.25rem;
+  font-style: italic;
+}
+
+/* --- Theorem / Proof / Definition Boxes --- */
+
+.theorem, .lemma, .definition, .proof, .note, .warning, .assessment {
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 1rem 1.25rem;
+  margin: 1.25rem 0;
+  page-break-inside: avoid;
+}
+
+.theorem, .lemma {
+  background: var(--theorem-bg);
+  border-left: 4px solid var(--accent);
+}
+
+.definition {
+  background: var(--note-bg);
+  border-left: 4px solid #2c5282;
+}
+
+.proof {
+  background: var(--proof-bg);
+  border-left: 4px solid #2d6a30;
+}
+
+.note {
+  background: var(--note-bg);
+  border-left: 4px solid #4a7ab5;
+}
+
+.warning {
+  background: var(--warning-bg);
+  border-left: 4px solid #c53030;
+}
+
+.assessment {
+  background: #f0f5ee;
+  border-left: 4px solid #2d6a30;
+}
+
+.assessment.concern {
+  background: #f5ece8;
+  border-left: 4px solid #c53030;
+}
+
+.box-title {
+  font-weight: bold;
+  font-variant: small-caps;
+  font-size: 0.95rem;
+  display: block;
+  margin-bottom: 0.5rem;
+  letter-spacing: 0.05em;
+}
+
+.theorem .box-title { color: var(--accent); }
+.lemma .box-title { color: var(--accent); }
+.definition .box-title { color: #2c5282; }
+.proof .box-title { color: #2d6a30; }
+.note .box-title { color: #4a7ab5; }
+.warning .box-title { color: #c53030; }
+.assessment .box-title { color: #2d6a30; }
+.assessment.concern .box-title { color: #c53030; }
+
+.proof::after {
+  content: "∎";
+  display: block;
+  text-align: right;
+  font-size: 1.2rem;
+  color: #2d6a30;
+  margin-top: 0.5rem;
+}
+
+/* --- Diagrams --- */
+
+.diagram-container {
+  background: var(--diagram-bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 1.5rem;
+  margin: 1.5rem 0;
+  text-align: center;
+}
+
+.diagram-container .caption {
+  font-size: 0.85rem;
+  color: #666;
+  margin-top: 0.75rem;
+  font-style: italic;
+}
+
+.mermaid {
+  margin: 0 auto;
+}
+
+/* --- Tables --- */
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1rem 0;
+  font-size: 0.9rem;
+}
+
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.45rem 0.7rem;
+  text-align: left;
+}
+
+th {
+  background: var(--code-bg);
+  font-weight: bold;
+  font-variant: small-caps;
+  letter-spacing: 0.03em;
+}
+
+tr:nth-child(even) { background: #fafaf8; }
+tr:nth-child(odd) { background: #f5f3ed; }
+
+/* --- Navigation --- */
+
+nav.chapter-nav {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 1rem 0;
+  margin: 2rem 0 1rem;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  font-size: 0.85rem;
+}
+
+nav.chapter-nav a {
+  color: var(--accent);
+  font-variant: small-caps;
+  letter-spacing: 0.05em;
+}
+
+nav.chapter-nav .prev::before { content: "← "; }
+nav.chapter-nav .next::after { content: " →"; }
+
+/* --- Table of Contents --- */
+
+.toc {
+  background: var(--sidebar-bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 1.25rem 1.5rem;
+  margin: 1.5rem 0;
+}
+
+.toc h2 {
+  font-size: 1.1rem;
+  border: none;
+  margin-top: 0;
+  font-variant: small-caps;
+  letter-spacing: 0.1em;
+}
+
+.toc ol {
+  padding-left: 1.5rem;
+  line-height: 1.8;
+}
+
+.toc li { margin-bottom: 0.2rem; }
+
+.toc a {
+  color: var(--text);
+  text-decoration: none;
+}
+
+.toc a:hover {
+  color: var(--accent);
+}
+
+/* --- Title Page --- */
+
+.title-page {
+  text-align: center;
+  padding: 3rem 0 2rem;
+}
+
+.title-page h1 {
+  font-size: 2.5rem;
+  border: none;
+  margin-bottom: 0.5rem;
+}
+
+.title-page .subtitle {
+  font-size: 1.2rem;
+  font-style: italic;
+  color: #666;
+  margin-bottom: 2rem;
+}
+
+.title-page .authors {
+  font-size: 1rem;
+  margin-bottom: 0.5rem;
+}
+
+.title-page .date {
+  font-size: 0.9rem;
+  color: #888;
+}
+
+/* --- Figures --- */
+
+figure {
+  margin: 1.5rem 0;
+  text-align: center;
+}
+
+figcaption {
+  font-size: 0.85rem;
+  color: #666;
+  font-style: italic;
+  margin-top: 0.5rem;
+}
+
+/* --- Lists --- */
+
+ul, ol {
+  margin: 0.75rem 0;
+  padding-left: 1.75rem;
+}
+
+li { margin-bottom: 0.3rem; }
+
+/* --- MathJax adjustments --- */
+
+mjx-container {
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+.MathJax { font-size: 1em !important; }
+
+/* --- Print --- */
+
+@media print {
+  body { max-width: none; font-size: 11pt; }
+  pre { font-size: 9pt; }
+  .diagram-container { break-inside: avoid; }
+  nav.chapter-nav { display: none; }
+  h1, h2 { break-after: avoid; }
+  .theorem, .proof, .definition { break-inside: avoid; }
+}
+
+/* --- Responsive --- */
+
+@media (max-width: 700px) {
+  html { font-size: 16px; }
+  body { padding: 1rem; }
+  pre { padding: 0.75rem; font-size: 0.75rem; }
+  h1 { font-size: 1.6rem; }
+}

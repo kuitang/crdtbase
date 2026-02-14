@@ -1,0 +1,995 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 2: CRDT Implementation &mdash; CRDTBase</title>
+  <link rel="stylesheet" href="style.css">
+
+  <!-- MathJax configuration and loading -->
+  <script>
+    window.MathJax = {
+      tex: {
+        inlineMath: [['\\(', '\\)']],
+        displayMath: [['\\[', '\\]']],
+      },
+      svg: { fontCache: 'global' }
+    };
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+
+  <!-- Mermaid diagram rendering -->
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({startOnLoad:true, theme:'neutral'});
+  </script>
+</head>
+<body>
+
+<nav class="chapter-nav">
+  <a href="ch01-architecture.html" class="prev">Chapter 1: Architecture Overview</a>
+  <a href="ch03-lean-proofs.html" class="next">Chapter 3: Lean Proofs</a>
+</nav>
+
+<h1>
+  <span class="chapter-num">Chapter 2</span>
+  CRDT Implementation
+</h1>
+
+<div class="toc">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#what-are-crdts">What CRDTs Are and Why They Matter</a></li>
+    <li><a href="#semilattice">The Semilattice Requirement</a></li>
+    <li><a href="#hlc-ordering">Ordering Primitive: The Hybrid Logical Clock</a></li>
+    <li><a href="#lww-register">LWW Register</a></li>
+    <li><a href="#pn-counter">PN-Counter</a></li>
+    <li><a href="#or-set">OR-Set (Observed-Remove Set)</a></li>
+    <li><a href="#mv-register">MV-Register (Multi-Value Register)</a></li>
+    <li><a href="#type-tags">CRDT Type Tags and the SQL Interface</a></li>
+    <li><a href="#table-composition">Table-Level Composition</a></li>
+    <li><a href="#ts-lean-correspondence">TypeScript and Lean Correspondence</a></li>
+  </ol>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="what-are-crdts">2.1 &ensp; What CRDTs Are and Why They Matter</h2>
+
+<p>
+  A <em>Conflict-free Replicated Data Type</em> (CRDT) is an abstract data type
+  equipped with a merge operation that automatically resolves concurrent
+  modifications without coordination. In a distributed system where multiple
+  sites can write concurrently&mdash;possibly while partitioned from one
+  another&mdash;CRDTs guarantee that all replicas converge to the same state
+  once they have exchanged the same set of updates, regardless of the order in
+  which those updates arrive.
+</p>
+
+<p>
+  This guarantee is <em>eventual consistency</em> in its strongest form: not
+  merely &ldquo;replicas will agree eventually,&rdquo; but &ldquo;replicas that
+  have seen the same operations will agree <em>identically</em>,
+  deterministically, with no conflict-resolution callbacks, no last-write-wins
+  races resolved by wall clock, and no manual merge.&rdquo; The mathematical
+  foundation for this guarantee is the <em>join-semilattice</em>.
+</p>
+
+<!-- ============================================================ -->
+<h2 id="semilattice">2.2 &ensp; The Semilattice Requirement</h2>
+
+<div class="definition">
+  <span class="box-title">Definition 2.1 &mdash; Join-Semilattice</span>
+  <p>
+    A <em>join-semilattice</em> is a set \(S\) together with a binary
+    operation \(\sqcup : S \times S \to S\) (called <em>join</em> or
+    <em>merge</em>) satisfying three axioms:
+  </p>
+  <ol>
+    <li><strong>Commutativity.</strong> \(a \sqcup b = b \sqcup a\)</li>
+    <li><strong>Associativity.</strong> \(a \sqcup (b \sqcup c) = (a \sqcup b) \sqcup c\)</li>
+    <li><strong>Idempotence.</strong> \(a \sqcup a = a\)</li>
+  </ol>
+</div>
+
+<p>
+  These three properties are exactly what is needed for order-independent
+  convergence. Commutativity means the merge result does not depend on which
+  operand is &ldquo;left&rdquo; versus &ldquo;right.&rdquo; Associativity means
+  multi-way merges can be parenthesized in any order. Idempotence means
+  re-delivering the same state is harmless&mdash;critical for at-least-once
+  delivery semantics over unreliable networks.
+</p>
+
+<div class="diagram-container">
+  <pre class="mermaid">
+graph BT
+  subgraph "Semilattice: merge as join"
+    AB["a &#8852; b"]
+    A["a"]
+    B["b"]
+    Bot["&#8869; (initial)"]
+    A --> AB
+    B --> AB
+    Bot --> A
+    Bot --> B
+  end
+  </pre>
+  <div class="caption">Figure 2.1 &mdash; Hasse diagram of a join-semilattice. Merge always moves upward:
+    \(a \sqcup b\) is the <em>least upper bound</em> of \(a\) and \(b\). The bottom element
+    \(\bot\) represents the initial (empty) state. Every merge monotonically advances the state.</div>
+</div>
+
+<div class="theorem">
+  <span class="box-title">Theorem 2.1 &mdash; Convergence from Semilattice Properties</span>
+  <p>
+    If \(\sqcup\) is commutative and associative, then for any initial state
+    \(s_0\) and any two permutations \(\pi_1, \pi_2\) of the same set of
+    operations \(\{o_1, \ldots, o_n\}\), folding merge over both orderings
+    yields the same result:
+  </p>
+  \[
+    s_0 \sqcup_{\pi_1(1)} \sqcup \cdots \sqcup_{\pi_1(n)}
+    \;=\;
+    s_0 \sqcup_{\pi_2(1)} \sqcup \cdots \sqcup_{\pi_2(n)}
+  \]
+  <p>
+    This is formalized in Lean as <code>convergence_of_perm</code>
+    (see Chapter 3), which derives from Lean 4's <code>List.Perm.foldl_eq</code>
+    lemma for right-commutative functions.
+  </p>
+</div>
+
+<p>
+  CRDTBase implements four CRDT types, each a join-semilattice under its merge
+  operation. The remainder of this chapter presents each implementation in
+  TypeScript, its Lean specification, and the key proof obligations.
+</p>
+
+<!-- ============================================================ -->
+<h2 id="hlc-ordering">2.3 &ensp; Ordering Primitive: The Hybrid Logical Clock</h2>
+
+<p>
+  Before examining any CRDT, we must understand the ordering primitive that
+  underpins them all. Every merge decision in CRDTBase ultimately reduces to
+  comparing <em>Hybrid Logical Clock</em> (HLC) timestamps with site-ID
+  tiebreaking.
+</p>
+
+<div class="definition">
+  <span class="box-title">Definition 2.2 &mdash; HLC Timestamp</span>
+  <p>
+    An HLC is a pair \((\mathit{wallMs}, \mathit{counter})\) where
+    \(\mathit{wallMs}\) is a 48-bit wall-clock millisecond timestamp and
+    \(\mathit{counter}\) is a 16-bit logical counter. These are packed into a
+    single 64-bit value for comparison:
+    \(\mathit{packed} = \mathit{wallMs} \cdot 2^{16} + \mathit{counter}\).
+  </p>
+</div>
+
+<span class="file-ref">src/core/hlc.ts:1&ndash;4</span>
+<pre><code>export type Hlc = {
+  wallMs: number;
+  counter: number;
+};</code></pre>
+
+<p>
+  The total comparison with site-ID tiebreaking defines a total order on
+  \((\mathit{Hlc}, \mathit{site})\) pairs. When two HLCs have identical packed
+  values, the lexicographically greater site ID wins:
+</p>
+
+<span class="file-ref">src/core/hlc.ts:28&ndash;33</span>
+<pre><code>export function compareWithSite(a: Hlc, aSite: string, b: Hlc, bSite: string): number {
+  const hlcCmp = compareHlc(a, b);
+  if (hlcCmp !== 0) return hlcCmp;
+  if (aSite === bSite) return 0;
+  return aSite > bSite ? 1 : -1;
+}</code></pre>
+
+<div class="note">
+  <span class="box-title">Implementation Note &mdash; Site-ID Tiebreaking</span>
+  <p>
+    The site-ID tiebreak ensures that even if two sites produce HLCs with
+    identical \((\mathit{wallMs}, \mathit{counter})\) values, the comparison is
+    still deterministic. Since site IDs are globally unique strings (typically
+    UUIDs), this gives a total order over all events in the system. The Lean
+    model proves this ordering is reflexive, antisymmetric, and transitive
+    (<code>compareWithSite_self_eq</code>, <code>compareWithSite_swap_lt</code>,
+    <code>compareWithSite_trans_lt</code>).
+  </p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="lww-register">2.4 &ensp; LWW Register</h2>
+
+<p>
+  The <em>Last-Writer-Wins Register</em> is the simplest CRDT: a single value
+  tagged with an HLC and a site ID. On merge, the register with the greater
+  \((\mathit{hlc}, \mathit{site})\) wins. This is the default column type in
+  CRDTBase&mdash;every bare <code>STRING</code>, <code>NUMBER</code>, or
+  <code>BOOLEAN</code> column is stored as an LWW register.
+</p>
+
+<div class="definition">
+  <span class="box-title">Definition 2.3 &mdash; LWW Register</span>
+  <p>
+    An LWW register over type \(T\) is a triple \((v, h, s)\) where
+    \(v : T\) is the payload value, \(h : \mathrm{Hlc}\) is the timestamp,
+    and \(s : \mathrm{String}\) is the originating site ID. Its merge is
+    defined as:
+  </p>
+  \[
+    \mathrm{merge}(a, b) =
+    \begin{cases}
+      b & \text{if } (a.h, a.s) \lt (b.h, b.s) \\
+      a & \text{otherwise}
+    \end{cases}
+  \]
+</div>
+
+<h3>TypeScript Implementation</h3>
+
+<span class="file-ref">src/core/crdt/lww.ts:3&ndash;7</span>
+<pre><code>export type LwwRegister&lt;T&gt; = {
+  val: T;
+  hlc: Hlc;
+  site: string;
+};</code></pre>
+
+<span class="file-ref">src/core/crdt/lww.ts:23&ndash;30</span>
+<pre><code>export function mergeLww&lt;T&gt;(a: LwwRegister&lt;T&gt;, b: LwwRegister&lt;T&gt;): LwwRegister&lt;T&gt; {
+  assertLwwEventConsistency(a, b);
+  const cmp = compareWithSite(a.hlc, a.site, b.hlc, b.site);
+  if (cmp >= 0) {
+    return a;
+  }
+  return b;
+}</code></pre>
+
+<p>
+  The <code>assertLwwEventConsistency</code> guard (line 17) throws if two
+  registers share the same \((\mathit{hlc}, \mathit{site})\) but carry
+  different payloads. This is a runtime invariant that must hold for the
+  semilattice properties to be valid&mdash;the same event identity must always
+  produce the same value.
+</p>
+
+<div class="diagram-container">
+  <pre class="mermaid">
+flowchart TD
+  Start["merge(a, b)"] --> Check{"assertLwwEventConsistency(a, b)"}
+  Check -->|"same (hlc, site), different val"| Throw["throw Error"]
+  Check -->|"OK"| Compare["cmp = compareWithSite(a, b)"]
+  Compare --> Geq{"cmp &ge; 0?"}
+  Geq -->|"Yes: a wins or tie"| ReturnA["return a"]
+  Geq -->|"No: b is newer"| ReturnB["return b"]
+  </pre>
+  <div class="caption">Figure 2.2 &mdash; LWW merge decision tree. The consistency check
+    rejects the &ldquo;impossible&rdquo; case of conflicting payloads under the same event
+    identity. On equality (\(\mathrm{cmp} = 0\)), the left-bias convention returns \(a\),
+    which is safe because consistency guarantees \(a = b\).</div>
+</div>
+
+<h3>Lean Specification</h3>
+
+<span class="file-ref">lean/CrdtBase/Crdt/Lww/Defs.lean:8&ndash;18</span>
+<pre><code>structure LwwRegister (&alpha; : Type) where
+  val  : &alpha;
+  hlc  : Hlc
+  site : String
+  deriving Repr, DecidableEq
+
+def merge {&alpha; : Type} (a b : LwwRegister &alpha;) : LwwRegister &alpha; :=
+  if Hlc.compareWithSite (a.hlc, a.site) (b.hlc, b.site) = .lt then b else a</code></pre>
+
+<div class="note">
+  <span class="box-title">Implementation Note &mdash; Event Consistency as Precondition</span>
+  <p>
+    The Lean model introduces <code>LwwConsistentPair</code> as a
+    <em>propositional</em> precondition on merge inputs: if
+    <code>compareWithSite</code> returns <code>.eq</code>, then the two
+    registers must be structurally equal. This is the Lean analog of the
+    TypeScript runtime assertion. The commutativity and associativity proofs
+    carry this hypothesis explicitly, making the proof obligation transparent.
+  </p>
+</div>
+
+<div class="theorem">
+  <span class="box-title">Theorem 2.2 &mdash; LWW Semilattice Properties</span>
+  <p>Under the event-consistency invariant \(\mathit{LwwConsistentPair}(a, b)\):</p>
+  <ol>
+    <li>\(\mathrm{merge}(a, b) = \mathrm{merge}(b, a)\) &ensp; (<code>lww_merge_comm_of_consistent</code>, Props.lean:30)</li>
+    <li>\(\mathrm{merge}(\mathrm{merge}(a, b), c) = \mathrm{merge}(a, \mathrm{merge}(b, c))\) &ensp; (<code>lww_merge_assoc_of_consistent</code>, Props.lean:51)</li>
+    <li>\(\mathrm{merge}(a, a) = a\) &ensp; (<code>lww_merge_idem</code>, Props.lean:85)</li>
+  </ol>
+  <p>
+    The commutativity proof case-splits on the three-way comparison
+    (<code>.lt</code>, <code>.eq</code>, <code>.gt</code>), using the swap
+    lemmas <code>compareWithSite_swap_lt</code> and
+    <code>compareWithSite_swap_gt</code> from the HLC module. The associativity
+    proof exhausts all nine combinations of pairwise comparisons, pruning
+    impossible cases via transitivity.
+  </p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="pn-counter">2.5 &ensp; PN-Counter</h2>
+
+<p>
+  A <em>Positive-Negative Counter</em> supports both increment and decrement
+  operations while converging across replicas. The key insight is to separate
+  increments and decrements into two independent maps, each tracking
+  per-site totals.
+</p>
+
+<div class="definition">
+  <span class="box-title">Definition 2.4 &mdash; PN-Counter</span>
+  <p>
+    A PN-Counter is a pair of maps \((\mathit{inc}, \mathit{dec})\), each
+    from site IDs to non-negative integers. The observable value is:
+  </p>
+  \[
+    \mathrm{value}(c) = \sum_{s} c.\mathit{inc}(s) \;-\; \sum_{s} c.\mathit{dec}(s)
+  \]
+  <p>
+    Merge is <em>pointwise max</em> over both maps independently:
+  </p>
+  \[
+    \mathrm{merge}(a, b) = \bigl(\;
+      \lambda s.\; \max(a.\mathit{inc}(s),\; b.\mathit{inc}(s)),\;\;
+      \lambda s.\; \max(a.\mathit{dec}(s),\; b.\mathit{dec}(s))
+    \;\bigr)
+  \]
+</div>
+
+<h3>TypeScript Implementation</h3>
+
+<span class="file-ref">src/core/crdt/pnCounter.ts:1&ndash;6</span>
+<pre><code>export type SiteCountMap = Record&lt;string, number&gt;;
+
+export type PnCounter = {
+  inc: SiteCountMap;
+  dec: SiteCountMap;
+};</code></pre>
+
+<p>
+  The merge of site-count maps computes pointwise max over the union of keys:
+</p>
+
+<span class="file-ref">src/core/crdt/pnCounter.ts:28&ndash;40</span>
+<pre><code>function mergeSiteCountMaps(a: SiteCountMap, b: SiteCountMap): SiteCountMap {
+  const out: SiteCountMap = {};
+  const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+  for (const key of keys) {
+    const left = a[key] ?? 0;
+    const right = b[key] ?? 0;
+    const merged = Math.max(left, right);
+    if (merged !== 0) {
+      out[key] = merged;
+    }
+  }
+  return out;
+}</code></pre>
+
+<span class="file-ref">src/core/crdt/pnCounter.ts:49&ndash;56</span>
+<pre><code>export function mergePnCounter(a: PnCounter, b: PnCounter): PnCounter {
+  const left = normalizePnCounter(a);
+  const right = normalizePnCounter(b);
+  return {
+    inc: mergeSiteCountMaps(left.inc, right.inc),
+    dec: mergeSiteCountMaps(left.dec, right.dec),
+  };
+}</code></pre>
+
+<p>
+  Value materialization sums all site counts and subtracts:
+</p>
+
+<span class="file-ref">src/core/crdt/pnCounter.ts:76&ndash;81</span>
+<pre><code>export function pnCounterValue(counter: PnCounter): number {
+  const normalized = normalizePnCounter(counter);
+  const inc = Object.values(normalized.inc).reduce((sum, value) => sum + value, 0);
+  const dec = Object.values(normalized.dec).reduce((sum, value) => sum + value, 0);
+  return inc - dec;
+}</code></pre>
+
+<h3>Lean Specification</h3>
+
+<p>
+  The Lean model uses total functions <code>String &rarr; Nat</code> instead of
+  hash maps. This makes proofs cleaner: unseen sites implicitly return 0, and
+  there is no need for normalization or zero-elision logic.
+</p>
+
+<span class="file-ref">lean/CrdtBase/Crdt/PnCounter/Defs.lean:6&ndash;8</span>
+<pre><code>structure PnCounter where
+  inc : String &rarr; Nat
+  dec : String &rarr; Nat</code></pre>
+
+<span class="file-ref">lean/CrdtBase/Crdt/PnCounter/Defs.lean:28&ndash;31</span>
+<pre><code>def merge (a b : PnCounter) : PnCounter :=
+  { inc := fun site =&gt; max (a.inc site) (b.inc site)
+    dec := fun site =&gt; max (a.dec site) (b.dec site) }</code></pre>
+
+<div class="theorem">
+  <span class="box-title">Theorem 2.3 &mdash; PN-Counter Semilattice Properties</span>
+  <p>All three properties hold unconditionally (no preconditions):</p>
+  <ol>
+    <li><code>pn_counter_merge_comm</code> &mdash; follows from <code>Nat.max_comm</code></li>
+    <li><code>pn_counter_merge_assoc</code> &mdash; follows from <code>Nat.max_assoc</code></li>
+    <li><code>pn_counter_merge_idem</code> &mdash; follows from <code>max(n, n) = n</code></li>
+  </ol>
+  <p>
+    Each proof is a single line of tactic: <code>ext site &lt;;&gt; simp [PnCounter.merge, Nat.max_comm]</code>.
+    The <code>ext</code> tactic reduces structural equality to pointwise equality, and
+    <code>simp</code> discharges the remaining <code>Nat.max</code> goal using standard library lemmas.
+    These are among the most concise CRDT proofs in the codebase.
+  </p>
+</div>
+
+<div class="note">
+  <span class="box-title">Implementation Note &mdash; Zero-Elision Normalization</span>
+  <p>
+    The TypeScript implementation normalizes maps by stripping zero-valued
+    entries (<code>normalizePnCounter</code>, line 42). This keeps serialized
+    state compact but is semantically invisible: a map with <code>{"siteA": 0}</code>
+    and one with <code>{}</code> represent the same counter state. The Lean
+    model sidesteps this entirely by using total functions where the &ldquo;default&rdquo;
+    is simply <code>0</code>.
+  </p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="or-set">2.6 &ensp; OR-Set (Observed-Remove Set)</h2>
+
+<p>
+  The <em>Observed-Remove Set</em> solves a fundamental problem in replicated
+  sets: what happens when one site adds an element concurrently with another
+  site removing it? The OR-Set&rsquo;s answer is precise: a remove operation
+  only removes the <em>specific add events it has observed</em>. Concurrent
+  adds that the remover has not seen survive.
+</p>
+
+<div class="definition">
+  <span class="box-title">Definition 2.5 &mdash; OR-Set</span>
+  <p>
+    An OR-Set over type \(T\) consists of:
+  </p>
+  <ul>
+    <li><strong>Elements:</strong> a set of pairs \((v, \mathit{tag})\) where
+      \(v : T\) is the value and \(\mathit{tag} = (\mathit{addHlc}, \mathit{addSite})\)
+      is a globally unique identifier for the add event.</li>
+    <li><strong>Tombstones:</strong> a set of tags identifying removed add events.</li>
+  </ul>
+  <p>Merge is:</p>
+  \[
+    \mathrm{merge}(a, b) = \mathrm{canonicalize}\bigl(
+      a.\mathit{elements} \cup b.\mathit{elements},\;
+      a.\mathit{tombstones} \cup b.\mathit{tombstones}
+    \bigr)
+  \]
+  <p>
+    where \(\mathrm{canonicalize}\) filters out any element whose tag appears
+    in the tombstone set.
+  </p>
+</div>
+
+<h3>TypeScript Implementation</h3>
+
+<span class="file-ref">src/core/crdt/orSet.ts:3&ndash;16</span>
+<pre><code>export type OrSetTag = {
+  addHlc: Hlc;
+  addSite: string;
+};
+
+export type OrSetElement&lt;T&gt; = {
+  val: T;
+  tag: OrSetTag;
+};
+
+export type OrSet&lt;T&gt; = {
+  elements: Array&lt;OrSetElement&lt;T&gt;&gt;;
+  tombstones: OrSetTag[];
+};</code></pre>
+
+<p>
+  Merge concatenates both element and tombstone arrays, then canonicalizes:
+</p>
+
+<span class="file-ref">src/core/crdt/orSet.ts:100&ndash;105</span>
+<pre><code>export function mergeOrSet&lt;T&gt;(a: OrSet&lt;T&gt;, b: OrSet&lt;T&gt;): OrSet&lt;T&gt; {
+  return canonicalizeOrSet({
+    elements: [...a.elements, ...b.elements],
+    tombstones: [...a.tombstones, ...b.tombstones],
+  });
+}</code></pre>
+
+<p>
+  Canonicalization deduplicates, sorts, and filters out tombstoned elements:
+</p>
+
+<span class="file-ref">src/core/crdt/orSet.ts:90&ndash;98</span>
+<pre><code>export function canonicalizeOrSet&lt;T&gt;(state: OrSet&lt;T&gt;): OrSet&lt;T&gt; {
+  assertOrSetElementConsistency(state.elements);
+  const tombstones = dedupeAndSortTags(state.tombstones);
+  const tombstoneKeys = new Set(tombstones.map((tag) => tagKey(tag)));
+  const elements = dedupeAndSortElements(state.elements).filter(
+    (element) => !tombstoneKeys.has(tagKey(element.tag)),
+  );
+  return { elements, tombstones };
+}</code></pre>
+
+<div class="diagram-container">
+  <pre class="mermaid">
+sequenceDiagram
+    participant SiteA as Site A
+    participant SiteB as Site B
+
+    Note over SiteA,SiteB: Both start with empty set {}
+
+    SiteA->>SiteA: add("x") with tag t1
+    Note right of SiteA: elements: [{val:"x", tag:t1}]
+
+    SiteA-->>SiteB: sync: add("x", t1)
+    Note right of SiteB: elements: [{val:"x", tag:t1}]
+
+    par Concurrent operations
+        SiteA->>SiteA: add("x") with tag t2
+        Note right of SiteA: elements: [{val:"x", tag:t1}, {val:"x", tag:t2}]
+    and
+        SiteB->>SiteB: remove("x") tombstones [t1]
+        Note right of SiteB: elements: [] tombstones: [t1]
+    end
+
+    SiteA-->>SiteB: sync: add("x", t2)
+    SiteB-->>SiteA: sync: tombstone t1
+
+    Note over SiteA: merge: elements [{val:"x", tag:t2}]<br/>tombstones [t1]<br/>t1 is removed, t2 survives!
+    Note over SiteB: merge: elements [{val:"x", tag:t2}]<br/>tombstones [t1]<br/>Same result: "x" is present
+  </pre>
+  <div class="caption">Figure 2.3 &mdash; OR-Set add/remove/merge sequence. Site B&rsquo;s remove only
+    tombstones the add it observed (tag \(t_1\)). Site A&rsquo;s concurrent
+    add (tag \(t_2\)) survives because Site B never saw it. After full sync,
+    both sites converge: &ldquo;x&rdquo; is present via \(t_2\).</div>
+</div>
+
+<h3>Lean Specification</h3>
+
+<p>
+  The Lean model uses <code>Finset</code> instead of arrays. Finsets carry
+  built-in deduplication semantics, which eliminates the need for the explicit
+  <code>dedupeAndSortElements</code> and <code>dedupeAndSortTags</code> functions:
+</p>
+
+<span class="file-ref">lean/CrdtBase/Crdt/OrSet/Defs.lean:8&ndash;22</span>
+<pre><code>structure OrSetTag (Hlc : Type) where
+  addHlc  : Hlc
+  addSite : String
+  deriving Repr, DecidableEq
+
+structure OrSetElem (&alpha; : Type) (Hlc : Type) where
+  val : &alpha;
+  tag : OrSetTag Hlc
+  deriving Repr, DecidableEq
+
+structure OrSet (&alpha; : Type) (Hlc : Type) where
+  elements   : Finset (OrSetElem &alpha; Hlc)
+  tombstones : Finset (OrSetTag Hlc)</code></pre>
+
+<span class="file-ref">lean/CrdtBase/Crdt/OrSet/Defs.lean:34&ndash;47</span>
+<pre><code>def OrSet.canonicalize (s : OrSet &alpha; Hlc) : OrSet &alpha; Hlc :=
+  { elements := s.elements.filter (fun e =&gt; e.tag &notin; s.tombstones)
+    tombstones := s.tombstones }
+
+def OrSet.merge (a b : OrSet &alpha; Hlc) : OrSet &alpha; Hlc :=
+  OrSet.canonicalize {
+    elements := a.elements &cup; b.elements
+    tombstones := a.tombstones &cup; b.tombstones
+  }</code></pre>
+
+<div class="theorem">
+  <span class="box-title">Theorem 2.4 &mdash; OR-Set Semilattice Properties</span>
+  <ol>
+    <li><code>or_set_merge_comm</code> (Props.lean:29) &mdash; follows from <code>Finset.union_comm</code></li>
+    <li><code>or_set_merge_assoc</code> (Props.lean:35) &mdash; uses <code>aesop</code> for Finset reasoning</li>
+    <li><code>or_set_merge_idem</code> (Props.lean:47) &mdash; requires the <em>cleanness</em>
+      precondition: \(\forall x \in a.\mathit{elements},\; x.\mathit{tag} \notin a.\mathit{tombstones}\)</li>
+  </ol>
+  <p>
+    The idempotency precondition <code>hClean</code> deserves attention. A
+    &ldquo;dirty&rdquo; OR-Set containing elements whose tags are already in the
+    tombstone set would lose those elements on the first canonicalization,
+    meaning <code>merge(a, a)</code> could differ from <code>a</code>. In practice,
+    all OR-Sets are stored in canonical form, so <code>hClean</code> always holds.
+    Commutativity and associativity hold unconditionally.
+  </p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="mv-register">2.7 &ensp; MV-Register (Multi-Value Register)</h2>
+
+<p>
+  Where an LWW register picks a single winner and an OR-Set tracks set
+  membership, the <em>Multi-Value Register</em> preserves all concurrent
+  values, surfacing conflicts to the application layer. This is the analog
+  of Amazon Dynamo&rsquo;s &ldquo;sibling values&rdquo; or Riak&rsquo;s
+  conflict resolution model.
+</p>
+
+<div class="definition">
+  <span class="box-title">Definition 2.6 &mdash; MV-Register</span>
+  <p>
+    An MV-Register over type \(T\) is a set of version-tagged values
+    \(\{(v_i, h_i, s_i)\}\), where each entry carries its payload, HLC, and
+    site ID. Merge is set union:
+  </p>
+  \[
+    \mathrm{merge}(a, b) = a.\mathit{values} \cup b.\mathit{values}
+  \]
+  <p>
+    When materialized for queries, if the register contains a single value it
+    is returned directly; if it contains multiple concurrent values, they are
+    returned as an array, signaling a conflict for the application to resolve.
+  </p>
+</div>
+
+<h3>TypeScript Implementation</h3>
+
+<span class="file-ref">src/core/crdt/mvRegister.ts:3&ndash;11</span>
+<pre><code>export type MvRegisterValue&lt;T&gt; = {
+  val: T;
+  hlc: Hlc;
+  site: string;
+};
+
+export type MvRegister&lt;T&gt; = {
+  values: Array&lt;MvRegisterValue&lt;T&gt;&gt;;
+};</code></pre>
+
+<span class="file-ref">src/core/crdt/mvRegister.ts:84&ndash;88</span>
+<pre><code>export function mergeMvRegister&lt;T&gt;(a: MvRegister&lt;T&gt;, b: MvRegister&lt;T&gt;): MvRegister&lt;T&gt; {
+  return canonicalizeMvRegister({
+    values: [...a.values, ...b.values],
+  });
+}</code></pre>
+
+<p>
+  Canonicalization deduplicates by event key \((\mathit{hlc}, \mathit{site})\)
+  and sorts for deterministic ordering:
+</p>
+
+<span class="file-ref">src/core/crdt/mvRegister.ts:77&ndash;82</span>
+<pre><code>export function canonicalizeMvRegister&lt;T&gt;(state: MvRegister&lt;T&gt;): MvRegister&lt;T&gt; {
+  assertMvEventConsistency(state.values);
+  const deduped = dedupeByEvent(state.values);
+  const values = deduped.sort((left, right) =>
+    compareKeys(entrySortKey(left), entrySortKey(right)));
+  return { values };
+}</code></pre>
+
+<h3>Lean Specification</h3>
+
+<span class="file-ref">lean/CrdtBase/Crdt/MvRegister/Defs.lean:9&ndash;17</span>
+<pre><code>structure MvValue (&alpha; : Type) where
+  val  : &alpha;
+  hlc  : Hlc
+  site : String
+  deriving Repr, DecidableEq
+
+structure MvRegister (&alpha; : Type) where
+  values : Finset (MvValue &alpha;)</code></pre>
+
+<span class="file-ref">lean/CrdtBase/Crdt/MvRegister/Defs.lean:29&ndash;31</span>
+<pre><code>def merge {&alpha; : Type} [DecidableEq &alpha;] (a b : MvRegister &alpha;) : MvRegister &alpha; :=
+  { values := a.values &cup; b.values }</code></pre>
+
+<div class="theorem">
+  <span class="box-title">Theorem 2.5 &mdash; MV-Register Semilattice Properties</span>
+  <p>All three properties hold unconditionally, following directly from
+    <code>Finset.union_comm</code>, <code>Finset.union_assoc</code>, and
+    <code>Finset.union_self</code>:</p>
+  <ol>
+    <li><code>mv_register_merge_comm</code> (Props.lean:8)</li>
+    <li><code>mv_register_merge_assoc</code> (Props.lean:14)</li>
+    <li><code>mv_register_merge_idem</code> (Props.lean:21)</li>
+  </ol>
+  <p>
+    The MV-Register is the purest semilattice in the codebase: its merge is
+    literally set union, and all properties follow from the corresponding
+    Finset lemmas with no additional reasoning.
+  </p>
+</div>
+
+<div class="note">
+  <span class="box-title">Implementation Note &mdash; MV-Register vs. LWW Register</span>
+  <p>
+    The choice between LWW and MV semantics is a design decision exposed to the
+    user through the SQL schema. A column declared as <code>LWW&lt;STRING&gt;</code>
+    (or bare <code>STRING</code>) silently picks a winner; a column declared as
+    <code>REGISTER&lt;STRING&gt;</code> preserves all concurrent writes. In
+    practice, LWW is appropriate for &ldquo;last edit wins&rdquo; fields (names,
+    descriptions), while MV-Register suits fields where the application needs
+    to detect and resolve conflicts (prices, inventory counts).
+  </p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="type-tags">2.8 &ensp; CRDT Type Tags and the SQL Interface</h2>
+
+<p>
+  Each CRDT type is assigned a numeric tag used in the operation encoding layer.
+  These tags appear in encoded operations, segment files, and the wire protocol
+  between sites:
+</p>
+
+<div class="diagram-container">
+  <table>
+    <thead>
+      <tr>
+        <th>Tag</th>
+        <th>CRDT Type</th>
+        <th>SQL Syntax</th>
+        <th>Merge Strategy</th>
+        <th>Lean Structure</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>1</code></td>
+        <td>LWW Register</td>
+        <td><code>LWW&lt;T&gt;</code>, bare <code>STRING</code> / <code>NUMBER</code> / <code>BOOLEAN</code></td>
+        <td>Greater \((\mathit{hlc}, \mathit{site})\) wins</td>
+        <td><code>LwwRegister &alpha;</code></td>
+      </tr>
+      <tr>
+        <td><code>2</code></td>
+        <td>PN-Counter</td>
+        <td><code>COUNTER</code></td>
+        <td>Pointwise max of per-site counts</td>
+        <td><code>PnCounter</code></td>
+      </tr>
+      <tr>
+        <td><code>3</code></td>
+        <td>OR-Set</td>
+        <td><code>SET&lt;T&gt;</code></td>
+        <td>Union + tombstone filtering</td>
+        <td><code>OrSet &alpha; Hlc</code></td>
+      </tr>
+      <tr>
+        <td><code>4</code></td>
+        <td>MV-Register</td>
+        <td><code>REGISTER&lt;T&gt;</code></td>
+        <td>Set union of versioned values</td>
+        <td><code>MvRegister &alpha;</code></td>
+      </tr>
+    </tbody>
+  </table>
+  <div class="caption">Figure 2.4 &mdash; CRDT type tag mapping between SQL syntax, TypeScript runtime,
+    and Lean specification. The tag number is the discriminant used in encoded operations.</div>
+</div>
+
+<p>
+  The SQL evaluation layer dispatches on these tags when applying operations
+  to runtime row state. Each column in a table carries its CRDT type, and
+  the merge dispatcher routes incoming operations to the appropriate merge
+  function. Row existence itself is modeled as an LWW register over
+  <code>Bool</code>&mdash;a deletion is simply writing <code>true</code> to
+  the hidden <code>_exists</code> column with a newer timestamp.
+</p>
+
+<!-- ============================================================ -->
+<h2 id="table-composition">2.9 &ensp; Table-Level Composition</h2>
+
+<p>
+  CRDTBase composes these four CRDT types into a table model. Each row contains
+  a visibility flag (LWW over Bool), plus one column of each CRDT type. Row
+  merge is componentwise; table merge is pointwise over keys.
+</p>
+
+<span class="file-ref">lean/CrdtBase/Crdt/Table/Defs.lean:11&ndash;17</span>
+<pre><code>structure TableRowState (&alpha; &beta; &gamma; Hlc : Type) where
+  alive : LwwRegister Bool
+  lwwCol : LwwRegister &alpha;
+  counterCol : PnCounter
+  setCol : OrSet &beta; Hlc
+  registerCol : MvRegister &gamma;</code></pre>
+
+<span class="file-ref">lean/CrdtBase/Crdt/Table/Defs.lean:19&ndash;27</span>
+<pre><code>def mergeTableRow (a b : TableRowState &alpha; &beta; &gamma; Hlc) : TableRowState &alpha; &beta; &gamma; Hlc :=
+  {
+    alive := LwwRegister.merge a.alive b.alive
+    lwwCol := LwwRegister.merge a.lwwCol b.lwwCol
+    counterCol := PnCounter.merge a.counterCol b.counterCol
+    setCol := OrSet.merge a.setCol b.setCol
+    registerCol := MvRegister.merge a.registerCol b.registerCol
+  }</code></pre>
+
+<span class="file-ref">lean/CrdtBase/Crdt/Table/Defs.lean:33&ndash;35</span>
+<pre><code>def mergeTable (a b : TableState &kappa; &alpha; &beta; &gamma; Hlc) : TableState &kappa; &alpha; &beta; &gamma; Hlc :=
+  fun key =&gt; mergeTableRow (a key) (b key)</code></pre>
+
+<div class="theorem">
+  <span class="box-title">Theorem 2.6 &mdash; Compositional Convergence</span>
+  <p>
+    The semilattice properties <em>lift</em> from individual CRDT columns to
+    whole rows and whole tables. The Lean proofs
+    (<code>Table/Props.lean</code>) establish:
+  </p>
+  <ul>
+    <li><code>table_merge_comm_of_row_comm</code> &mdash; table commutativity from row commutativity</li>
+    <li><code>table_merge_assoc_of_row_assoc</code> &mdash; table associativity from row associativity</li>
+    <li><code>table_merge_idem_of_row_idem</code> &mdash; table idempotency from row idempotency</li>
+  </ul>
+  <p>
+    Additionally, cross-column commutativity is proved: counter updates
+    commute with row-existence changes, OR-Set updates commute with
+    row-existence changes, and counter updates commute with MV-Register
+    updates&mdash;because each operation modifies a disjoint field of the
+    row structure.
+  </p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="ts-lean-correspondence">2.10 &ensp; TypeScript and Lean Correspondence</h2>
+
+<p>
+  CRDTBase maintains a dual-codebase architecture: TypeScript for production
+  runtime and Lean 4 for formal specification and verification. The two
+  codebases are structurally parallel:
+</p>
+
+<div class="diagram-container">
+  <pre class="mermaid">
+graph LR
+  subgraph "TypeScript (Runtime)"
+    TS_HLC["src/core/hlc.ts"]
+    TS_LWW["src/core/crdt/lww.ts"]
+    TS_PN["src/core/crdt/pnCounter.ts"]
+    TS_OR["src/core/crdt/orSet.ts"]
+    TS_MV["src/core/crdt/mvRegister.ts"]
+  end
+
+  subgraph "Lean 4 (Specification)"
+    LN_HLC["Hlc/Defs.lean"]
+    LN_LWW["Crdt/Lww/Defs.lean"]
+    LN_PN["Crdt/PnCounter/Defs.lean"]
+    LN_OR["Crdt/OrSet/Defs.lean"]
+    LN_MV["Crdt/MvRegister/Defs.lean"]
+  end
+
+  subgraph "Lean 4 (Proofs)"
+    LN_HLC_P["Hlc/Props.lean"]
+    LN_LWW_P["Crdt/Lww/Props.lean"]
+    LN_PN_P["Crdt/PnCounter/Props.lean"]
+    LN_OR_P["Crdt/OrSet/Props.lean"]
+    LN_MV_P["Crdt/MvRegister/Props.lean"]
+  end
+
+  TS_HLC <-.-> LN_HLC
+  TS_LWW <-.-> LN_LWW
+  TS_PN <-.-> LN_PN
+  TS_OR <-.-> LN_OR
+  TS_MV <-.-> LN_MV
+
+  LN_HLC --> LN_HLC_P
+  LN_LWW --> LN_LWW_P
+  LN_PN --> LN_PN_P
+  LN_OR --> LN_OR_P
+  LN_MV --> LN_MV_P
+  </pre>
+  <div class="caption">Figure 2.5 &mdash; Structural correspondence between TypeScript runtime,
+    Lean definitions, and Lean proofs. Dashed arrows indicate semantic equivalence
+    validated by differential random testing. Solid arrows show proof dependencies.</div>
+</div>
+
+<p>
+  The two codebases are linked by <em>differential random testing</em> (DRT),
+  covered in Chapter 4. The Lean executable serves as a test oracle:
+  random CRDT states are generated, both TypeScript and Lean merge them, and
+  the outputs are compared. Any divergence is a bug in one codebase.
+</p>
+
+<h3>Design Differences</h3>
+
+<table>
+  <thead>
+    <tr>
+      <th>Aspect</th>
+      <th>TypeScript</th>
+      <th>Lean</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Collections</td>
+      <td><code>Array</code>, <code>Map</code>, <code>Record</code></td>
+      <td><code>Finset</code>, <code>List</code>, <code>String &rarr; Nat</code></td>
+    </tr>
+    <tr>
+      <td>HLC storage</td>
+      <td><code>bigint</code> via bit shift (<code>&lt;&lt; 16n</code>)</td>
+      <td><code>Nat</code> via multiplication (<code>* counterMax</code>)</td>
+    </tr>
+    <tr>
+      <td>Deduplication</td>
+      <td>Explicit <code>dedupeBy*</code> functions</td>
+      <td>Implicit in <code>Finset</code></td>
+    </tr>
+    <tr>
+      <td>Bounds checking</td>
+      <td>Runtime <code>throw</code></td>
+      <td>Dependent types (<code>wallMs_lt</code>, <code>counter_lt</code>)</td>
+    </tr>
+    <tr>
+      <td>Event consistency</td>
+      <td>Runtime assertion</td>
+      <td>Propositional hypothesis (<code>LwwConsistentPair</code>)</td>
+    </tr>
+    <tr>
+      <td>Binary encoding</td>
+      <td>MessagePack via <code>@msgpack/msgpack</code></td>
+      <td>Not modeled (out of proof scope)</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>Proof Inventory for CRDT Layer</h3>
+
+<table>
+  <thead>
+    <tr>
+      <th>CRDT Type</th>
+      <th>Commutativity</th>
+      <th>Associativity</th>
+      <th>Idempotence</th>
+      <th>Preconditions</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>LWW Register</td>
+      <td><code>lww_merge_comm_of_consistent</code></td>
+      <td><code>lww_merge_assoc_of_consistent</code></td>
+      <td><code>lww_merge_idem</code></td>
+      <td><code>LwwConsistentPair</code></td>
+    </tr>
+    <tr>
+      <td>PN-Counter</td>
+      <td><code>pn_counter_merge_comm</code></td>
+      <td><code>pn_counter_merge_assoc</code></td>
+      <td><code>pn_counter_merge_idem</code></td>
+      <td>None</td>
+    </tr>
+    <tr>
+      <td>OR-Set</td>
+      <td><code>or_set_merge_comm</code></td>
+      <td><code>or_set_merge_assoc</code></td>
+      <td><code>or_set_merge_idem</code></td>
+      <td><code>hClean</code> (idem only)</td>
+    </tr>
+    <tr>
+      <td>MV-Register</td>
+      <td><code>mv_register_merge_comm</code></td>
+      <td><code>mv_register_merge_assoc</code></td>
+      <td><code>mv_register_merge_idem</code></td>
+      <td>None</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+  Together, these 12 semilattice theorems form the foundation of CRDTBase&rsquo;s
+  convergence guarantee. They are composed upward through the table model
+  (Chapter 3) and validated empirically through differential random testing
+  (Chapter 4).
+</p>
+
+<hr>
+
+<nav class="chapter-nav">
+  <a href="ch01-architecture.html" class="prev">Chapter 1: Architecture Overview</a>
+  <a href="ch03-lean-proofs.html" class="next">Chapter 3: Lean Proofs</a>
+</nav>
+
+</body>
+</html>

@@ -1,0 +1,1402 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 4: Differential Testing &mdash; CRDTBase</title>
+  <link rel="stylesheet" href="style.css">
+
+  <!-- MathJax -->
+  <script>
+    window.MathJax = {
+      tex: {
+        inlineMath: [['\\(', '\\)']],
+        displayMath: [['\\[', '\\]']],
+      },
+    };
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+
+  <!-- Mermaid -->
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({startOnLoad:true, theme:'neutral'});
+  </script>
+</head>
+<body>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch03-lean-proofs.html">Chapter 3: Lean Proofs</a>
+  <span>Chapter 4</span>
+  <a class="next" href="ch05-data-model.html">Chapter 5: Data Model &amp; Correctness</a>
+</nav>
+
+<h1>
+  <span class="chapter-num">Chapter 4</span>
+  Differential Testing
+</h1>
+
+<div class="toc">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#philosophy">Philosophy: Cedar-Inspired Dual-Implementation Testing</a></li>
+    <li><a href="#testing-pyramid">The Testing Pyramid</a></li>
+    <li><a href="#drt-harness">The DRT Harness</a></li>
+    <li><a href="#jsonl-protocol">The JSONL Protocol</a></li>
+    <li><a href="#generators">Fast-Check Generators</a></li>
+    <li><a href="#crdt-drt">CRDT Merge DRT (Level 1)</a></li>
+    <li><a href="#compaction-drt">Compaction Split Law DRT</a></li>
+    <li><a href="#sql-drt">SQL Differential Testing</a></li>
+    <li><a href="#replication-drt">Replication Log DRT</a></li>
+    <li><a href="#level-2">Property-Based Tests (Level 2)</a></li>
+    <li><a href="#level-3">Model-Based Tests (Level 3)</a></li>
+    <li><a href="#level-4">End-to-End Tests (Level 4)</a></li>
+    <li><a href="#ci">CI Pipeline</a></li>
+    <li><a href="#edge-cases">Edge Cases and Normalization</a></li>
+    <li><a href="#commands">Command Reference</a></li>
+  </ol>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="philosophy">4.1 &ensp; Philosophy: Cedar-Inspired Dual-Implementation Testing</h2>
+
+<p>
+  CRDTBase rejects traditional unit tests entirely. The project's
+  <code>TESTING.md</code> opens with a directive:
+</p>
+
+<blockquote>
+  No traditional unit tests. Every test in this project is either a
+  <strong>property-based test</strong>, a <strong>differential test</strong>,
+  or a <strong>model-based test</strong>. If you find yourself writing
+  <code>expect(add(2, 3)).toBe(5)</code>, stop &mdash; express it as a
+  property instead.
+</blockquote>
+
+<p>
+  The methodology draws inspiration from
+  <a href="https://www.amazon.science/publications/how-we-built-cedar">Amazon's Cedar policy engine</a>,
+  which maintains two independent implementations of its authorization logic:
+  a Lean 4 specification verified by theorem proving, and a Rust production
+  implementation tested against the specification via differential random
+  testing. CRDTBase follows an identical architecture: a Lean 4 model that
+  serves as a mathematically verified oracle, and a TypeScript production
+  implementation that is continuously compared against it.
+</p>
+
+<p>
+  The key insight is that <em>two independent implementations of the same
+  specification will not share the same bugs</em>. A subtle off-by-one in
+  TypeScript's <code>compareWithSite</code> function will not appear in
+  Lean's <code>Hlc.compareWithSite</code>, because they were written by
+  different processes (human intuition vs. type-checked proof). When
+  fast-check generates a random input that makes the two implementations
+  disagree, it has found a genuine bug &mdash; and it will shrink that input
+  to the minimal reproducing case.
+</p>
+
+<p>
+  The differential testing system compares two independent implementations
+  of every CRDT operation:
+</p>
+
+<ol>
+  <li><strong>TypeScript</strong> &mdash; production code in <code>src/core/</code></li>
+  <li><strong>Lean 4</strong> &mdash; verified specification in <code>lean/CrdtBase/</code></li>
+</ol>
+
+<p>
+  Both receive the same randomly generated inputs. If their outputs ever
+  disagree, the test fails and fast-check shrinks the failing input to a
+  minimal reproduction.
+</p>
+
+<!-- ================================================================== -->
+<h2 id="testing-pyramid">4.2 &ensp; The Testing Pyramid</h2>
+
+<div class="diagram-container">
+  <pre class="mermaid">
+graph TB
+    L0["<b>Level 0: Lean Proofs</b><br/>28 theorems &bull; ALL inputs<br/>Absolute confidence"]
+    L1["<b>Level 1: Differential Random Testing</b><br/>TS vs Lean oracle &bull; 100K+ samples<br/>Very high confidence"]
+    L15["<b>Level 1.5: Invariant Enforcement</b><br/>Operational safety guards<br/>High confidence"]
+    L2["<b>Level 2: Property-Based Tests</b><br/>Round-trips, bloom filters &bull; 10K+ samples<br/>High confidence"]
+    L3["<b>Level 3: Model-Based Tests</b><br/>Engine vs Map model, convergence<br/>High (integration) confidence"]
+    L4["<b>Level 4: End-to-End Tests</b><br/>Filesystem + S3/MinIO<br/>Operational confidence"]
+
+    L0 --- L1
+    L1 --- L15
+    L15 --- L2
+    L2 --- L3
+    L3 --- L4
+
+    style L0 fill:#f5f0e8,stroke:#8b0000,stroke-width:3px,color:#1a1a1a
+    style L1 fill:#eef2e8,stroke:#2d6a30,stroke-width:2px,color:#1a1a1a
+    style L15 fill:#e8eef5,stroke:#4a7ab5,stroke-width:2px,color:#1a1a1a
+    style L2 fill:#e8eef5,stroke:#4a7ab5,stroke-width:2px,color:#1a1a1a
+    style L3 fill:#f5ece8,stroke:#c53030,stroke-width:2px,color:#1a1a1a
+    style L4 fill:#f5ece8,stroke:#c53030,stroke-width:2px,color:#1a1a1a
+  </pre>
+  <div class="caption">Figure 4.1 &mdash; The CRDTBase testing pyramid. Each level catches a different class of defects. Level 0 provides mathematical certainty; Level 4 exercises real I/O paths.</div>
+</div>
+
+<div class="definition">
+  <span class="box-title">Definition 4.1 &mdash; Test Levels</span>
+  <table>
+    <tr>
+      <th>Level</th>
+      <th>What</th>
+      <th>Confidence</th>
+      <th>Location</th>
+    </tr>
+    <tr>
+      <td>Level 0</td>
+      <td>Lean proofs (28 theorems)</td>
+      <td>Absolute (all inputs)</td>
+      <td><code>lean/CrdtBase/**/Props.lean</code></td>
+    </tr>
+    <tr>
+      <td>Level 1</td>
+      <td>Differential Random Testing (DRT)</td>
+      <td>Very high (100K+ samples)</td>
+      <td><code>test/drt/*.drt.test.ts</code></td>
+    </tr>
+    <tr>
+      <td>Level 1.5</td>
+      <td>Invariant enforcement</td>
+      <td>High</td>
+      <td><code>test/properties/invariants.prop.test.ts</code></td>
+    </tr>
+    <tr>
+      <td>Level 2</td>
+      <td>Property-based tests</td>
+      <td>High (10K+ samples)</td>
+      <td><code>test/properties/*.prop.test.ts</code></td>
+    </tr>
+    <tr>
+      <td>Level 3</td>
+      <td>Model-based tests (<code>fc.commands</code>)</td>
+      <td>High (integration)</td>
+      <td><code>test/model/*.model.test.ts</code></td>
+    </tr>
+    <tr>
+      <td>Level 4</td>
+      <td>E2E (filesystem + S3/MinIO)</td>
+      <td>Operational</td>
+      <td><code>test/e2e/*.e2e.test.ts</code></td>
+    </tr>
+  </table>
+</div>
+
+<div class="definition">
+  <span class="box-title">Definition 4.2 &mdash; What &ldquo;Passing&rdquo; Means</span>
+  <p>
+    <strong>Level 0:</strong> The <em>algorithm</em> is mathematically correct for ALL inputs (up to Lean's kernel).
+  </p>
+  <p>
+    <strong>Level 1:</strong> The TypeScript <em>implementation matches</em> the verified algorithm for 100K+ random inputs. Bugs are in implementation, not algorithm.
+  </p>
+  <p>
+    <strong>Level 2:</strong> System <em>invariants hold</em> (round-trips, ordering, bloom correctness) for 10K+ random inputs.
+  </p>
+  <p>
+    <strong>Level 3:</strong> The <em>integrated system behaves</em> like a simple model under arbitrary command sequences.
+  </p>
+  <p>
+    <strong>Level 4:</strong> Real I/O paths (filesystem, S3) function correctly under controlled conditions.
+  </p>
+  <p>A release requires all five levels to pass.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="drt-harness">4.3 &ensp; The DRT Harness</h2>
+
+<h3>Building the Lean Oracle</h3>
+
+<p>
+  The Lean project resides at <code>lean/</code>. The lake configuration
+  (<code>lean/lakefile.toml</code>) defines two build targets:
+</p>
+
+<span class="file-ref">lean/lakefile.toml:18&ndash;23</span>
+<pre><code>[[lean_lib]]
+name = "CrdtBase"
+
+[[lean_exe]]
+name = "CrdtBaseDRT"
+root = "CrdtBase.DiffTest.Main"</code></pre>
+
+<p>
+  <code>CrdtBase</code> is the library containing all CRDT definitions, proofs,
+  SQL semantics, and replication definitions. Building it type-checks all 28
+  theorems. <code>CrdtBaseDRT</code> is a standalone executable whose entry
+  point is <code>lean/CrdtBase/DiffTest/Main.lean</code> &mdash; the test oracle.
+</p>
+
+<p>The build commands:</p>
+
+<pre><code># Build both proof library and DRT executable
+cd lean && lake build CrdtBase CrdtBaseDRT
+
+# Or via npm:
+npm run lean:build</code></pre>
+
+<p>
+  The resulting binary lands at <code>lean/.lake/build/bin/CrdtBaseDRT</code>.
+  If any Lean proof contains <code>sorry</code>, the build fails.
+</p>
+
+<h3>The LeanDrtClient</h3>
+
+<p>
+  The TypeScript harness at <code>test/drt/harness.ts</code> implements the IPC
+  client. It manages the lifecycle of a single long-running Lean process,
+  communicating via stdin/stdout JSON lines.
+</p>
+
+<div class="diagram-container">
+  <pre class="mermaid">
+sequenceDiagram
+    participant FC as fast-check
+    participant TS as TypeScript Test
+    participant H as LeanDrtClient
+    participant L as Lean CrdtBaseDRT
+
+    FC->>TS: Generate random (a, b)
+    TS->>TS: tsResult = mergeLww(a, b)
+    TS->>H: send({type: "lww_merge", a, b})
+    H->>L: JSON line on stdin
+    L->>L: handleLine → handleLwwMerge
+    L->>H: JSON line on stdout
+    H->>TS: Promise resolves with leanResult
+    TS->>TS: expect(tsResult).toEqual(leanResult.result)
+    TS->>FC: Pass / Fail (triggers shrink)
+  </pre>
+  <div class="caption">Figure 4.2 &mdash; Data flow of a single DRT test case. fast-check generates random inputs, both implementations process them, and the outputs are compared.</div>
+</div>
+
+<p><strong>Binary discovery</strong> first checks the <code>LEAN_DRT_BIN</code>
+  environment variable (set in CI), then falls back to the local build path:</p>
+
+<span class="file-ref">test/drt/harness.ts:34&ndash;41</span>
+<pre><code>static findBinary(): string | null {
+  const explicit = process.env.LEAN_DRT_BIN;
+  if (explicit && existsSync(explicit)) {
+    return explicit;
+  }
+  const fallback = 'lean/.lake/build/bin/CrdtBaseDRT';
+  return existsSync(fallback) ? fallback : null;
+}</code></pre>
+
+<p><strong>Process spawning</strong> creates a single Lean process per
+  <code>describe</code> block. The process's stdout is consumed by a readline
+  interface, and incoming lines are dispatched to a FIFO queue of pending
+  promises:</p>
+
+<span class="file-ref">test/drt/harness.ts:14&ndash;32</span>
+<pre><code>constructor(private readonly binPath: string) {
+  this.proc = spawn(this.binPath, [], {
+    stdio: ['pipe', 'pipe', 'inherit']
+  });
+  const rl = createInterface({ input: this.proc.stdout });
+  rl.on('line', (line) => {
+    const next = this.pending.shift();
+    if (next) {
+      next.resolve(line);
+    }
+  });
+  this.proc.on('error', (error) => {
+    const err = error instanceof Error
+      ? error : new Error(String(error));
+    this.flushError(err);
+  });
+  this.proc.on('exit', (code) => {
+    if (code !== 0) {
+      this.flushError(
+        new Error(`Lean DRT exited with code ${code}`)
+      );
+    }
+  });
+}</code></pre>
+
+<p><strong>Request/response protocol:</strong> Each call to <code>send</code> writes
+  a JSON line to the Lean process's stdin and pushes a promise onto the pending
+  queue. When the Lean process writes a response line, the readline handler
+  shifts the next pending promise and resolves it:</p>
+
+<span class="file-ref">test/drt/harness.ts:43&ndash;62</span>
+<pre><code>async send&lt;T&gt;(payload: unknown): Promise&lt;T&gt; {
+  return new Promise((resolve, reject) => {
+    this.pending.push({
+      resolve: (line) => {
+        try {
+          const parsed = JSON.parse(line) as T & { error?: string };
+          if (typeof parsed.error === 'string') {
+            reject(new Error(parsed.error));
+            return;
+          }
+          resolve(parsed);
+        } catch (error) {
+          reject(error instanceof Error
+            ? error : new Error(String(error)));
+        }
+      },
+      reject,
+    });
+    this.proc.stdin.write(`${JSON.stringify(payload)}\n`);
+  });
+}</code></pre>
+
+<div class="note">
+  <span class="box-title">Graceful Skip When Lean Is Unavailable</span>
+  <p>
+    Every DRT test file follows this pattern. If the Lean binary is not built,
+    all DRT tests are skipped without failure. This means the TypeScript test
+    suite can run at full speed during development without requiring Lean:
+  </p>
+  <span class="file-ref">test/drt/lww.drt.test.ts:8&ndash;9</span>
+<pre><code>const leanBin = LeanDrtClient.findBinary();
+const drt = leanBin ? test : test.skip;</code></pre>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="jsonl-protocol">4.4 &ensp; The JSONL Protocol</h2>
+
+<p>
+  The oracle is a long-running process that reads one JSON object per line from
+  stdin and writes one JSON object per line to stdout. This avoids the overhead
+  of spawning a new process per test case &mdash; critical when running 100K+
+  iterations.
+</p>
+
+<h3>Lean-Side Main Loop</h3>
+
+<span class="file-ref">lean/CrdtBase/DiffTest/Main.lean:892&ndash;909</span>
+<pre><code>partial def loop (stdin : IO.FS.Stream) : IO Unit := do
+  let line &larr; stdin.getLine
+  if line.isEmpty then
+    pure ()
+  else
+    let trimmed := line.trimAscii
+    if trimmed.isEmpty then
+      loop stdin
+    else
+      match handleLine trimmed.copy with
+      | Except.ok out => emitLine out
+      | Except.error err =>
+          emitLine &lt;| (Json.mkObj
+            [("error", toJson err)]).compress
+      loop stdin
+
+def main : IO Unit := do
+  let stdin &larr; IO.getStdin
+  loop stdin</code></pre>
+
+<h3>Command Dispatch</h3>
+
+<p>
+  The <code>handleLine</code> dispatcher routes on the <code>type</code>
+  field of each JSON object. It supports ten command types spanning four
+  categories:
+</p>
+
+<span class="file-ref">lean/CrdtBase/DiffTest/Main.lean:862&ndash;884</span>
+<pre><code>def handleLine (line : String) : Except String String := do
+  let json &larr; Json.parse line
+  let typ &larr; json.getObjValAs? String "type"
+  match typ with
+  | "lww_merge"              => handleLwwMerge cmd.a cmd.b
+  | "pn_merge"               => handlePnMerge cmd.a cmd.b
+  | "or_set_merge"           => handleOrSetMerge cmd.a cmd.b
+  | "mv_merge"               => handleMvMerge cmd.a cmd.b
+  | "sql_generate_ops"       => handleSqlGenerateOps json
+  | "sql_build_select_plan"  => handleSqlBuildSelectPlan json
+  | "sql_eval"               => handleSqlEval json
+  | "replication_list_sites" => handleReplicationListSites json
+  | "replication_get_head"   => handleReplicationGetHead json
+  | "replication_read_since" => handleReplicationReadSince json
+  | _                        => throw s!"unsupported command: {typ}"</code></pre>
+
+<h3>Wire Format</h3>
+
+<div class="definition">
+  <span class="box-title">Definition 4.3 &mdash; JSONL Wire Protocol</span>
+  <p><strong>Request format</strong> (TypeScript to Lean, one JSON object per line):</p>
+<pre><code>{"type": "lww_merge", "a": {...}, "b": {...}}
+{"type": "sql_eval", "statement": {...}, "context": {...}, "state": {...}}</code></pre>
+  <p><strong>Success response</strong> (Lean to TypeScript):</p>
+<pre><code>{"result": ...}</code></pre>
+  <p><strong>Error response</strong>:</p>
+<pre><code>{"error": "conflicting LWW event identity: same (hlc, site) with different payloads"}</code></pre>
+  <p>
+    The <code>send</code> method on the TypeScript side checks for the
+    <code>error</code> field and rejects the promise if present. This means
+    DRT tests can verify error-agreement: if TypeScript throws, Lean must
+    also return an error object.
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="generators">4.5 &ensp; Fast-Check Generators</h2>
+
+<p>
+  All random data is generated by
+  <a href="https://fast-check.dev/">fast-check</a> (version ^3.16.0) with the
+  <code>@fast-check/vitest</code> integration (version ^0.1.4). Test cases are
+  not manually written or exhaustively enumerated &mdash; they are randomly
+  sampled and automatically shrunk on failure.
+</p>
+
+<p>
+  The generator library lives at <code>test/properties/arbitraries.ts</code>.
+  Each generator produces values that satisfy the bounds required by the Lean
+  specification by construction:
+</p>
+
+<h3>Hybrid Logical Clock</h3>
+
+<p>
+  The Lean <code>Hlc</code> structure carries proof obligations that
+  \(\mathit{wallMs} < 2^{48}\) and \(\mathit{counter} < 2^{16}\).
+  The generator produces values within these bounds:
+</p>
+
+<span class="file-ref">test/properties/arbitraries.ts:12&ndash;16</span>
+<pre><code>export const arbHlc = (): fc.Arbitrary&lt;Hlc&gt; =>
+  fc.record({
+    wallMs: fc.nat({ max: HLC_LIMITS.wallMsMax - 1 }),
+    counter: fc.nat({ max: HLC_LIMITS.counterMax - 1 }),
+  });</code></pre>
+
+<h3>Site ID</h3>
+
+<span class="file-ref">test/properties/arbitraries.ts:18&ndash;19</span>
+<pre><code>export const arbSiteId = (): fc.Arbitrary&lt;string&gt; =>
+  fc.hexaString({ minLength: 8, maxLength: 8 });</code></pre>
+
+<h3>LWW Register</h3>
+
+<span class="file-ref">test/properties/arbitraries.ts:29&ndash;34</span>
+<pre><code>export const arbLwwState = (): fc.Arbitrary&lt;LwwRegister&lt;...&gt;&gt; =>
+  fc.record({
+    val: arbScalar(),
+    hlc: arbHlc(),
+    site: arbSiteId(),
+  });</code></pre>
+
+<h3>PN-Counter</h3>
+
+<p>
+  Uses <code>fc.dictionary</code> to generate per-site count maps, then
+  normalizes to strip zero entries:
+</p>
+
+<span class="file-ref">test/properties/arbitraries.ts:42&ndash;48</span>
+<pre><code>export const arbPnCounter = (): fc.Arbitrary&lt;PnCounter&gt; =>
+  fc.record({
+    inc: fc.dictionary(arbSiteId(), fc.nat({ max: 1_000_000 })),
+    dec: fc.dictionary(arbSiteId(), fc.nat({ max: 1_000_000 })),
+  }).map(normalizePnCounter);</code></pre>
+
+<h3>OR-Set</h3>
+
+<p>
+  Elements are unique by tag key <code>(addHlc, addSite)</code>,
+  with separate tombstone arrays:
+</p>
+
+<span class="file-ref">test/properties/arbitraries.ts:62&ndash;74</span>
+<pre><code>export const arbOrSetState = (): fc.Arbitrary&lt;OrSet&lt;...&gt;&gt; =>
+  fc.record({
+    elements: fc.uniqueArray(arbOrSetElement(), {
+      maxLength: 40,
+      selector: (element) => tagKey(element.tag),
+    }),
+    tombstones: fc.uniqueArray(arbOrSetTag(), {
+      maxLength: 40,
+      selector: tagKey,
+    }),
+  }).map(canonicalizeOrSet);</code></pre>
+
+<h3>MV-Register</h3>
+
+<span class="file-ref">test/properties/arbitraries.ts:83&ndash;92</span>
+<pre><code>export const arbMvRegister = (): fc.Arbitrary&lt;MvRegister&lt;...&gt;&gt; =>
+  fc.record({
+    values: fc.uniqueArray(arbMvValue(), {
+      maxLength: 40,
+      selector: mvEventKey,
+    }),
+  }).map(canonicalizeMvRegister);</code></pre>
+
+<div class="note">
+  <span class="box-title">SQL Generators</span>
+  <p>
+    SQL test case generators are more involved and live in separate files.
+    There are three generator files that produce structured SQL inputs:
+  </p>
+  <ul>
+    <li><code>test/properties/sql.generators.ts</code> &mdash; generates
+      <code>GeneratedWriteOpsCase</code> with <code>sql</code>, <code>schema</code>,
+      <code>site</code>, <code>hlcSequence</code>, <code>removeTags</code>,
+      and <code>expectedOps</code>.</li>
+    <li><code>test/properties/sql-eval.generators.ts</code> &mdash; generates
+      <code>GeneratedSqlEvalCase</code> with full CRDT column states and
+      evaluation context.</li>
+    <li>The SELECT planner generator produces
+      <code>GeneratedSelectPlanCase</code> with partition routing
+      information.</li>
+  </ul>
+  <p>
+    All SQL generators produce syntactically valid SQL strings by construction
+    &mdash; they build the string from structured components, not by randomly
+    concatenating tokens.
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="crdt-drt">4.6 &ensp; CRDT Merge DRT (Level 1)</h2>
+
+<div class="diagram-container">
+  <pre class="mermaid">
+flowchart LR
+    subgraph Generation
+        FC["fast-check<br/>arbitraries"]
+    end
+
+    subgraph TypeScript
+        TS["mergeLww(a, b)<br/>mergePnCounter(a, b)<br/>mergeOrSet(a, b)<br/>mergeMvRegister(a, b)"]
+    end
+
+    subgraph "Lean Oracle (stdin/stdout)"
+        JSON["JSON line<br/>{type, a, b}"]
+        LEAN["handleLwwMerge<br/>handlePnMerge<br/>handleOrSetMerge<br/>handleMvMerge"]
+        RESP["{result: ...}"]
+    end
+
+    subgraph Comparison
+        CMP["expect(tsResult)<br/>.toEqual(leanResult)"]
+    end
+
+    FC -->|"random (a, b)"| TS
+    FC -->|"random (a, b)"| JSON
+    JSON --> LEAN
+    LEAN --> RESP
+    TS -->|tsResult| CMP
+    RESP -->|leanResult| CMP
+
+    style FC fill:#e8eef5,stroke:#4a7ab5,color:#1a1a1a
+    style TS fill:#eef2e8,stroke:#2d6a30,color:#1a1a1a
+    style LEAN fill:#f5f0e8,stroke:#8b0000,color:#1a1a1a
+    style CMP fill:#f5ece8,stroke:#c53030,color:#1a1a1a
+  </pre>
+  <div class="caption">Figure 4.3 &mdash; DRT pipeline: fast-check generates random inputs, feeds them to both TypeScript and the Lean executable, and compares outputs.</div>
+</div>
+
+<h3>LWW Merge</h3>
+
+<p>
+  The simplest DRT test generates two random LWW register states and
+  compares the merge results. A precondition filters out conflicting events
+  (same <code>(hlc, site)</code> but different payloads), which are tested
+  separately in the invariant enforcement suite:
+</p>
+
+<span class="file-ref">test/drt/lww.drt.test.ts:26&ndash;37</span>
+<pre><code>drt
+  .prop([arbLwwState(), arbLwwState()], { numRuns: drtRuns })
+  ('merge matches Lean oracle', async (a, b) => {
+    fc.pre(!isConflictingLwwEvent(a, b));
+    const tsResult = mergeLww(a, b);
+    const leanResult = await client!.send&lt;{
+      result: typeof tsResult
+    }&gt;({
+      type: 'lww_merge',
+      a,
+      b,
+    });
+    expect(tsResult).toEqual(leanResult.result);
+  }, drtTimeoutMs);</code></pre>
+
+<h3>PN-Counter Merge</h3>
+
+<p>
+  The PN-Counter DRT requires wire format conversion because TypeScript uses
+  <code>Record&lt;string, number&gt;</code> while Lean uses
+  <code>List {site, n}</code>:
+</p>
+
+<span class="file-ref">test/drt/compaction.drt.test.ts:32&ndash;42</span>
+<pre><code>function toPnWire(counter: PnCounter): PnWire {
+  const encode = (entries: Record&lt;string, number&gt;):
+    PnWireEntry[] =>
+    Object.entries(entries)
+      .filter(([, n]) => n !== 0)
+      .sort(([left], [right]) => compareKeys(left, right))
+      .map(([site, n]) => ({ site, n }));
+  return {
+    inc: encode(counter.inc),
+    dec: encode(counter.dec),
+  };
+}</code></pre>
+
+<h3>OR-Set and MV-Register Merge</h3>
+
+<p>
+  These follow the same pattern as LWW with their own precondition filters
+  (<code>hasConflictingOrSetEvents</code> and
+  <code>hasConflictingMvEvents</code>). Lean merges elements by union,
+  deduplicates by tag key, filters tombstoned elements, and sorts by
+  canonical key.
+</p>
+
+<!-- ================================================================== -->
+<h2 id="compaction-drt">4.7 &ensp; Compaction Split Law DRT</h2>
+
+<p>
+  The compaction DRT test is the most sophisticated differential test. For each
+  CRDT type, it verifies the <em>split law</em>: for any list of states and any
+  split point \(k\), folding the full list equals folding the prefix
+  \([0, k)\) then folding the suffix \([k, n)\) on top. Formally:
+</p>
+
+\[
+  \bigoplus_{i=0}^{n-1} s_i
+  \;=\;
+  \left(\bigoplus_{i=0}^{k-1} s_i\right)
+  \oplus
+  \left(\bigoplus_{i=k}^{n-1} s_i\right)
+\]
+
+<p>
+  This must hold in <em>both</em> TypeScript and Lean, and the direct fold in
+  TypeScript must equal the direct fold in Lean.
+</p>
+
+<span class="file-ref">test/drt/compaction.drt.test.ts:120&ndash;122</span>
+<pre><code>function splitPoints(length: number): number[] {
+  return Array.from(
+    { length: length + 1 },
+    (_, index) => index,
+  );
+}</code></pre>
+
+<p>
+  For a list of length \(n\), this generates \(n + 1\) split points (including
+  the empty prefix and empty suffix). With 25 random inputs per CRDT type and
+  a maximum list length of 12, this produces up to
+  \(25 \times 13 \times 2 = 650\) Lean oracle calls per CRDT type.
+</p>
+
+<span class="file-ref">test/drt/compaction.drt.test.ts:137&ndash;161</span>
+<pre><code>drt
+  .prop(
+    [fc.array(arbLwwState(), { maxLength: 12 })],
+    { numRuns: drtRuns },
+  )
+  ('LWW: every prefix/suffix split matches direct fold and Lean',
+    async (states) => {
+      fc.pre(
+        !hasConflictingLwwList(states, isConflictingLwwEvent)
+      );
+      const directTs = foldTs(states, mergeLww);
+      const directLean = await foldLean(states, mergeLean);
+      expect(directTs).toEqual(directLean);
+
+      for (const splitIndex of splitPoints(states.length)) {
+        const splitTs = applyCompactionSplitTs(
+          states, splitIndex, mergeLww
+        );
+        const splitLean = await applyCompactionSplitLean(
+          states, splitIndex, mergeLean
+        );
+        expect(splitTs).toEqual(directTs);
+        expect(splitLean).toEqual(directLean);
+      }
+    }, drtTimeoutMs);</code></pre>
+
+<p>This test exercises three properties simultaneously:</p>
+
+<ol>
+  <li><code>directTs == directLean</code> &mdash; basic DRT agreement</li>
+  <li><code>splitTs == directTs</code> &mdash; TypeScript compaction correctness</li>
+  <li><code>splitLean == directLean</code> &mdash; Lean compaction correctness</li>
+</ol>
+
+<p>
+  The same test is repeated for all four CRDT types: LWW, PN-Counter,
+  OR-Set, and MV-Register.
+</p>
+
+<!-- ================================================================== -->
+<h2 id="sql-drt">4.8 &ensp; SQL Differential Testing</h2>
+
+<p>
+  SQL differential testing is the bridge between CRDTBase's SQL layer and its
+  verified Lean specification. The key design decision is that
+  <strong>SQL text is parsed once in TypeScript</strong>, and the resulting
+  AST is shared with both implementations. This means:
+</p>
+
+<ul>
+  <li>The TypeScript parser is tested separately at Level 2 (parse/print/parse round-trips)</li>
+  <li>DRT tests verify <em>semantic correctness</em>: given the same AST,
+    do both implementations produce the same CRDT operations, query plans,
+    and evaluation results?</li>
+</ul>
+
+<h3>SQL Write Op Generation</h3>
+
+<span class="file-ref">test/drt/sql-generate-ops.drt.test.ts:47&ndash;83</span>
+<pre><code>drt
+  .prop([arbGeneratedWriteOpsCase], { numRuns: drtRuns })
+  ('Lean sql_generate_ops matches TypeScript generateCrdtOps',
+    async (input) => {
+      const parsed = parseSql(input.sql);
+      fc.pre(
+        parsed.kind !== 'select' &&
+        parsed.kind !== 'create_table' &&
+        parsed.kind !== 'drop_table',
+      );
+
+      let hlcIndex = 0;
+      const tsOps = generateCrdtOps(statement, {
+        schema: input.schema,
+        site: input.site,
+        nextHlc: () => {
+          const value = input.hlcSequence[hlcIndex]!;
+          hlcIndex += 1;
+          return value;
+        },
+        resolveSetRemoveTags: () => input.removeTags ?? [],
+      });
+
+      const lean = await client!.sqlGenerateOps&lt;{
+        result: typeof tsOps
+      }&gt;(statement, {
+        schema: toLeanSchema(input.schema),
+        site: input.site,
+        hlcSequence: input.hlcSequence,
+        removeTags: input.removeTags ?? null,
+      });
+
+      // Triple differential comparison
+      expect(tsOps).toEqual(input.expectedOps);
+      expect(lean.result).toEqual(input.expectedOps);
+      expect(lean.result).toEqual(tsOps);
+    }, drtTimeoutMs);</code></pre>
+
+<div class="note">
+  <span class="box-title">Triple Differential Test</span>
+  <p>
+    The SQL write op test is actually a <em>triple</em> differential test:
+    the generator pre-computes <code>expectedOps</code> using its own model,
+    and the test verifies that TypeScript, Lean, and the generator model all
+    agree. This catches bugs in the generator itself.
+  </p>
+</div>
+
+<h3>SQL Full Evaluation</h3>
+
+<p>
+  The most complex DRT test generates random SQL statements (any type:
+  SELECT, INSERT, UPDATE, DELETE, INC, DEC, ADD, REMOVE), random initial
+  database state with full CRDT column states, and random evaluation context.
+  It then compares the complete evaluation outcome including the next state:
+</p>
+
+<span class="file-ref">test/drt/sql-eval.drt.test.ts:303&ndash;357</span>
+<pre><code>drt
+  .prop(
+    [arbSqlEvalCase],
+    drtSeed === undefined
+      ? { numRuns: drtRuns }
+      : { numRuns: drtRuns, seed: drtSeed },
+  )
+  ('Lean sql_eval matches TypeScript evaluateSqlAst',
+    async (input) => {
+      const parsed = parseSql(input.sql);
+
+      let ts: SqlEvalOutcome | null = null;
+      let tsError: string | null = null;
+      try {
+        ts = evaluateSqlAst(parsed, {
+          state: input.state,
+          context: input.context,
+        });
+      } catch (error) {
+        tsError = error instanceof Error
+          ? error.message : String(error);
+      }
+
+      // Error agreement: if TS throws, Lean must also throw
+      if (tsError) {
+        await expect(
+          client!.sqlEval&lt;{ result: LeanEvalOutcome }&gt;(
+            parsed,
+            { ... },
+            toLeanState(input.state),
+          ),
+        ).rejects.toThrow();
+        return;
+      }
+
+      const lean = await client!.sqlEval&lt;{
+        result: LeanEvalOutcome
+      }&gt;(parsed, { ... }, toLeanState(input.state));
+
+      const normalizedLean =
+        normalizeJsonObject(normalizeOutcome(leanOutcome));
+      const normalizedTs =
+        normalizeJsonObject(normalizeOutcome(ts!));
+      expect(normalizedLean).toEqual(normalizedTs);
+    }, drtTimeoutMs);</code></pre>
+
+<div class="note">
+  <span class="box-title">Seed Replay</span>
+  <p>
+    When a DRT failure is found, the failing fast-check seed can be replayed
+    for debugging:
+  </p>
+<pre><code>DRT_NUM_RUNS=200 DRT_SEED=-1196022201 \
+  npx vitest run test/drt/sql-eval.drt.test.ts</code></pre>
+  <p>
+    The <code>DRT_SEED</code> environment variable is read at
+    <code>sql-eval.drt.test.ts:22</code> and passed to fast-check's
+    configuration. This enables deterministic reproduction of any failure,
+    even across machines.
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="replication-drt">4.9 &ensp; Replication Log DRT</h2>
+
+<p>
+  The replication log DRT tests verify that the S3-backed replication
+  implementation matches Lean's pure functional model for three operations:
+  <code>listSites</code>, <code>getHead</code>, and <code>readSince</code>.
+</p>
+
+<p>
+  The test uses an <code>InMemoryS3ReaderClient</code> that simulates S3
+  pagination in-process. The page size is itself randomized (1 to 4 items
+  per page), exercising pagination edge cases:
+</p>
+
+<span class="file-ref">test/drt/replication-log-endpoints.drt.test.ts:144&ndash;184</span>
+<pre><code>drt
+  .prop([
+    fc.array(arbEntry, {
+      minLength: 0,
+      maxLength: 80,
+    }),
+    fc.constantFrom(
+      'site-a', 'site-b', 'site-c', 'site-missing'
+    ),
+    fc.nat({ max: 30 }),
+    fc.integer({ min: 1, max: 4 }),
+  ], { numRuns: drtRuns })
+  ('listSites/getHead/readSince match Lean model',
+    async (generated, querySite, since, pageSize) => {
+      const seededEntries = materializeSeedEntries(generated);
+      const s3Client =
+        new InMemoryS3ReaderClient(pageSize);
+      // ... seed entries into mock S3 ...
+
+      const log = new S3ReplicatedLog({
+        bucket: 'test-bucket',
+        prefix: 'deltas',
+        client: s3Client,
+      });
+
+      const expectedSites =
+        await client!.replicationListSites&lt;{
+          result: string[]
+        }&gt;(leanEntries);
+      const expectedHead =
+        await client!.replicationGetHead&lt;{
+          result: number
+        }&gt;(leanEntries, querySite);
+      const expectedReadSince =
+        await client!.replicationReadSince&lt;{
+          result: number[]
+        }&gt;(leanEntries, querySite, since);
+
+      await expect(log.listSites())
+        .resolves.toEqual(expectedSites.result);
+      await expect(log.getHead(querySite))
+        .resolves.toBe(expectedHead.result);
+      await expect(
+        log.readSince(querySite, since)
+          .then((e) => e.map((x) => x.seq)),
+      ).resolves.toEqual(expectedReadSince.result);
+    }, drtTimeoutMs);</code></pre>
+
+<!-- ================================================================== -->
+<h2 id="level-2">4.10 &ensp; Property-Based Tests (Level 2)</h2>
+
+<p>
+  Level 2 tests cover properties that are not in Lean because they involve
+  I/O, encoding, or system integration, but are still expressed as universal
+  properties over random inputs:
+</p>
+
+<h3>Encoding Round-Trips</h3>
+
+<p>
+  For every serialization format (deltas, segments, manifests), the property
+  \(\text{decode}(\text{encode}(x)) = x\) must hold for all valid inputs:
+</p>
+
+<pre><code>test.prop([arbDeltaFile])(
+  'encode then decode is identity for delta files',
+  (delta) => {
+    const bytes = encodeDelta(delta);
+    const decoded = decodeDelta(bytes);
+    expect(decoded).toEqual(delta);
+  }
+);</code></pre>
+
+<h3>SQL Parser Round-Trips</h3>
+
+<p>
+  The parser and printer must be inverses. For every SQL statement type,
+  the property \(\text{parse}(\text{print}(\text{ast})) = \text{ast}\)
+  is verified:
+</p>
+
+<pre><code>test.prop([arbSelectStmt])(
+  'parse(print(ast)) = ast for SELECT statements',
+  (stmt) => {
+    const sql = printSelect(stmt);
+    const parsed = parseSelect(sql);
+    expect(parsed).toEqual(stmt);
+  }
+);</code></pre>
+
+<h3>Bloom Filter Properties</h3>
+
+<p>Two properties are tested for the bloom filter implementation:</p>
+
+<ol>
+  <li><strong>No false negatives:</strong> Every inserted key must test positive.</li>
+  <li><strong>Bounded false positive rate:</strong> For sufficiently large probe sets, the false positive rate must be below 2%.</li>
+</ol>
+
+<pre><code>test.prop([
+  fc.array(fc.string(), { minLength: 100, maxLength: 1000 }),
+  fc.array(fc.string(), { minLength: 100, maxLength: 1000 }),
+])(
+  'bloom filter false positive rate is below 2%',
+  (inserted, probes) => {
+    const bloom = buildBloomFilter(inserted);
+    const insertedSet = new Set(inserted);
+    const falsePositives = probes.filter(
+      p => !insertedSet.has(p) && bloom.test(p)
+    );
+    const nonMembers = probes.filter(
+      p => !insertedSet.has(p)
+    );
+    if (nonMembers.length > 50) {
+      expect(
+        falsePositives.length / nonMembers.length
+      ).toBeLessThan(0.02);
+    }
+  }
+);</code></pre>
+
+<h3>Invariant Enforcement (Level 1.5)</h3>
+
+<p>
+  Between Level 1 and Level 2 sit the invariant enforcement tests. These
+  verify operational safety properties that are assumed by the Lean model
+  but enforced in the TypeScript runtime:
+</p>
+
+<span class="file-ref">test/properties/invariants.prop.test.ts:13&ndash;21</span>
+<pre><code>test.prop([
+  arbHlc(),
+  arbSiteId(),
+  fc.tuple(arbScalar(), arbScalar()),
+])('merge rejects conflicting payloads for same (hlc, site)',
+  (hlc, site, [leftVal, rightVal]) => {
+    fc.pre(!Object.is(leftVal, rightVal));
+    const a = { val: leftVal, hlc, site };
+    const b = { val: rightVal, hlc, site };
+    expect(() => mergeLww(a, b))
+      .toThrow(/conflicting LWW event identity/);
+  },
+);</code></pre>
+
+<p>The same pattern is repeated for OR-Set tag conflicts, MV-Register
+  event conflicts, PN-Counter invalid amounts, and HLC monotonicity
+  fence violations.</p>
+
+<!-- ================================================================== -->
+<h2 id="level-3">4.11 &ensp; Model-Based Tests (Level 3)</h2>
+
+<p>
+  Level 3 uses fast-check's <code>fc.commands()</code> API to define a
+  simplified model and a set of commands. fast-check generates arbitrary
+  command sequences, runs them against both the model and the real engine,
+  and checks they always agree. When a failing sequence is found, fast-check
+  <strong>shrinks</strong> it to the minimal reproduction.
+</p>
+
+<h3>Engine vs. Simple Map Model</h3>
+
+<p>
+  The &ldquo;model&rdquo; is just a
+  <code>Map&lt;string, Map&lt;string, Record&lt;string, any&gt;&gt;&gt;</code>
+  (table name to primary key to column values). Commands include
+  <code>InsertCommand</code>, <code>UpdateCommand</code>,
+  <code>DeleteCommand</code>, and <code>SelectCommand</code>. Each command
+  applies the operation to both the model and the real engine, then verifies
+  they agree:
+</p>
+
+<pre><code>test('engine matches simple model under arbitrary commands',
+  async () => {
+    await fc.assert(
+      fc.asyncProperty(
+        fc.commands([
+          arbInsertCommand(),
+          arbUpdateCommand(),
+          arbDeleteCommand(),
+          arbSelectCommand(),
+        ]),
+        async (cmds) => {
+          const model: Model = new Map();
+          const engine = await createTestEngine();
+          await engine.exec(
+            'CREATE TABLE t (' +
+            'id PRIMARY KEY, ' +
+            'name LWW&lt;STRING&gt;, ' +
+            'count COUNTER)'
+          );
+          await fc.asyncModelRun(
+            () => ({ model, real: engine }), cmds
+          );
+        }
+      ),
+      { numRuns: 500 }
+    );
+  });</code></pre>
+
+<h3>Multi-Site Convergence Simulation</h3>
+
+<p>
+  The most important model-based test: simulate multiple sites, each
+  performing random operations, syncing in random order, and verifying
+  convergence. After all sites perform a full sync, their materialized
+  states must be identical:
+</p>
+
+<pre><code>test.prop([
+  fc.array(arbSiteAction, {
+    minLength: 10,
+    maxLength: 200,
+  }),
+])('all sites converge after full sync',
+  async (actions) => {
+    const sites = [
+      createTestEngine(),
+      createTestEngine(),
+      createTestEngine(),
+    ];
+    const log = new MemoryReplicatedLog();
+
+    // Execute random actions (writes, pushes, pulls)
+    for (const action of actions) {
+      const site = sites[action.siteIndex % sites.length];
+      switch (action.action) {
+        case 'write': /* ... */ break;
+        case 'sync_push': await site.syncPush(log); break;
+        case 'sync_pull': await site.syncPull(log); break;
+      }
+    }
+
+    // Full sync: push all, pull all, pull again
+    for (const site of sites) await site.syncPush(log);
+    for (const site of sites) await site.syncPull(log);
+    for (const site of sites) await site.syncPull(log);
+
+    // All sites must have identical materialized state
+    const states = await Promise.all(
+      sites.map(s => s.query('SELECT * FROM t'))
+    );
+    expect(states[0]).toEqual(states[1]);
+    expect(states[1]).toEqual(states[2]);
+  }
+);</code></pre>
+
+<!-- ================================================================== -->
+<h2 id="level-4">4.12 &ensp; End-to-End Tests (Level 4)</h2>
+
+<p>
+  Level 4 exercises real persistence and transport paths. Two E2E test suites
+  validate operational correctness:
+</p>
+
+<h3>E2E A: Three-Client Filesystem Replication</h3>
+
+<p>
+  <strong>File:</strong> <code>test/e2e/three-clients.e2e.test.ts</code>
+</p>
+
+<p>Three independent clients execute SQL and converge through a file-backed
+  HTTP replicated log. The test validates:</p>
+
+<ol>
+  <li>Clients persist local <code>schema.bin</code>, <code>state.bin</code>,
+    <code>pending.bin</code>, and <code>sync.bin</code>.</li>
+  <li>Server persists replicated delta entries as MessagePack <code>.bin</code> files.</li>
+  <li>The CLI <code>dump</code> command can decode generated <code>.bin</code> files.</li>
+  <li>After full sync, all three clients see identical materialized state.</li>
+</ol>
+
+<p>Expected converged row after the test sequence:</p>
+
+<table>
+  <tr><th>Column</th><th>CRDT Type</th><th>Expected Value</th></tr>
+  <tr><td><code>title</code></td><td>LWW</td><td><code>'from-c'</code></td></tr>
+  <tr><td><code>points</code></td><td>Counter</td><td><code>8</code></td></tr>
+  <tr><td><code>tags</code></td><td>Set</td><td><code>{'beta', 'gamma'}</code></td></tr>
+  <tr><td><code>status</code></td><td>Register</td><td><code>{'open', 'review'}</code></td></tr>
+</table>
+
+<h3>E2E B: S3/MinIO Replication</h3>
+
+<p>
+  <strong>File:</strong> <code>test/e2e/s3-minio.e2e.test.ts</code>
+</p>
+
+<p>Clients replicate through <code>S3ReplicatedLog</code> using direct S3
+  credentials against a local MinIO instance. Objects are written to
+  <code>deltas/&lt;site&gt;/&lt;seq&gt;.delta.bin</code>. Downloaded S3
+  objects can be inspected with <code>node cli.mjs dump</code>.</p>
+
+<!-- ================================================================== -->
+<h2 id="ci">4.13 &ensp; CI Pipeline</h2>
+
+<div class="diagram-container">
+  <pre class="mermaid">
+flowchart TD
+    A["<b>Checkout</b><br/>actions/checkout@v4"] --> B["<b>Setup Node.js 22</b><br/>actions/setup-node@v4"]
+    B --> C["<b>npm ci</b><br/>Install dependencies"]
+    C --> D["<b>Build Lean Proofs + DRT Oracle</b><br/>leanprover/lean-action@v1<br/>build-args: CrdtBase CrdtBaseDRT<br/>use-github-cache: true<br/>use-mathlib-cache: true"]
+    D --> E["<b>Verify Oracle Binary</b><br/>test -x lean/.lake/build/bin/CrdtBaseDRT"]
+    E --> F["<b>Resolve Chromium</b><br/>for Playwright-core tests"]
+    F --> G["<b>Run TypeScript Test Suite</b><br/>LEAN_DRT_BIN=lean/.lake/build/bin/CrdtBaseDRT<br/>npm test"]
+
+    G --> H{"All Levels Pass?"}
+    H -->|Yes| I["Pipeline green"]
+    H -->|No| J["Pipeline red"]
+
+    style D fill:#f5f0e8,stroke:#8b0000,stroke-width:2px,color:#1a1a1a
+    style G fill:#eef2e8,stroke:#2d6a30,stroke-width:2px,color:#1a1a1a
+    style I fill:#eef2e8,stroke:#2d6a30,stroke-width:2px,color:#1a1a1a
+    style J fill:#f5ece8,stroke:#c53030,stroke-width:2px,color:#1a1a1a
+  </pre>
+  <div class="caption">Figure 4.4 &mdash; CI pipeline. A single job on <code>ubuntu-latest</code> with a 120-minute timeout builds both the Lean proofs and the TypeScript test suite.</div>
+</div>
+
+<p>
+  The CI configuration lives at <code>.github/workflows/ci.yml</code>. It
+  runs on pull requests to <code>main</code>, pushes to <code>main</code>,
+  and manual dispatch:
+</p>
+
+<span class="file-ref">.github/workflows/ci.yml:37&ndash;47</span>
+<pre><code>- name: Build Lean proofs and DRT oracle
+  uses: leanprover/lean-action@v1
+  with:
+    auto-config: false
+    build: true
+    build-args: CrdtBase CrdtBaseDRT
+    test: false
+    lint: false
+    lake-package-directory: lean
+    use-github-cache: true
+    use-mathlib-cache: true</code></pre>
+
+<p>
+  This single step builds both the proof library and the DRT executable. If
+  any Lean proof contains <code>sorry</code>, the build fails. The Mathlib
+  cache avoids rebuilding the dependency on every run.
+</p>
+
+<span class="file-ref">.github/workflows/ci.yml:69&ndash;72</span>
+<pre><code>- name: Run TypeScript test suite
+  env:
+    LEAN_DRT_BIN: lean/.lake/build/bin/CrdtBaseDRT
+  run: npm test</code></pre>
+
+<p>
+  <code>npm test</code> expands to <code>vitest run</code>, which executes
+  ALL test files including DRT. The <code>LEAN_DRT_BIN</code> environment
+  variable points the harness to the freshly built oracle binary.
+</p>
+
+<!-- ================================================================== -->
+<h2 id="edge-cases">4.14 &ensp; Edge Cases and Normalization</h2>
+
+<h3>Event Consistency Invariant</h3>
+
+<p>
+  The LWW CRDT has a critical invariant: if two states share the same
+  \((\mathit{hlc}, \mathit{site})\) pair, they MUST have the same payload.
+  This invariant is required for the commutativity and associativity proofs in
+  Lean. DRT tests use <code>fc.pre()</code> to filter out conflicting events,
+  while separate invariant tests verify rejection:
+</p>
+
+<pre><code>// DRT filters conflicts out:
+fc.pre(!isConflictingLwwEvent(a, b));
+
+// Invariant test verifies rejection:
+expect(() => mergeLww(a, b))
+  .toThrow(/conflicting LWW event identity/);</code></pre>
+
+<p>The Lean oracle validates the same invariant:</p>
+
+<span class="file-ref">lean/CrdtBase/DiffTest/Main.lean:296&ndash;298</span>
+<pre><code>def assertLwwConsistent (a b : LwwJson) :
+    Except String Unit := do
+  if (a.hlc == b.hlc) && (a.site == b.site)
+      && a.val != b.val then
+    throw "conflicting LWW event identity: \
+      same (hlc, site) with different payloads"</code></pre>
+
+<h3>HLC Bounds Validation</h3>
+
+<p>
+  The Lean <code>Hlc</code> structure carries proof obligations. The DRT oracle
+  validates these bounds when converting from JSON:
+</p>
+
+<span class="file-ref">lean/CrdtBase/DiffTest/Main.lean:242&ndash;245</span>
+<pre><code>def toHlc (h : HlcJson) : Except String Hlc := do
+  match Hlc.mk? h.wallMs h.counter with
+  | some hlc => pure hlc
+  | none => throw s!"invalid HLC bounds: \
+      {h.wallMs} {h.counter}"</code></pre>
+
+<p>The TypeScript arbitrary generates within bounds by construction, so this
+  validation never triggers during normal DRT runs but provides defense in
+  depth.</p>
+
+<h3>SQL Eval Normalization</h3>
+
+<p>
+  The SQL eval DRT has approximately 150 lines of normalization code
+  (<code>sql-eval.drt.test.ts:62&ndash;206</code>) to handle non-deterministic
+  output differences:
+</p>
+
+<ul>
+  <li><strong>JSON object key ordering</strong> &mdash; sorted lexicographically</li>
+  <li><strong>PN-Counter representation</strong> &mdash; <code>Record&lt;string, number&gt;</code> in TypeScript vs. <code>List {site, n}</code> in Lean</li>
+  <li><strong>OR-Set element and tombstone ordering</strong> &mdash; sorted by <code>(hlc, site, val)</code> triple</li>
+  <li><strong>MV-Register value ordering</strong> &mdash; sorted by <code>(hlc, site, val)</code> triple</li>
+  <li><strong>HLC hex canonicalization</strong> &mdash; e.g., <code>0x00ff</code> vs. <code>0xff</code></li>
+  <li><strong>Read result row ordering</strong> &mdash; sorted by JSON stringification</li>
+</ul>
+
+<p>
+  This normalization is applied symmetrically to both TypeScript and Lean
+  outputs before comparison, ensuring that surface-level representation
+  differences do not cause spurious failures.
+</p>
+
+<!-- ================================================================== -->
+<h2 id="commands">4.15 &ensp; Command Reference</h2>
+
+<h3>Build Commands</h3>
+
+<pre><code># Build Lean proof library and DRT oracle
+cd lean && lake build CrdtBase CrdtBaseDRT
+
+# Or via npm:
+npm run lean:build</code></pre>
+
+<h3>Run Commands</h3>
+
+<pre><code># Quick local DRT run (50 iterations per property)
+npx vitest run test/drt/*.drt.test.ts
+
+# Higher confidence (1000 iterations, longer timeout)
+DRT_NUM_RUNS=1000 DRT_TIMEOUT_MS=120000 \
+  npx vitest run test/drt/*.drt.test.ts
+
+# Replay a specific failing seed
+DRT_NUM_RUNS=200 DRT_SEED=-1196022201 \
+  npx vitest run test/drt/sql-eval.drt.test.ts
+
+# Run only CRDT property tests (Level 2)
+npx vitest run test/properties/*.prop.test.ts
+
+# Run filesystem e2e only (Level 4)
+npx vitest run test/e2e/three-clients.e2e.test.ts
+
+# Run S3/MinIO e2e only (Level 4)
+npx vitest run test/e2e/s3-minio.e2e.test.ts
+
+# Full build + all tests
+npm run test:all
+
+# Coverage run with tuned parameters
+npm run test:coverage</code></pre>
+
+<h3>Environment Variables</h3>
+
+<table>
+  <tr>
+    <th>Variable</th>
+    <th>Default</th>
+    <th>Purpose</th>
+  </tr>
+  <tr>
+    <td><code>LEAN_DRT_BIN</code></td>
+    <td><code>lean/.lake/build/bin/CrdtBaseDRT</code></td>
+    <td>Path to the Lean oracle binary</td>
+  </tr>
+  <tr>
+    <td><code>DRT_NUM_RUNS</code></td>
+    <td>50 (basic), 25 (compaction)</td>
+    <td>Iterations per property</td>
+  </tr>
+  <tr>
+    <td><code>DRT_TIMEOUT_MS</code></td>
+    <td>30000 (basic), 45000 (compaction)</td>
+    <td>Per-property timeout in milliseconds</td>
+  </tr>
+  <tr>
+    <td><code>DRT_SEED</code></td>
+    <td>undefined</td>
+    <td>Replay a specific fast-check seed</td>
+  </tr>
+</table>
+
+<h3>File Layout</h3>
+
+<pre><code>test/drt/
+  harness.ts                            # IPC client: spawns Lean, manages JSON protocol
+  lww.drt.test.ts                       # DRT: LWW merge
+  pnCounter.drt.test.ts                 # DRT: PN-Counter merge
+  orSet.drt.test.ts                     # DRT: OR-Set merge
+  mvRegister.drt.test.ts                # DRT: MV-Register merge
+  compaction.drt.test.ts                # DRT: compaction split law (all 4 types)
+  sql-generate-ops.drt.test.ts          # DRT: SQL write &rarr; CRDT ops generation
+  sql-planner.drt.test.ts               # DRT: SQL SELECT &rarr; query plan
+  sql-eval.drt.test.ts                  # DRT: full SQL AST evaluation with state
+  replication-log-endpoints.drt.test.ts # DRT: S3 log listSites/getHead/readSince</code></pre>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch03-lean-proofs.html">Chapter 3: Lean Proofs</a>
+  <span>Chapter 4</span>
+  <a class="next" href="ch05-data-model.html">Chapter 5: Data Model &amp; Correctness</a>
+</nav>
+
+</body>
+</html>

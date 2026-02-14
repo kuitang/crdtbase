@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CRDTBase: A Literate Program</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="title-page">
+  <h1>CRDTBase</h1>
+  <div class="subtitle">A Verified CRDT Database with Pluggable Replication<br>
+    A Literate Program &amp; Architecture Review</div>
+  <div class="authors">
+    Specification &amp; Design: Claude (Opus) &middot; Implementation: Codex<br>
+    Review &amp; Annotation: Claude (Opus)
+  </div>
+  <div class="date">February 2026</div>
+</div>
+
+<hr>
+
+<div class="toc">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="ch01-architecture.html"><strong>Architecture Overview</strong></a>
+      <br><em>System decomposition, data flow, and the key design decisions that make a CRDT database work on top of S3-compatible object storage.</em>
+    </li>
+    <li><a href="ch02-crdts.html"><strong>CRDT Implementation</strong></a>
+      <br><em>LWW Registers, PN-Counters, OR-Sets, and MV-Registers in TypeScript &mdash; the merge functions that guarantee convergence.</em>
+    </li>
+    <li><a href="ch03-lean-proofs.html"><strong>Lean Proofs</strong></a>
+      <br><em>Formal verification of CRDT semilattice properties in Lean 4. How the proofs work, elegant examples, and what they guarantee.</em>
+    </li>
+    <li><a href="ch04-differential-testing.html"><strong>Differential Testing</strong></a>
+      <br><em>The Lean oracle, fast-check generators, and the pipeline that checks 100K+ random inputs to ensure TypeScript matches the verified spec.</em>
+    </li>
+    <li><a href="ch05-data-model.html"><strong>Data Model &amp; Correctness</strong></a>
+      <br><em>Tables, rows, columns, HLC timestamps, and the SQL dialect. How CRDT semantics compose into a queryable database and whether the model holds up.</em>
+    </li>
+    <li><a href="ch06-compaction.html"><strong>Compaction</strong></a>
+      <br><em>Reducing unbounded delta accumulation into bounded segment files, and why the CAS-on-manifest design makes this safe.</em>
+    </li>
+    <li><a href="ch07-e2e-flow.html"><strong>End-to-End: Three Clients Across the Globe</strong></a>
+      <br><em>A concrete walkthrough of concurrent writes from IAD, LHR, and NRT, tracing how Tigris geo-replication and CRDT merges achieve convergence.</em>
+    </li>
+  </ol>
+</div>
+
+<div class="note">
+  <span class="box-title">About This Document</span>
+  <p>
+    This is a <em>literate program</em>: a narrative explanation of CRDTBase interwoven with the actual source code, formal proofs, and architecture diagrams.
+    It serves simultaneously as documentation, architecture review, and technical reference.
+  </p>
+  <p>
+    Code references use the format <code>path/to/file.ts:42</code> indicating full file path and line number.
+    Diagrams are rendered with Mermaid.js; mathematical notation with MathJax.
+    All fonts are serif for prose, monospace only for literal code.
+  </p>
+</div>
+
+<nav class="chapter-nav">
+  <span></span>
+  <a href="ch01-architecture.html" class="next">Chapter 1: Architecture Overview</a>
+</nav>
+
+</body>
+</html>

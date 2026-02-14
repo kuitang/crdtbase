@@ -1,0 +1,1225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 3: Lean Proofs &mdash; CRDTBase</title>
+  <link rel="stylesheet" href="style.css">
+
+  <!-- MathJax configuration -->
+  <script>
+    window.MathJax = {
+      tex: {
+        inlineMath: [['\\(', '\\)']],
+        displayMath: [['\\[', '\\]']],
+        macros: {
+          N: '\\mathbb{N}',
+          Prop: '\\mathrm{Prop}',
+          merge: '\\operatorname{merge}',
+          pack: '\\operatorname{pack}',
+          compareWithSite: '\\operatorname{compareWithSite}',
+          foldl: '\\operatorname{foldl}',
+          applyOps: '\\operatorname{applyOps}'
+        }
+      }
+    };
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+
+  <!-- Mermaid -->
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({startOnLoad:true, theme:'neutral'});
+  </script>
+</head>
+<body>
+
+<nav class="chapter-nav">
+  <a href="ch02-crdts.html" class="prev">Chapter 2: CRDT Implementation</a>
+  <span>Chapter 3</span>
+  <a href="ch04-differential-testing.html" class="next">Chapter 4: Differential Testing</a>
+</nav>
+
+<h1>
+  <span class="chapter-num">Chapter Three</span>
+  Lean Proofs
+</h1>
+
+<div class="toc">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#why-verify">Why Formal Verification for CRDTs</a></li>
+    <li><a href="#architecture">Proof Architecture: Defs.lean / Props.lean</a></li>
+    <li><a href="#hlc-ordering">HLC Ordering Proofs</a></li>
+    <li><a href="#lww-semilattice">LWW Semilattice Proofs</a></li>
+    <li><a href="#event-consistency">The Event-Consistency Invariant</a></li>
+    <li><a href="#pn-counter">PN-Counter Proofs</a></li>
+    <li><a href="#or-set">OR-Set Proofs</a></li>
+    <li><a href="#elegant-proofs">Three Elegant Proofs</a></li>
+    <li><a href="#table-composition">Table Composition Proofs</a></li>
+    <li><a href="#verification-tiers">Verification Tiers and Coverage</a></li>
+    <li><a href="#proven-vs-sorry">What Is Proven vs. What Uses <code>sorry</code></a></li>
+  </ol>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<h2 id="why-verify">3.1 &ensp; Why Formal Verification for CRDTs</h2>
+
+<p>
+  In 2017, Martin Kleppmann surveyed the CRDT literature and found a
+  disconcerting pattern: several published proofs of CRDT convergence contained
+  errors. The commutativity arguments were often hand-waved; the
+  associativity cases in comparison-based merges were routinely elided with
+  phrases like &ldquo;the remaining cases are symmetric.&rdquo; But they were not
+  always symmetric&mdash;especially when tie-breaking enters the picture.
+</p>
+
+<p>
+  CRDTBase takes the position that if your entire system rests on three
+  algebraic properties&mdash;commutativity, associativity, and
+  idempotence of the merge function&mdash;those properties must not merely be
+  argued informally. They should be machine-checked. The <code>lean/</code>
+  subdirectory contains roughly 900 lines of Lean 4 proof text, spread across
+  12 <code>Props.lean</code> files, covering 60+ theorems. Every theorem
+  compiles without <code>sorry</code>.
+</p>
+
+<blockquote>
+  &ldquo;A CRDT whose merge is not a semilattice join is just a fancy data
+  corruption mechanism with extra steps.&rdquo;
+</blockquote>
+
+<p>
+  The verification targets a precise mathematical property: for each CRDT type,
+  the merge function forms a <em>join semilattice</em>, meaning it satisfies:
+</p>
+
+\[
+  \forall a, b.\; \merge(a, b) = \merge(b, a) \quad \text{(commutativity)}
+\]
+\[
+  \forall a, b, c.\; \merge(\merge(a, b), c) = \merge(a, \merge(b, c)) \quad \text{(associativity)}
+\]
+\[
+  \forall a.\; \merge(a, a) = a \quad \text{(idempotence)}
+\]
+
+<p>
+  From these three properties, a standard result (which CRDTBase also proves)
+  gives <em>convergence</em>: any two replicas that have received the same set
+  of operations&mdash;in any order&mdash;will arrive at the same state.
+</p>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<h2 id="architecture">3.2 &ensp; Proof Architecture: Defs.lean / Props.lean</h2>
+
+<p>
+  The Lean codebase follows a uniform two-file convention for each module.
+  <code>Defs.lean</code> contains type definitions, smart constructors, and
+  the merge function itself. <code>Props.lean</code> imports
+  <code>Defs.lean</code> and contains all theorems and lemmas about those
+  definitions. This is the Cedar-style separation: definitions are
+  computation; properties are proof.
+</p>
+
+<div class="diagram-container">
+  <pre class="mermaid">
+graph TD
+    ROOT["CrdtBase.lean<br/><em>root import</em>"]
+
+    subgraph Foundation
+      HD["Hlc/Defs.lean<br/>HLC type, pack, compareWithSite"]
+      HP["Hlc/Props.lean<br/>total order, monotonicity"]
+    end
+
+    subgraph CRDT Layer
+      LD["Lww/Defs.lean"]
+      LP["Lww/Props.lean"]
+      PD["PnCounter/Defs.lean"]
+      PP["PnCounter/Props.lean"]
+      OD["OrSet/Defs.lean"]
+      OP["OrSet/Props.lean"]
+      MD["MvRegister/Defs.lean"]
+      MP["MvRegister/Props.lean"]
+    end
+
+    subgraph Composition
+      TD2["Table/Defs.lean"]
+      TP["Table/Props.lean"]
+      CD["Convergence/Defs.lean"]
+      CP["Convergence/Props.lean"]
+    end
+
+    subgraph Applications
+      CompD["Compaction/Defs.lean"]
+      CompP["Compaction/Props.lean"]
+      TombD["Tombstone/Defs.lean"]
+      TombP["Tombstone/Props.lean"]
+      SD["Sql/Defs.lean"]
+      SP["Sql/Props.lean"]
+      RD["Replication/Defs.lean"]
+      RP["Replication/Props.lean"]
+    end
+
+    HD --> HP
+    HD --> LD
+    LD --> LP
+    HP --> LP
+    PD --> PP
+    OD --> OP
+    MD --> MP
+    LD --> TD2
+    PD --> TD2
+    OD --> TD2
+    MD --> TD2
+    TD2 --> TP
+    LP --> CP
+    PP --> CP
+    OP --> CP
+    MP --> CP
+    CD --> CP
+    LD --> CompD
+    PD --> CompD
+    OD --> CompD
+    MD --> CompD
+    CompD --> CompP
+    LD --> TombD
+    TombD --> TombP
+    HP --> TombP
+    SD --> SP
+    RD --> RP
+  </pre>
+  <div class="caption">Figure 3.1 &mdash; File dependency graph. Arrows point from
+    dependency to dependent. The layering is strict: HLC at the foundation,
+    individual CRDTs in the middle, convergence and table composition at top.</div>
+</div>
+
+<p>
+  The global option <code>set_option autoImplicit false</code> is set in every
+  file, following Cedar-style conventions: every type variable must be explicitly
+  declared. The project depends on <strong>Batteries</strong> (the Lean 4
+  community standard library) and <strong>Mathlib</strong> (for
+  <code>Finset</code>, <code>List.Perm</code>, and the <code>aesop</code>
+  tactic).
+</p>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<h2 id="hlc-ordering">3.3 &ensp; HLC Ordering Proofs</h2>
+
+<p>
+  The Hybrid Logical Clock is the foundation of all timestamp-based CRDTs
+  in the system. Its Lean model carries bounds as proof obligations directly
+  in the structure:
+</p>
+
+<div class="definition">
+  <span class="box-title">Definition 3.1 &mdash; Hlc</span>
+  <span class="file-ref">lean/CrdtBase/Hlc/Defs.lean:16&ndash;21</span>
+<pre><code>structure Hlc where
+  wallMs : Nat
+  counter : Nat
+  wallMs_lt : wallMs &lt; wallMsMax      -- wallMsMax = 2^48
+  counter_lt : counter &lt; counterMax   -- counterMax = 2^16
+  deriving Repr, DecidableEq</code></pre>
+  <p>
+    Every <code>Hlc</code> value is <em>by construction</em> within range.
+    You cannot create an out-of-bounds HLC without <code>sorry</code>.
+  </p>
+</div>
+
+<p>
+  <strong>Packing</strong> collapses the two fields into a single natural
+  number for efficient comparison:
+</p>
+
+<div class="definition">
+  <span class="box-title">Definition 3.2 &mdash; Hlc.pack</span>
+  <span class="file-ref">lean/CrdtBase/Hlc/Defs.lean:26&ndash;27</span>
+  \[
+    \pack(h) = h.\mathtt{wallMs} \times 2^{16} + h.\mathtt{counter}
+  \]
+<pre><code>def pack (h : Hlc) : Nat :=
+  h.wallMs * counterMax + h.counter</code></pre>
+</div>
+
+<p>
+  <strong>Extended comparison</strong> (<code>compareWithSite</code>) implements
+  lexicographic ordering over \((\pack, \mathtt{siteId})\), using named
+  decidable hypotheses that are available in the proof context when reasoning
+  about branches:
+</p>
+
+<div class="definition">
+  <span class="box-title">Definition 3.3 &mdash; compareWithSite</span>
+  <span class="file-ref">lean/CrdtBase/Hlc/Defs.lean:34&ndash;44</span>
+<pre><code>def compareWithSite (a b : Hlc &times; String) : Ordering :=
+  if _ : a.1.pack &lt; b.1.pack then .lt
+  else if _ : b.1.pack &lt; a.1.pack then .gt
+  else if _ : a.2 &lt; b.2 then .lt
+  else if _ : b.2 &lt; a.2 then .gt
+  else .eq</code></pre>
+</div>
+
+<p>
+  The HLC Props file proves 14 theorems establishing that
+  <code>compareWithSite</code> forms a strict total order. The key results
+  are:
+</p>
+
+<div class="theorem">
+  <span class="box-title">Theorem 3.1 &mdash; hlc_total_order</span>
+  <span class="file-ref">lean/CrdtBase/Hlc/Props.lean:84&ndash;86</span>
+  <p>Packed HLC values are totally ordered by \(&lt;\):</p>
+  \[
+    \forall a, b : \mathtt{Hlc}.\;
+      a.\pack &lt; b.\pack \;\lor\; a.\pack = b.\pack \;\lor\; b.\pack &lt; a.\pack
+  \]
+<pre><code>theorem hlc_total_order (a b : Hlc) :
+    a.pack &lt; b.pack &or; a.pack = b.pack &or; b.pack &lt; a.pack := by
+  exact Nat.lt_trichotomy a.pack b.pack</code></pre>
+</div>
+
+<div class="theorem">
+  <span class="box-title">Theorem 3.2 &mdash; hlc_pack_preserves_order</span>
+  <span class="file-ref">lean/CrdtBase/Hlc/Props.lean:89&ndash;105</span>
+  <p>A higher wall-clock component always yields a larger packed value:</p>
+  \[
+    \forall a, b : \mathtt{Hlc}.\;
+      a.\mathtt{wallMs} > b.\mathtt{wallMs} \implies a.\pack > b.\pack
+  \]
+<pre><code>theorem hlc_pack_preserves_order
+    (a b : Hlc) (hWall : a.wallMs &gt; b.wallMs) :
+    a.pack &gt; b.pack := by
+  have hPackUpper : b.pack &lt; (b.wallMs + 1) * counterMax := by
+    unfold Hlc.pack
+    have hAdd : b.wallMs * counterMax + b.counter
+               &lt; b.wallMs * counterMax + counterMax :=
+      Nat.add_lt_add_left b.counter_lt (b.wallMs * counterMax)
+    simpa [Nat.succ_eq_add_one, Nat.add_mul, Nat.one_mul] using hAdd
+  have hWallSucc : b.wallMs + 1 &le; a.wallMs := Nat.succ_le_of_lt hWall
+  have hMul : (b.wallMs + 1) * counterMax &le; a.wallMs * counterMax :=
+    Nat.mul_le_mul_right counterMax hWallSucc
+  have hLower : (b.wallMs + 1) * counterMax &le; a.pack := by
+    unfold Hlc.pack
+    exact Nat.le_trans hMul (Nat.le_add_right _ _)
+  exact Nat.lt_of_lt_of_le hPackUpper hLower</code></pre>
+</div>
+
+<p>
+  This proof is noteworthy because it exploits the bounded counter field.
+  The argument: \(b.\pack &lt; (b.\mathtt{wallMs}+1) \times 2^{16}\)
+  because the counter is bounded by \(2^{16}\), and
+  \((b.\mathtt{wallMs}+1) \times 2^{16} \le a.\pack\) because
+  \(a.\mathtt{wallMs} \ge b.\mathtt{wallMs}+1\). Chaining gives
+  \(b.\pack &lt; a.\pack\).
+</p>
+
+<p>
+  The antisymmetry and transitivity results for <code>compareWithSite</code>
+  use a private abstraction barrier. A <code>siteLexLt</code> predicate is
+  defined as the semantic meaning of lexicographic ordering, and three private
+  helper theorems bridge between the syntactic <code>if</code>-branch definition
+  and this predicate. This keeps public-facing theorems clean while
+  containing the branch reasoning in one place:
+</p>
+
+<div class="theorem">
+  <span class="box-title">Theorem 3.3 &mdash; compareWithSite_trans_lt</span>
+  <span class="file-ref">lean/CrdtBase/Hlc/Props.lean:260&ndash;268</span>
+  \[
+    \compareWithSite(a, b) = \mathtt{lt} \;\land\;
+    \compareWithSite(b, c) = \mathtt{lt} \;\implies\;
+    \compareWithSite(a, c) = \mathtt{lt}
+  \]
+<pre><code>theorem compareWithSite_trans_lt
+    {a b c : Hlc &times; String}
+    (hab : Hlc.compareWithSite a b = .lt)
+    (hbc : Hlc.compareWithSite b c = .lt) :
+    Hlc.compareWithSite a c = .lt := by
+  have habLt : siteLexLt a b := (compareWithSite_eq_lt_iff a b).1 hab
+  have hbcLt : siteLexLt b c := (compareWithSite_eq_lt_iff b c).1 hbc
+  have hacLt : siteLexLt a c := siteLexLt_trans habLt hbcLt
+  exact (compareWithSite_eq_lt_iff a c).2 hacLt</code></pre>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<h2 id="lww-semilattice">3.4 &ensp; LWW Semilattice Proofs</h2>
+
+<p>
+  The Last-Writer-Wins register is the most subtle CRDT to verify because its
+  merge function is conditional: it selects between two values based on a
+  comparison. Unlike set union or pointwise max, commutativity and
+  associativity are <em>not</em> automatic.
+</p>
+
+<div class="definition">
+  <span class="box-title">Definition 3.4 &mdash; LwwRegister and merge</span>
+  <span class="file-ref">lean/CrdtBase/Crdt/Lww/Defs.lean:8&ndash;18</span>
+<pre><code>structure LwwRegister (&alpha; : Type) where
+  val  : &alpha;
+  hlc  : Hlc
+  site : String
+  deriving Repr, DecidableEq
+
+def merge {&alpha; : Type} (a b : LwwRegister &alpha;) : LwwRegister &alpha; :=
+  if Hlc.compareWithSite (a.hlc, a.site) (b.hlc, b.site) = .lt
+  then b else a</code></pre>
+</div>
+
+<h3>Commutativity: A Three-Case Argument</h3>
+
+<div class="theorem">
+  <span class="box-title">Theorem 3.4 &mdash; lww_merge_comm_of_consistent</span>
+  <span class="file-ref">lean/CrdtBase/Crdt/Lww/Props.lean:30&ndash;48</span>
+  \[
+    \forall a, b : \text{LwwRegister}\;\alpha.\;
+    \text{LwwConsistentPair}(a,b) \implies
+    \merge(a, b) = \merge(b, a)
+  \]
+</div>
+
+<div class="proof">
+  <span class="box-title">Proof (step by step)</span>
+  <span class="file-ref">lean/CrdtBase/Crdt/Lww/Props.lean:30&ndash;48</span>
+<pre><code>theorem lww_merge_comm_of_consistent {&alpha; : Type} (a b : LwwRegister &alpha;)
+    (hCons : LwwConsistentPair a b)
+    : LwwRegister.merge a b = LwwRegister.merge b a := by
+  unfold LwwRegister.merge
+  cases hab : Hlc.compareWithSite (a.hlc, a.site) (b.hlc, b.site) with
+  | lt =&gt;
+      have hba : Hlc.compareWithSite (b.hlc, b.site) (a.hlc, a.site) = .gt :=
+        compareWithSite_swap_lt hab
+      simp [hba]
+  | eq =&gt;
+      have hEq : a = b := hCons hab
+      subst hEq
+      have hSelf : Hlc.compareWithSite (a.hlc, a.site) (a.hlc, a.site) = .eq :=
+        compareWithSite_self_eq (a.hlc, a.site)
+      simp [hSelf]
+  | gt =&gt;
+      have hba : Hlc.compareWithSite (b.hlc, b.site) (a.hlc, a.site) = .lt :=
+        compareWithSite_swap_gt hab
+      simp [hba]</code></pre>
+  <p>The proof proceeds by case analysis on the comparison result between
+    \(a\) and \(b\):</p>
+  <ol>
+    <li><strong>Case <code>lt</code>:</strong> \(\compareWithSite(a, b) = \mathtt{lt}\).
+      Then \(\merge(a, b) = b\). By antisymmetry (<code>compareWithSite_swap_lt</code>),
+      \(\compareWithSite(b, a) = \mathtt{gt}\), so
+      \(\merge(b, a) = b\) as well. Done.</li>
+    <li><strong>Case <code>eq</code>:</strong> \(\compareWithSite(a, b) = \mathtt{eq}\).
+      The event-consistency hypothesis \(\text{hCons}\) fires: if the keys
+      are equal, the entire registers must be identical. <code>subst</code>
+      eliminates \(b\), collapsing both sides to \(\merge(a, a)\), which
+      equals \(a\) by <code>compareWithSite_self_eq</code>.</li>
+    <li><strong>Case <code>gt</code>:</strong> Symmetric to <code>lt</code>,
+      using <code>compareWithSite_swap_gt</code>.</li>
+  </ol>
+</div>
+
+<div class="diagram-container">
+  <pre class="mermaid">
+graph TD
+    Start["compareWithSite(a, b)"]
+
+    Start -->|"= lt"| LT["merge(a,b) = b"]
+    Start -->|"= eq"| EQ["Event-consistency: a = b"]
+    Start -->|"= gt"| GT["merge(a,b) = a"]
+
+    LT --> LT2["swap_lt: compareWithSite(b,a) = gt"]
+    LT2 --> LT3["merge(b,a) = b &check;"]
+
+    EQ --> EQ2["subst: collapse a = b"]
+    EQ2 --> EQ3["self_eq: both sides = a &check;"]
+
+    GT --> GT2["swap_gt: compareWithSite(b,a) = lt"]
+    GT2 --> GT3["merge(b,a) = a &check;"]
+
+    style LT3 fill:#e8f5e9,stroke:#2d6a30
+    style EQ3 fill:#e8f5e9,stroke:#2d6a30
+    style GT3 fill:#e8f5e9,stroke:#2d6a30
+  </pre>
+  <div class="caption">Figure 3.2 &mdash; Proof structure for LWW commutativity.
+    Three cases, each resolved by an HLC ordering property plus event-consistency.</div>
+</div>
+
+<h3>Associativity: The 27-Way Case Split</h3>
+
+<div class="theorem">
+  <span class="box-title">Theorem 3.5 &mdash; lww_merge_assoc_of_consistent</span>
+  <span class="file-ref">lean/CrdtBase/Crdt/Lww/Props.lean:51&ndash;82</span>
+  \[
+    \forall a, b, c.\;
+    \text{LwwConsistentPair}(a, b) \;\land\; \text{LwwConsistentPair}(b, c) \implies
+    \merge(\merge(a, b), c) = \merge(a, \merge(b, c))
+  \]
+</div>
+
+<div class="proof">
+  <span class="box-title">Proof (structure)</span>
+  <span class="file-ref">lean/CrdtBase/Crdt/Lww/Props.lean:56&ndash;82</span>
+<pre><code>  unfold LwwRegister.merge
+  cases hab : Hlc.compareWithSite (a.hlc, a.site) (b.hlc, b.site) &lt;;&gt;
+    cases hbc : Hlc.compareWithSite (b.hlc, b.site) (c.hlc, c.site) &lt;;&gt;
+    cases hac : Hlc.compareWithSite (a.hlc, a.site) (c.hlc, c.site) &lt;;&gt;
+    simp [hab, hbc, hac]
+  -- 6 impossible cases remain:
+  &middot; have hacLt := compareWithSite_trans_lt hab hbc; simp [hac] at hacLt
+  &middot; have hacLt := compareWithSite_trans_lt hab hbc; simp [hac] at hacLt
+  &middot; have habEq : a = b := hAB hab; have hbcEq : b = c := hBC hbc
+    subst habEq; subst hbcEq
+    have hacEq := compareWithSite_self_eq (a.hlc, a.site); simp [hac] at hacEq
+  &middot; have habEq : a = b := hAB hab; subst habEq; simp [hac] at hbc
+  &middot; have hbcEq : b = c := hBC hbc; subst hbcEq; simp [hac] at hab
+  &middot; have hacGt := compareWithSite_trans_gt hab hbc; simp [hac] at hacGt</code></pre>
+  <p>The proof generates \(3 \times 3 \times 3 = 27\) subgoals by case-splitting
+    on all three pairwise comparisons \((a,b)\), \((b,c)\), and \((a,c)\).
+    After <code>simp</code> evaluates the <code>if</code> branches, 21 consistent
+    cases close immediately. The remaining 6 are <em>impossible</em>
+    combinations&mdash;they violate transitivity or event-consistency:</p>
+  <table>
+    <tr>
+      <th>\((a,b)\)</th><th>\((b,c)\)</th><th>\((a,c)\)</th><th>Contradiction</th>
+    </tr>
+    <tr><td>lt</td><td>lt</td><td>eq</td><td>Transitivity gives \(a &lt; c\), contradicts \(a = c\)</td></tr>
+    <tr><td>lt</td><td>lt</td><td>gt</td><td>Transitivity gives \(a &lt; c\), contradicts \(a &gt; c\)</td></tr>
+    <tr><td>eq</td><td>eq</td><td>lt</td><td>Consistency: \(a = b = c\), so \(a = c\); contradicts \(a &lt; c\)</td></tr>
+    <tr><td>eq</td><td>gt</td><td>lt</td><td>Consistency: \(a = b\); then \(b &gt; c\) and \(a &lt; c\) conflict</td></tr>
+    <tr><td>gt</td><td>eq</td><td>gt</td><td>Consistency: \(b = c\); then \(a &gt; b\) and \(a &gt; c\) should match, but case says otherwise</td></tr>
+    <tr><td>gt</td><td>gt</td><td>lt</td><td>Transitivity gives \(a &gt; c\), contradicts \(a &lt; c\)</td></tr>
+  </table>
+  <p>Each is discharged with a one-liner: derive a comparison result that
+    conflicts with the case hypothesis, producing <code>False</code>.</p>
+</div>
+
+<h3>Idempotence: The Trivial Case</h3>
+
+<div class="theorem">
+  <span class="box-title">Theorem 3.6 &mdash; lww_merge_idem</span>
+  <span class="file-ref">lean/CrdtBase/Crdt/Lww/Props.lean:85&ndash;89</span>
+  \[
+    \forall a : \text{LwwRegister}\;\alpha.\; \merge(a, a) = a
+  \]
+<pre><code>theorem lww_merge_idem {&alpha; : Type} (a : LwwRegister &alpha;)
+    : LwwRegister.merge a a = a := by
+  have hSelf : Hlc.compareWithSite (a.hlc, a.site) (a.hlc, a.site) = .eq :=
+    compareWithSite_self_eq (a.hlc, a.site)
+  unfold LwwRegister.merge
+  simp [hSelf]</code></pre>
+  <p>
+    Self-comparison always yields <code>.eq</code>, so the <code>if</code>
+    branch takes the <code>else</code> path and returns <code>a</code>
+    unchanged.  No consistency hypothesis needed&mdash;idempotence is
+    unconditional.
+  </p>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<h2 id="event-consistency">3.5 &ensp; The Event-Consistency Invariant</h2>
+
+<p>
+  LWW commutativity and associativity are <em>conditional</em>. They require
+  <code>LwwConsistentPair</code>:
+</p>
+
+<div class="definition">
+  <span class="box-title">Definition 3.5 &mdash; LwwConsistentPair</span>
+  <span class="file-ref">lean/CrdtBase/Crdt/Lww/Props.lean:11&ndash;12</span>
+  \[
+    \text{LwwConsistentPair}(a, b) \;:\equiv\;
+    \compareWithSite(a, b) = \mathtt{eq} \implies a = b
+  \]
+<pre><code>def LwwConsistentPair {&alpha; : Type} (a b : LwwRegister &alpha;) : Prop :=
+  Hlc.compareWithSite (a.hlc, a.site) (b.hlc, b.site) = Ordering.eq &rarr; a = b</code></pre>
+</div>
+
+<p>
+  This says: if two LWW registers share the same \((\text{hlc}, \text{site})\)
+  key, they must be <em>identical</em>&mdash;including payload. This is an
+  operational invariant: if each site assigns unique HLC timestamps to its
+  events, no two distinct payloads can share the same key. If the invariant
+  is violated (e.g., by cloned site IDs), the system provides no convergence
+  guarantee.
+</p>
+
+<div class="note">
+  <span class="box-title">Design Note</span>
+  <p>
+    Making event-consistency an explicit precondition rather than a hidden
+    assumption is a deliberate design choice. The proofs force callers to
+    provide evidence that the invariant holds, making the trust boundary
+    explicit. The &ldquo;globalized&rdquo; variants
+    (<code>lww_merge_comm_global_of_consistent</code>,
+    <code>lww_merge_assoc_global_of_consistent</code>) universally
+    quantify over all pairs, letting you discharge the obligation once
+    for the entire system:
+  </p>
+<pre><code>-- Lww/Props.lean:92-96
+theorem lww_merge_comm_global_of_consistent {&alpha; : Type}
+    (hCons : &forall; a b : LwwRegister &alpha;, LwwConsistentPair a b) :
+    &forall; a b : LwwRegister &alpha;, LwwRegister.merge a b = LwwRegister.merge b a := by
+  intro a b
+  simpa using lww_merge_comm_of_consistent a b (hCons a b)</code></pre>
+</div>
+
+<p>
+  Two supporting theorems make the invariant actionable at the application
+  level:
+</p>
+
+<div class="theorem">
+  <span class="box-title">Theorem 3.7 &mdash; lww_equal_key_implies_equal_payload</span>
+  <span class="file-ref">lean/CrdtBase/Crdt/Lww/Props.lean:15&ndash;19</span>
+  <p>Under event-consistency, equal keys imply equal values:</p>
+  \[
+    \text{LwwConsistentPair}(a, b) \;\land\;
+    \compareWithSite(a, b) = \mathtt{eq} \implies a.\mathtt{val} = b.\mathtt{val}
+  \]
+</div>
+
+<div class="theorem">
+  <span class="box-title">Theorem 3.8 &mdash; dedup_rejects_conflicting_same_key</span>
+  <span class="file-ref">lean/CrdtBase/Crdt/Lww/Props.lean:22&ndash;27</span>
+  <p>Conflicting payloads on the same key are incompatible with consistency:</p>
+  \[
+    \compareWithSite(a, b) = \mathtt{eq} \;\land\;
+    a.\mathtt{val} \ne b.\mathtt{val} \implies
+    \neg\,\text{LwwConsistentPair}(a, b)
+  \]
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<h2 id="pn-counter">3.6 &ensp; PN-Counter Proofs</h2>
+
+<p>
+  The PN-Counter is modeled as two functions \(\mathtt{String} \to \N\)
+  rather than as hash maps. This modeling choice is what makes the proofs
+  essentially trivial:
+</p>
+
+<div class="definition">
+  <span class="box-title">Definition 3.6 &mdash; PnCounter</span>
+  <span class="file-ref">lean/CrdtBase/Crdt/PnCounter/Defs.lean:6&ndash;8</span>
+<pre><code>structure PnCounter where
+  inc : String &rarr; Nat
+  dec : String &rarr; Nat</code></pre>
+  <p>
+    A custom <code>@[ext]</code> theorem enables the <code>ext</code> tactic to
+    decompose equality into pointwise equality at each site. Merge is pointwise
+    <code>max</code>:
+  </p>
+<pre><code>@[simp]
+def merge (a b : PnCounter) : PnCounter :=
+  { inc := fun site =&gt; max (a.inc site) (b.inc site)
+    dec := fun site =&gt; max (a.dec site) (b.dec site) }</code></pre>
+</div>
+
+<div class="theorem">
+  <span class="box-title">Theorem 3.9 &mdash; pn_counter_merge_comm</span>
+  <span class="file-ref">lean/CrdtBase/Crdt/PnCounter/Props.lean:8&ndash;10</span>
+  \[
+    \forall a, b : \text{PnCounter}.\; \merge(a, b) = \merge(b, a)
+  \]
+</div>
+
+<div class="proof">
+  <span class="box-title">Proof</span>
+<pre><code>theorem pn_counter_merge_comm (a b : PnCounter) :
+    PnCounter.merge a b = PnCounter.merge b a := by
+  ext site &lt;;&gt; simp [PnCounter.merge, Nat.max_comm]</code></pre>
+  <p><strong>Step 1.</strong> <code>ext site</code> invokes the custom
+    extensionality theorem, splitting the goal into two pointwise subgoals:
+    one for the <code>inc</code> map and one for the <code>dec</code> map.
+    Each has the form
+    \(\forall \mathtt{site}.\; \max(a.\mathtt{inc}(\mathtt{site}),\,b.\mathtt{inc}(\mathtt{site}))
+      = \max(b.\mathtt{inc}(\mathtt{site}),\,a.\mathtt{inc}(\mathtt{site}))\).</p>
+  <p><strong>Step 2.</strong> <code>&lt;;&gt;</code> applies the following tactic
+    to <em>both</em> subgoals simultaneously.</p>
+  <p><strong>Step 3.</strong> <code>simp [PnCounter.merge, Nat.max_comm]</code>
+    unfolds the merge definition and applies \(\max\) commutativity from
+    Batteries to close both goals.</p>
+</div>
+
+<div class="theorem">
+  <span class="box-title">Theorem 3.10 &mdash; pn_counter_merge_assoc</span>
+  <span class="file-ref">lean/CrdtBase/Crdt/PnCounter/Props.lean:13&ndash;15</span>
+  \[
+    \forall a, b, c : \text{PnCounter}.\;
+    \merge(\merge(a, b), c) = \merge(a, \merge(b, c))
+  \]
+<pre><code>theorem pn_counter_merge_assoc (a b c : PnCounter) :
+    PnCounter.merge (PnCounter.merge a b) c =
+      PnCounter.merge a (PnCounter.merge b c) := by
+  ext site &lt;;&gt; simp [PnCounter.merge, Nat.max_assoc]</code></pre>
+  <p>
+    The proof reduces pointwise max associativity to <code>Nat.max_assoc</code>.
+    The entire semilattice proof for PN-Counter is 6 lines of proof text.
+  </p>
+</div>
+
+<div class="theorem">
+  <span class="box-title">Theorem 3.11 &mdash; pn_counter_merge_idem</span>
+  <span class="file-ref">lean/CrdtBase/Crdt/PnCounter/Props.lean:18&ndash;20</span>
+  \[
+    \forall a : \text{PnCounter}.\; \merge(a, a) = a
+  \]
+<pre><code>theorem pn_counter_merge_idem (a : PnCounter) :
+    PnCounter.merge a a = a := by
+  ext site &lt;;&gt; simp [PnCounter.merge]</code></pre>
+  <p>Idempotence of \(\max\) is built into <code>simp</code>&mdash;no
+    additional lemma needed.</p>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<h2 id="or-set">3.7 &ensp; OR-Set Proofs</h2>
+
+<p>
+  The OR-Set uses <code>Finset</code> from Mathlib, which provides decidable
+  membership and set-algebraic lemmas. This is the main reason for the Mathlib
+  dependency.
+</p>
+
+<div class="definition">
+  <span class="box-title">Definition 3.7 &mdash; OrSet and canonicalization</span>
+  <span class="file-ref">lean/CrdtBase/Crdt/OrSet/Defs.lean:20&ndash;47</span>
+<pre><code>structure OrSet (&alpha; : Type) (Hlc : Type) where
+  elements   : Finset (OrSetElem &alpha; Hlc)
+  tombstones : Finset (OrSetTag Hlc)
+
+def OrSet.canonicalize (s : OrSet &alpha; Hlc) : OrSet &alpha; Hlc :=
+  { elements := s.elements.filter (fun e =&gt; e.tag &notin; s.tombstones)
+    tombstones := s.tombstones }
+
+def OrSet.merge (a b : OrSet &alpha; Hlc) : OrSet &alpha; Hlc :=
+  OrSet.canonicalize {
+    elements := a.elements &cup; b.elements
+    tombstones := a.tombstones &cup; b.tombstones }</code></pre>
+</div>
+
+<h3>Canonicalization Properties</h3>
+
+<div class="theorem">
+  <span class="box-title">Theorem 3.12 &mdash; or_set_canonicalize_idem</span>
+  <span class="file-ref">lean/CrdtBase/Crdt/OrSet/Props.lean:9&ndash;12</span>
+  \[
+    \forall a.\; \text{canonicalize}(\text{canonicalize}(a)) = \text{canonicalize}(a)
+  \]
+<pre><code>theorem or_set_canonicalize_idem (a : OrSet &alpha; Hlc) :
+    OrSet.canonicalize (OrSet.canonicalize a) = OrSet.canonicalize a := by
+  ext x &lt;;&gt; simp [OrSet.canonicalize]</code></pre>
+</div>
+
+<div class="theorem">
+  <span class="box-title">Theorem 3.13 &mdash; or_set_canonicalize_no_tombstoned_tags</span>
+  <span class="file-ref">lean/CrdtBase/Crdt/OrSet/Props.lean:15&ndash;19</span>
+  <p>After canonicalization, no element has a tombstoned tag:</p>
+  \[
+    \forall x \in \text{canonicalize}(a).\text{elements}.\;
+    x.\text{tag} \notin \text{canonicalize}(a).\text{tombstones}
+  \]
+<pre><code>theorem or_set_canonicalize_no_tombstoned_tags (a : OrSet &alpha; Hlc) :
+    &forall; x, x &isin; (OrSet.canonicalize a).elements &rarr;
+      x.tag &notin; (OrSet.canonicalize a).tombstones := by
+  intro x hx
+  exact (Finset.mem_filter.mp hx).2</code></pre>
+</div>
+
+<h3>Semilattice Properties</h3>
+
+<div class="theorem">
+  <span class="box-title">Theorem 3.14 &mdash; or_set_merge_comm</span>
+  <span class="file-ref">lean/CrdtBase/Crdt/OrSet/Props.lean:29&ndash;32</span>
+  \[
+    \forall a, b.\; \text{OrSet.merge}(a, b) = \text{OrSet.merge}(b, a)
+  \]
+<pre><code>theorem or_set_merge_comm (a b : OrSet &alpha; Hlc) :
+    OrSet.merge a b = OrSet.merge b a := by
+  ext x &lt;;&gt; simp [OrSet.merge, Finset.union_comm]</code></pre>
+</div>
+
+<div class="theorem">
+  <span class="box-title">Theorem 3.15 &mdash; or_set_merge_assoc</span>
+  <span class="file-ref">lean/CrdtBase/Crdt/OrSet/Props.lean:35&ndash;44</span>
+  \[
+    \forall a, b, c.\;
+    \text{OrSet.merge}(\text{OrSet.merge}(a, b), c) =
+    \text{OrSet.merge}(a, \text{OrSet.merge}(b, c))
+  \]
+<pre><code>theorem or_set_merge_assoc (a b c : OrSet &alpha; Hlc) :
+    OrSet.merge (OrSet.merge a b) c =
+      OrSet.merge a (OrSet.merge b c) := by
+  ext x
+  &middot; constructor &lt;;&gt; intro hx
+    &middot; simp [OrSet.merge, Finset.union_comm,
+           Finset.union_left_comm] at hx &vdash;
+      aesop
+    &middot; simp [OrSet.merge, Finset.union_comm,
+           Finset.union_left_comm] at hx &vdash;
+      aesop
+  &middot; simp [OrSet.merge, Finset.union_comm, Finset.union_left_comm]</code></pre>
+  <p>
+    The associativity proof is the most complex OR-Set proof. After
+    <code>simp</code> reduces the <code>Finset</code> membership goals using
+    union commutativity and left-commutativity, <code>aesop</code> closes the
+    remaining goals via automated search over the Finset membership lemmas.
+    This is the primary use of Mathlib&rsquo;s <code>aesop</code> tactic in
+    the entire codebase.
+  </p>
+</div>
+
+<div class="note">
+  <span class="box-title">Idempotence Precondition</span>
+  <p>
+    OR-Set idempotence (<code>or_set_merge_idem</code>) requires a
+    precondition: the input must already be canonicalized (no element has a
+    tombstoned tag). This is stated as <code>hClean : &forall; x &isin;
+    a.elements, x.tag &notin; a.tombstones</code>. After merge, the
+    canonicalization step always produces a clean state, so this precondition
+    is automatically satisfied in practice.
+  </p>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<h2 id="elegant-proofs">3.8 &ensp; Three Elegant Proofs</h2>
+
+<h3>1. The PN-Counter One-Liner Trio</h3>
+
+<p>
+  The PN-Counter semilattice proofs are the most elegant in the codebase.
+  Each consists of exactly one tactic invocation:
+</p>
+
+<div class="proof">
+  <span class="box-title">Complete PN-Counter Semilattice</span>
+  <span class="file-ref">lean/CrdtBase/Crdt/PnCounter/Props.lean:8&ndash;21</span>
+<pre><code>-- Commutativity:
+  ext site &lt;;&gt; simp [PnCounter.merge, Nat.max_comm]
+-- Associativity:
+  ext site &lt;;&gt; simp [PnCounter.merge, Nat.max_assoc]
+-- Idempotence:
+  ext site &lt;;&gt; simp [PnCounter.merge]</code></pre>
+  <p>
+    The elegance comes from the modeling choice. By representing the counter
+    as <code>String &rarr; Nat</code> (pure functions) instead of
+    <code>HashMap String Nat</code>, the <code>ext</code> tactic gives
+    pointwise reasoning for free. With <code>HashMap</code>, you would
+    need to reason about finite map equality, key enumeration, and
+    missing-key defaults. With pure functions, the proof reduces to the
+    corresponding property of <code>Nat.max</code> from Batteries.
+  </p>
+</div>
+
+<h3>2. Convergence via RightCommutative Construction</h3>
+
+<p>
+  This is the crown jewel&mdash;the abstract convergence theorem that says
+  &ldquo;if merge forms a semilattice, then fold over any permutation of the
+  same operations converges to the same state.&rdquo;
+</p>
+
+<div class="theorem">
+  <span class="box-title">Theorem 3.16 &mdash; convergence_of_comm_assoc</span>
+  <span class="file-ref">lean/CrdtBase/Convergence/Props.lean:28&ndash;42</span>
+  \[
+    \forall \mathtt{merge}.\;
+    (\forall a, b.\; \merge(a, b) = \merge(b, a)) \;\land\;
+    (\forall a, b, c.\; \merge(\merge(a, b), c) = \merge(a, \merge(b, c)))
+    \implies
+  \]
+  \[
+    \forall \mathtt{init}.\;
+    \mathtt{ops}_1 \sim_\text{perm} \mathtt{ops}_2 \implies
+    \applyOps(\merge, \mathtt{init}, \mathtt{ops}_1)
+    = \applyOps(\merge, \mathtt{init}, \mathtt{ops}_2)
+  \]
+</div>
+
+<div class="proof">
+  <span class="box-title">Proof</span>
+  <span class="file-ref">lean/CrdtBase/Convergence/Props.lean:28&ndash;42</span>
+<pre><code>theorem convergence_of_comm_assoc {&alpha; : Type}
+    (merge : &alpha; &rarr; &alpha; &rarr; &alpha;)
+    (hComm : &forall; a b : &alpha;, merge a b = merge b a)
+    (hAssoc : &forall; a b c : &alpha;, merge (merge a b) c = merge a (merge b c))
+    (init : &alpha;) {ops&sub1; ops&sub2; : List &alpha;}
+    (hPerm : List.Perm ops&sub1; ops&sub2;) :
+    applyOps merge init ops&sub1; = applyOps merge init ops&sub2; := by
+  letI : RightCommutative merge := &laquo;by
+    intro a b c
+    calc
+      merge (merge a b) c = merge a (merge b c) := hAssoc a b c
+      _ = merge a (merge c b) := by rw [hComm b c]
+      _ = merge (merge a c) b := (hAssoc a c b).symm
+    &raquo;
+  exact convergence_of_perm merge init hPerm</code></pre>
+  <p>The key insight: Mathlib already has <code>List.Perm.foldl_eq</code>,
+    which says <code>foldl</code> over a permutation gives the same result
+    <em>if</em> the step function is <code>RightCommutative</code> (i.e.,
+    \(f(f(a, b), c) = f(f(a, c), b)\)). The proof constructs a
+    <code>RightCommutative</code> instance from commutativity + associativity
+    via a three-step <code>calc</code> chain:</p>
+  \[
+    \merge(\merge(a, b), c)
+    \;=\; \merge(a, \merge(b, c))
+    \;=\; \merge(a, \merge(c, b))
+    \;=\; \merge(\merge(a, c), b)
+  \]
+  <p>Each step uses exactly one axiom. The <code>.symm</code> at the end
+    flips the direction of the associativity rewrite. The concrete per-CRDT
+    convergence theorems then become one-liners:</p>
+<pre><code>-- Convergence/Props.lean:126-130
+theorem convergence_pn_counter
+    (init : PnCounter) {ops&sub1; ops&sub2; : List PnCounter}
+    (hPerm : List.Perm ops&sub1; ops&sub2;) :
+    applyOps PnCounter.merge init ops&sub1; =
+      applyOps PnCounter.merge init ops&sub2; := by
+  simpa using convergence_of_perm PnCounter.merge init hPerm</code></pre>
+</div>
+
+<h3>3. LWW Associativity Under Event-Consistency</h3>
+
+<p>
+  This is the most technically demanding proof in the codebase. Where the
+  PN-Counter proof is one line, this proof requires a 27-way case split
+  and 6 individual contradiction arguments. It was discussed in detail in
+  Section 3.4 above (Theorem 3.5). The proof is elegant not because it is
+  short, but because its structure exactly mirrors the mathematical argument:
+  &ldquo;for any total order, max is associative; the only subtle cases are
+  ties, where event-consistency substitutes equality.&rdquo;
+</p>
+
+<p>
+  The <code>&lt;;&gt;</code> combinator means the case split and initial
+  <code>simp</code> are written once and applied to all 27 branches
+  simultaneously. Only the 6 survivors need individual attention, and each
+  is a one-liner.
+</p>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<h2 id="table-composition">3.9 &ensp; Table Composition Proofs</h2>
+
+<p>
+  A composite row carries one column of each CRDT type plus a visibility
+  flag:
+</p>
+
+<div class="definition">
+  <span class="box-title">Definition 3.8 &mdash; TableRowState</span>
+  <span class="file-ref">lean/CrdtBase/Crdt/Table/Defs.lean:11&ndash;16</span>
+<pre><code>structure TableRowState (&alpha; &beta; &gamma; Hlc : Type) where
+  alive       : LwwRegister Bool
+  lwwCol      : LwwRegister &alpha;
+  counterCol  : PnCounter
+  setCol      : OrSet &beta; Hlc
+  registerCol : MvRegister &gamma;</code></pre>
+</div>
+
+<p>
+  Whole-table state is <code>&kappa; &rarr; TableRowState ...</code> (a function
+  from keys to rows), and table merge is pointwise row merge. The composition
+  proofs use the <em>lifting</em> pattern: if each column&rsquo;s merge has a
+  property, the whole row inherits it.
+</p>
+
+<div class="theorem">
+  <span class="box-title">Theorem 3.17 &mdash; table_merge_comm_of_row_comm</span>
+  <span class="file-ref">lean/CrdtBase/Crdt/Table/Props.lean:13&ndash;18</span>
+  \[
+    (\forall x, y.\; \text{mergeRow}(x, y) = \text{mergeRow}(y, x))
+    \implies
+    \forall a, b.\; \text{mergeTable}(a, b) = \text{mergeTable}(b, a)
+  \]
+<pre><code>theorem table_merge_comm_of_row_comm
+    (hRowComm : &forall; x y : TableRowState &alpha; &beta; &gamma; Hlc,
+      mergeTableRow x y = mergeTableRow y x)
+    (a b : TableState &kappa; &alpha; &beta; &gamma; Hlc)
+    : mergeTable a b = mergeTable b a := by
+  funext key
+  exact hRowComm (a key) (b key)</code></pre>
+  <p>
+    The proof is a single <code>funext</code> followed by instantiation.
+    Associativity and idempotence follow the same pattern.
+  </p>
+</div>
+
+<p>
+  The operator commutativity theorems are particularly clean&mdash;each is
+  proved by <code>cases row; rfl</code>:
+</p>
+
+<div class="theorem">
+  <span class="box-title">Theorem 3.18 &mdash; Independent Column Operations Commute</span>
+  <span class="file-ref">lean/CrdtBase/Crdt/Table/Props.lean:70&ndash;99</span>
+<pre><code>-- Row-existence updates commute with counter updates
+theorem row_exists_counter_commute
+    (row : TableRowState &alpha; &beta; &gamma; Hlc)
+    (existsEvent : LwwRegister Bool) (counterDelta : PnCounter)
+    : applyCounterCell (applyRowExists row existsEvent) counterDelta =
+      applyRowExists (applyCounterCell row counterDelta) existsEvent := by
+  cases row; rfl
+
+-- Counter and MV-register updates commute
+theorem row_counter_register_commute
+    (row : TableRowState &alpha; &beta; &gamma; Hlc)
+    (counterDelta : PnCounter) (registerDelta : MvRegister &gamma;)
+    : applyRegisterCell (applyCounterCell row counterDelta) registerDelta =
+      applyCounterCell (applyRegisterCell row registerDelta) counterDelta := by
+  cases row; rfl</code></pre>
+  <p>
+    These proofs work because each <code>apply*Cell</code> function modifies
+    exactly one field of the row structure via <code>{ row with field := ... }</code>.
+    After <code>cases row</code> destructs the structure, both sides are
+    definitionally equal, and <code>rfl</code> closes the goal.
+  </p>
+</div>
+
+<div class="theorem">
+  <span class="box-title">Theorem 3.19 &mdash; modify_row_at_disjoint_commute</span>
+  <span class="file-ref">lean/CrdtBase/Crdt/Table/Props.lean:106&ndash;129</span>
+  <p>Updates at disjoint keys commute at the whole-table level:</p>
+  \[
+    k_1 \ne k_2 \implies
+    \text{modify}(\text{modify}(T, k_1, f), k_2, g) =
+    \text{modify}(\text{modify}(T, k_2, g), k_1, f)
+  \]
+<pre><code>theorem modify_row_at_disjoint_commute
+    (table : TableState &kappa; &alpha; &beta; &gamma; Hlc)
+    (k1 k2 : &kappa;) (hNe : k1 &ne; k2)
+    (f g : TableRowState &alpha; &beta; &gamma; Hlc &rarr; TableRowState &alpha; &beta; &gamma; Hlc)
+    : modifyRowAt (modifyRowAt table k1 f) k2 g =
+      modifyRowAt (modifyRowAt table k2 g) k1 f := by
+  funext current
+  by_cases hCurrentK1 : current = k1
+  &middot; have hCurrentNeK2 : current &ne; k2 := by
+      intro hCurrentK2; apply hNe
+      calc k1 = current := hCurrentK1.symm
+           _ = k2 := hCurrentK2
+    simp [modifyRowAt, hCurrentK1, hNe]
+  &middot; by_cases hCurrentK2 : current = k2
+    &middot; have hK2NeK1 : k2 &ne; k1 := by intro h; exact hNe h.symm
+      simp [modifyRowAt, hCurrentK2, hK2NeK1]
+    &middot; simp [modifyRowAt, hCurrentK1, hCurrentK2]</code></pre>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<h2 id="verification-tiers">3.10 &ensp; Verification Tiers and Coverage</h2>
+
+<div class="diagram-container">
+  <pre class="mermaid">
+graph BT
+    T1["<strong>Tier 1: CRDT Semilattice</strong><br/>12 core theorems<br/>LWW, PnCounter, OrSet, MvRegister<br/><em>comm, assoc, idem per type</em>"]
+
+    T2["<strong>Tier 2: HLC Ordering</strong><br/>14 theorems<br/>total order, transitivity, antisymmetry<br/>pack_preserves_order, monotonicity"]
+
+    T3["<strong>Tier 3: Convergence</strong><br/>7 theorems<br/>abstract + concrete per CRDT<br/>convergence_of_comm_assoc"]
+
+    T4["<strong>Tier 4: Compaction</strong><br/>7 theorems<br/>foldl splitting, per-CRDT instantiation<br/>compaction_preserves_state"]
+
+    T5["<strong>Tier 5: Domain Properties</strong><br/>Tombstone: 3 theorems<br/>Table: 9 theorems<br/>Replication: 2 theorems"]
+
+    T6["<strong>Tier 6: SQL Soundness</strong><br/>8 theorems<br/>type soundness, syncability<br/>planner correctness"]
+
+    T2 --> T1
+    T1 --> T3
+    T1 --> T4
+    T1 --> T5
+    T3 --> T5
+    T5 --> T6
+
+    style T1 fill:#f5f0e8,stroke:#8b0000,stroke-width:2px
+    style T2 fill:#e8eef5,stroke:#2c5282,stroke-width:2px
+    style T3 fill:#eef2e8,stroke:#2d6a30,stroke-width:2px
+    style T4 fill:#eef2e8,stroke:#2d6a30
+    style T5 fill:#f0ede6,stroke:#666
+    style T6 fill:#f0ede6,stroke:#666
+  </pre>
+  <div class="caption">Figure 3.3 &mdash; Verification tier diagram. Lower tiers
+    provide the foundations that higher tiers depend on. Tier 1 (CRDT semilattice)
+    and Tier 2 (HLC ordering) form the critical trust base.</div>
+</div>
+
+<h3>Complete Theorem Inventory</h3>
+
+<table>
+  <tr>
+    <th>Tier</th><th>Module</th><th>Theorems</th><th>Count</th>
+  </tr>
+  <tr>
+    <td rowspan="5">1: CRDT Semilattice</td>
+    <td>LWW</td>
+    <td><code>lww_merge_comm_of_consistent</code>, <code>lww_merge_assoc_of_consistent</code>, <code>lww_merge_idem</code></td>
+    <td>3</td>
+  </tr>
+  <tr>
+    <td>PN-Counter</td>
+    <td><code>pn_counter_merge_comm</code>, <code>pn_counter_merge_assoc</code>, <code>pn_counter_merge_idem</code></td>
+    <td>3</td>
+  </tr>
+  <tr>
+    <td>OR-Set</td>
+    <td><code>or_set_merge_comm</code>, <code>or_set_merge_assoc</code>, <code>or_set_merge_idem</code></td>
+    <td>3</td>
+  </tr>
+  <tr>
+    <td>MV-Register</td>
+    <td><code>mv_register_merge_comm</code>, <code>mv_register_merge_assoc</code>, <code>mv_register_merge_idem</code></td>
+    <td>3</td>
+  </tr>
+  <tr>
+    <td colspan="2"><em>Plus supporting lemmas:</em> <code>or_set_canonicalize_idem</code>, <code>lww_equal_key_implies_equal_payload</code>, etc.</td>
+    <td>7</td>
+  </tr>
+  <tr>
+    <td>2: HLC Ordering</td>
+    <td>Hlc/Props</td>
+    <td><code>hlc_total_order</code>, <code>hlc_pack_preserves_order</code>, <code>compareWithSite_trans_lt</code>, etc.</td>
+    <td>14+</td>
+  </tr>
+  <tr>
+    <td>3: Convergence</td>
+    <td>Convergence/Props</td>
+    <td><code>convergence_of_perm</code>, <code>convergence_of_comm_assoc</code>, <code>convergence_pn_counter</code>, etc.</td>
+    <td>7</td>
+  </tr>
+  <tr>
+    <td>4: Compaction</td>
+    <td>Compaction/Props</td>
+    <td><code>compaction_preserves_state</code>, <code>compaction_idempotent</code>, per-CRDT instantiations</td>
+    <td>7</td>
+  </tr>
+  <tr>
+    <td rowspan="3">5: Domain</td>
+    <td>Tombstone/Props</td>
+    <td><code>delete_wins_if_later</code>, <code>write_resurrects_if_later</code>, <code>tombstone_stable_without_new_writes</code></td>
+    <td>3</td>
+  </tr>
+  <tr>
+    <td>Table/Props</td>
+    <td><code>table_merge_comm_of_row_comm</code>, <code>modify_row_at_disjoint_commute</code>, visibility preservation, etc.</td>
+    <td>9</td>
+  </tr>
+  <tr>
+    <td>Replication/Props</td>
+    <td><code>readSince_mem_gt_since</code>, <code>mem_takeContiguousFrom_mem</code></td>
+    <td>2</td>
+  </tr>
+  <tr>
+    <td>6: SQL</td>
+    <td>Sql/Props</td>
+    <td><code>write_ops_type_sound</code>, <code>write_ops_syncable</code>, planner theorems</td>
+    <td>8</td>
+  </tr>
+</table>
+
+<h3>Tactic Palette</h3>
+
+<table>
+  <tr><th>Tactic</th><th>Usage Pattern</th></tr>
+  <tr>
+    <td><code>simp</code></td>
+    <td>Workhorse for definitional unfolding. Used with explicit lemma sets
+      (<code>simp [Hlc.recv, ...]</code>) to control unfolding depth.</td>
+  </tr>
+  <tr>
+    <td><code>ext</code></td>
+    <td>Extensionality for <code>PnCounter</code> (custom <code>@[ext]</code>),
+      <code>Finset</code>, and function-typed table states (<code>funext key</code>).</td>
+  </tr>
+  <tr>
+    <td><code>cases</code></td>
+    <td>Destructuring <code>Ordering</code> variants and structures.
+      The <code>&lt;;&gt;</code> combinator applies follow-up tactics to all branches.</td>
+  </tr>
+  <tr>
+    <td><code>aesop</code></td>
+    <td>Used in OR-Set associativity to close complex Finset membership goals.</td>
+  </tr>
+  <tr>
+    <td><code>subst</code></td>
+    <td>Key in LWW proofs: when event-consistency gives \(a = b\),
+      <code>subst</code> eliminates the variable entirely.</td>
+  </tr>
+  <tr>
+    <td><code>calc</code></td>
+    <td>Multi-step equalities, especially in the convergence bridge proof
+      and <code>hlc_recv_monotonic</code>.</td>
+  </tr>
+  <tr>
+    <td><code>funext</code></td>
+    <td>For table-level proofs where equality of functions requires pointwise reasoning.</td>
+  </tr>
+  <tr>
+    <td><code>congrArg</code></td>
+    <td>Extracts field equalities from structure equalities
+      (e.g., <code>congrArg Hlc.wallMs hEq</code>).</td>
+  </tr>
+</table>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<h2 id="proven-vs-sorry">3.11 &ensp; What Is Proven vs. What Uses <code>sorry</code></h2>
+
+<div class="assessment">
+  <span class="box-title">Clean Bill of Health</span>
+  <p>
+    A search for <code>sorry</code> across all files under
+    <code>lean/CrdtBase/</code> returns <strong>zero matches</strong>. Every
+    theorem in the proof suite compiles without axiom holes. The only
+    <code>sorry</code> occurrences in the repository are in third-party
+    dependencies (<code>.lake/packages/</code>), which are Mathlib and
+    Batteries test files&mdash;not part of the CRDTBase proof.
+  </p>
+</div>
+
+<p>
+  That said, the verification has clear <em>scope boundaries</em>&mdash;things
+  that are outside the proof&rsquo;s jurisdiction:
+</p>
+
+<div class="warning">
+  <span class="box-title">Verification Gaps (Not <code>sorry</code>, But Not Proven)</span>
+  <ul>
+    <li><strong>TypeScript &harr; Lean equivalence.</strong> The proofs verify
+      the Lean specification, not the TypeScript implementation. The bridge
+      is <em>differential testing</em> (Chapter 4), not formal refinement.</li>
+    <li><strong>Network layer correctness.</strong> The proofs assume operations
+      are eventually delivered. They do not model message loss, duplication
+      beyond CRDT idempotence, or Byzantine faults.</li>
+    <li><strong>HLC real-time accuracy.</strong> The proofs model HLC as
+      bounded natural numbers. They do not prove that the JavaScript
+      <code>Date.now()</code> is monotonic or that NTP keeps clocks within
+      drift bounds.</li>
+    <li><strong>Storage durability.</strong> Convergence assumes all operations
+      survive storage. S3/Tigris durability is outside the formal model.</li>
+    <li><strong>Composite row semilattice.</strong> The table composition
+      proofs (<code>table_merge_comm_of_row_comm</code>, etc.) are
+      <em>conditional</em> on the row merge having the property. They do not
+      directly prove that <code>mergeTableRow</code> is commutative, because
+      that requires composing the LWW event-consistency condition across all
+      LWW columns. The operational invariant must be established at system
+      initialization.</li>
+    <li><strong>OR-Set idempotence precondition.</strong>
+      <code>or_set_merge_idem</code> requires the input to already be
+      canonicalized. In practice, every merge output is canonicalized,
+      so this is satisfied&mdash;but the chain from &ldquo;merge always
+      canonicalizes&rdquo; to &ldquo;idempotence always holds&rdquo; is an
+      informal argument, not a formal proof.</li>
+  </ul>
+</div>
+
+<p>
+  The proof architecture is designed so that the formal core (Tiers 1&ndash;3)
+  covers the properties that are hardest to get right by inspection, while
+  the boundaries listed above are covered by complementary strategies:
+  differential testing, integration tests, and operational monitoring.
+</p>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+
+<nav class="chapter-nav">
+  <a href="ch02-crdts.html" class="prev">Chapter 2: CRDT Implementation</a>
+  <span>Chapter 3: Lean Proofs</span>
+  <a href="ch04-differential-testing.html" class="next">Chapter 4: Differential Testing</a>
+</nav>
+
+</body>
+</html>

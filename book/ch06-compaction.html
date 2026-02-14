@@ -1,0 +1,1181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 6: Compaction &mdash; CRDTBase</title>
+  <link rel="stylesheet" href="style.css">
+
+  <!-- MathJax -->
+  <script>
+    window.MathJax = {
+      tex: { inlineMath: [['\\(','\\)']], displayMath: [['\\[','\\]']] }
+    };
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+
+  <!-- Mermaid -->
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({startOnLoad:true, theme:'neutral'});
+  </script>
+</head>
+<body>
+
+<nav class="chapter-nav">
+  <a href="ch05-data-model.html" class="prev">Chapter 5: Data Model</a>
+  <a href="ch07-e2e-flow.html" class="next">Chapter 7: End-to-End Flow</a>
+</nav>
+
+<h1>
+  <span class="chapter-num">Chapter 6</span>
+  Compaction
+</h1>
+
+<!-- ============================================================ -->
+<!-- TABLE OF CONTENTS                                             -->
+<!-- ============================================================ -->
+
+<div class="toc">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#why-compaction">Why Compaction Exists</a></li>
+    <li><a href="#architecture">Architecture Overview</a></li>
+    <li><a href="#data-structures">Data Structures</a></li>
+    <li><a href="#algorithm">The Compaction Algorithm Step by Step</a></li>
+    <li><a href="#cas-manifest">CAS-on-Manifest: Safe Concurrent Compaction</a></li>
+    <li><a href="#correctness">How Compaction Preserves CRDT Correctness</a></li>
+    <li><a href="#segment-output">Segment File Output</a></li>
+    <li><a href="#manifest-truth">The Manifest as the Single Source of Truth</a></li>
+    <li><a href="#tombstones">OR-Set Tombstone Handling</a></li>
+    <li><a href="#cas-failure">What Happens on CAS Failure</a></li>
+    <li><a href="#performance">Performance Implications</a></li>
+    <li><a href="#summary">Summary</a></li>
+  </ol>
+</div>
+
+
+<!-- ============================================================ -->
+<!-- 1. WHY COMPACTION EXISTS                                      -->
+<!-- ============================================================ -->
+
+<h2 id="why-compaction">6.1 &ensp; Why Compaction Exists</h2>
+
+<p>
+CRDTBase uses a <strong>delta-shipping</strong> replication model.
+Every write from every site appends a small delta file to a replicated log
+stored in S3-compatible object storage:
+</p>
+
+<pre><code>deltas/site-a/0000000001.delta.bin
+deltas/site-a/0000000002.delta.bin
+deltas/site-b/0000000001.delta.bin
+...</code></pre>
+
+<p>
+Without intervention, a new client joining the system must read
+<em>every delta ever written by every site</em>, replay them all,
+and only then can it answer queries. As the number of deltas grows,
+three costs become impractical:
+</p>
+
+<ul>
+  <li><strong>Startup cost:</strong> A fresh client downloads \(N\) deltas
+    across \(S\) sites. Bootstrap time grows linearly with total write
+    history.</li>
+  <li><strong>Read amplification:</strong> Every query must overlay all
+    uncompacted deltas on top of whatever base state exists.</li>
+  <li><strong>Storage scan cost:</strong> Listing and fetching thousands of
+    small S3 objects is slow. Each LIST + GET round-trip adds latency.</li>
+</ul>
+
+<p>
+Compaction solves this by periodically folding accumulated deltas into
+<strong>segment files</strong>&thinsp;&mdash;&thinsp;pre-merged CRDT state
+snapshots. A new client only needs to download the latest segments (listed
+in a manifest) and then replay only the deltas that arrived
+<em>after</em> the last compaction.
+</p>
+
+<div class="note">
+  <span class="box-title">LSM-Tree Analogy</span>
+  <p>
+    This is conceptually similar to an LSM-tree (Log-Structured Merge Tree):
+    the "log" is the ReplicatedLog of deltas, and "compaction" merges log
+    entries into sorted segment files. However, CRDTBase's design is simpler:
+  </p>
+  <ol>
+    <li>There is only <strong>one level</strong> of segments (no tiered compaction).</li>
+    <li>Segments are partitioned by <strong>table and partition key</strong>,
+      not by key range.</li>
+    <li>CRDT merge semantics replace the traditional "pick the newer value"
+      merge policy.</li>
+  </ol>
+</div>
+
+<!-- Diagram 1: Before/After Compaction -->
+<div class="diagram-container">
+  <pre class="mermaid">
+graph LR
+  subgraph Before["Before Compaction"]
+    direction TB
+    D1["delta site-a/001"]
+    D2["delta site-a/002"]
+    D3["delta site-a/003"]
+    D4["delta site-b/001"]
+    D5["delta site-b/002"]
+    D6["delta site-c/001"]
+  end
+
+  subgraph After["After Compaction"]
+    direction TB
+    S1["segment<br/>tasks_default_18e4a2b3.seg.bin"]
+    M1["manifest.bin<br/>version: 1<br/>sites_compacted:<br/>{a:3, b:2, c:1}"]
+    D7["delta site-a/004<br/>(post-compaction)"]
+    D8["delta site-b/003<br/>(post-compaction)"]
+  end
+
+  D1 --> S1
+  D2 --> S1
+  D3 --> S1
+  D4 --> S1
+  D5 --> S1
+  D6 --> S1
+  M1 -. "references" .-> S1
+  </pre>
+  <div class="caption">
+    Figure 6.1 &mdash; Before compaction, a new client must read all delta files.
+    After compaction, it reads one segment plus only post-compaction deltas.
+    Old delta files remain in storage but are never re-read.
+  </div>
+</div>
+
+
+<!-- ============================================================ -->
+<!-- 2. ARCHITECTURE OVERVIEW                                      -->
+<!-- ============================================================ -->
+
+<h2 id="architecture">6.2 &ensp; Architecture Overview</h2>
+
+<p>
+Compaction involves three core abstractions:
+</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Abstraction</th>
+      <th>Role</th>
+      <th>Key File</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>ReplicatedLog</strong></td>
+      <td>Source of truth: per-site append-only delta streams</td>
+      <td><code>src/core/replication.ts</code></td>
+    </tr>
+    <tr>
+      <td><strong>SnapshotStore</strong></td>
+      <td>Destination: stores segment files and the manifest</td>
+      <td><code>src/core/snapshotStore.ts</code></td>
+    </tr>
+    <tr>
+      <td><strong>Compactor</strong></td>
+      <td>The job that reads deltas, merges state, writes segments,
+        and CAS-updates the manifest</td>
+      <td><code>src/platform/node/compactor.ts</code></td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+The core compaction data types and segment-building logic live in
+<code>src/core/compaction.ts</code> (platform-independent). The orchestration
+that ties together log reading, segment writing, and manifest CAS lives in
+<code>src/platform/node/compactor.ts</code>.
+</p>
+
+
+<!-- ============================================================ -->
+<!-- 3. DATA STRUCTURES                                            -->
+<!-- ============================================================ -->
+
+<h2 id="data-structures">6.3 &ensp; Data Structures</h2>
+
+<h3>6.3.1 &ensp; SegmentFile</h3>
+
+<p>
+A segment file is a MessagePack-encoded blob containing the <strong>merged CRDT
+state</strong> for all rows in one (table, partition) pair:
+</p>
+
+<span class="file-ref">src/core/compaction.ts:18&ndash;27</span>
+<pre><code>export type SegmentFile = {
+  v: 1;
+  table: string;
+  partition: string;
+  hlc_max: string;        // hex-encoded HLC of latest incorporated op
+  row_count: number;
+  bloom: Uint8Array;       // bloom filter over primary keys
+  bloom_k: number;         // number of hash functions
+  rows: SegmentRow[];      // sorted by primary key
+};</code></pre>
+
+<span class="file-ref">src/core/compaction.ts:13&ndash;16</span>
+<pre><code>export type SegmentRow = {
+  key: SqlPrimaryKey;
+  cols: Record&lt;string, SqlEvalColumnState&gt;;
+};</code></pre>
+
+<p>
+Each <code>SegmentRow</code> holds the full CRDT state for every
+column&thinsp;&mdash;&thinsp;not just the materialized value, but the complete
+state needed for future merges:
+</p>
+
+<ul>
+  <li><strong>LWW Register (typ=1):</strong>
+    <code>{ val, hlc, site }</code> &mdash; the winning value and its timestamp.</li>
+  <li><strong>PN-Counter (typ=2):</strong>
+    <code>{ inc: Record&lt;site, count&gt;, dec: Record&lt;site, count&gt; }</code>
+    &mdash; per-site increment and decrement tallies.</li>
+  <li><strong>OR-Set (typ=3):</strong>
+    <code>{ elements: [...], tombstones: [...] }</code> &mdash; all live add-tags
+    plus remove tombstones.</li>
+  <li><strong>MV-Register (typ=4):</strong>
+    <code>{ values: [{val, hlc, site}, ...] }</code> &mdash; all concurrent values.</li>
+</ul>
+
+<h3>6.3.2 &ensp; ManifestFile</h3>
+
+<p>
+The manifest is the single coordination point. It records which segments exist
+and what has been compacted:
+</p>
+
+<span class="file-ref">src/core/compaction.ts:40&ndash;46</span>
+<pre><code>export type ManifestFile = {
+  v: 1;
+  version: number;                          // monotonic, incremented each compaction
+  compaction_hlc: string;                   // max HLC across all compacted ops
+  segments: ManifestSegmentRef[];           // pointers to segment files
+  sites_compacted: Record&lt;string, number&gt;; // siteId -&gt; last compacted seq
+};</code></pre>
+
+<p>
+The <code>sites_compacted</code> map is the <strong>compaction
+watermark</strong>: it tells clients exactly which deltas are already folded
+into the segments. Any delta with
+<code>seq &le; sites_compacted[siteId]</code> is already in the segments
+and need not be replayed.
+</p>
+
+<span class="file-ref">src/core/compaction.ts:29&ndash;38</span>
+<pre><code>export type ManifestSegmentRef = {
+  path: string;           // e.g. "segments/tasks__default_18e4a2b3.seg.bin"
+  table: string;
+  partition: string;
+  row_count: number;
+  size_bytes: number;
+  hlc_max: string;
+  key_min: SqlPrimaryKey; // smallest PK in segment
+  key_max: SqlPrimaryKey; // largest PK in segment
+};</code></pre>
+
+<h3>6.3.3 &ensp; Empty Manifest</h3>
+
+<p>
+When no compaction has ever run, the system uses an empty manifest with
+version&nbsp;0:
+</p>
+
+<span class="file-ref">src/core/compaction.ts:393&ndash;401</span>
+<pre><code>export function makeEmptyManifest(): ManifestFile {
+  return {
+    v: 1,
+    version: 0,
+    compaction_hlc: '0x0',
+    segments: [],
+    sites_compacted: {},
+  };
+}</code></pre>
+
+
+<!-- ============================================================ -->
+<!-- 4. THE COMPACTION ALGORITHM                                   -->
+<!-- ============================================================ -->
+
+<h2 id="algorithm">6.4 &ensp; The Compaction Algorithm Step by Step</h2>
+
+<p>
+The entry point is <code>compactReplicatedLog()</code> in
+<code>src/platform/node/compactor.ts:56&ndash;131</code>. The algorithm
+proceeds in four phases.
+</p>
+
+<!-- Diagram 2: Compaction Algorithm Flowchart -->
+<div class="diagram-container">
+  <pre class="mermaid">
+flowchart TD
+    A["Start: compactReplicatedLog()"] --> B["Step 1: Load prior manifest<br/>+ deserialize existing segments<br/>into RuntimeRowState map"]
+    B --> C["Step 2: For each site,<br/>read new deltas since<br/>last compacted seq"]
+    C --> D{"Any gaps in<br/>seq numbers?"}
+    D -- "Yes" --> E["takeContiguousEntriesSince()<br/>stops at gap"]
+    D -- "No" --> F["Apply all ops to<br/>RuntimeRowState map"]
+    E --> F
+    F --> G["Step 3: Build new segments<br/>- Group rows by (table, partition)<br/>- Sort by primary key<br/>- Build bloom filter<br/>- MessagePack encode"]
+    G --> H["PUT segment files<br/>to SnapshotStore"]
+    H --> I["Step 4: Build new manifest<br/>version = prior + 1"]
+    I --> J{"CAS putManifest:<br/>current version ==<br/>expected?"}
+    J -- "Success" --> K["Return applied: true"]
+    J -- "Failure" --> L["Return applied: false<br/>(another compaction won)"]
+  </pre>
+  <div class="caption">
+    Figure 6.2 &mdash; The four-phase compaction algorithm.
+    CAS failure at the end causes the entire compaction's work to be discarded,
+    but leaves the system in a safe state.
+  </div>
+</div>
+
+<h3>Step 1: Read Prior State</h3>
+
+<span class="file-ref">src/platform/node/compactor.ts:59&ndash;68</span>
+<pre><code>const schema = options.schema ?? (await options.snapshots.getSchema());
+const priorManifest = (await options.snapshots.getManifest()) ?? makeEmptyManifest();
+const rows = await loadRowsFromManifest(options.snapshots, priorManifest);
+const sitesCompacted: Record&lt;string, number&gt; = { ...priorManifest.sites_compacted };
+let compactionHlc = priorManifest.compaction_hlc;</code></pre>
+
+<p>
+The compactor loads all existing segment files referenced by the prior manifest
+and deserializes them back into <code>RuntimeRowState</code>&thinsp;&mdash;&thinsp;the
+in-memory row representation used by the CRDT engine. This is done by
+<code>loadRowsFromManifest()</code>
+(<code>compactor.ts:19&ndash;34</code>), which iterates over each segment ref,
+fetches the bytes, decodes the MessagePack, and converts segment rows into
+runtime rows via <code>segmentFileToRuntimeRows()</code>.
+</p>
+
+<h3>Step 2: Collect New Deltas from All Sites</h3>
+
+<span class="file-ref">src/platform/node/compactor.ts:71&ndash;89</span>
+<pre><code>const sites = await options.log.listSites();
+sites.sort();
+
+for (const siteId of sites) {
+  const since = normalizeSeq(sitesCompacted[siteId] ?? 0);
+  const readEntries = await options.log.readSince(siteId, since);
+  const entries = takeContiguousEntriesSince(readEntries, since);
+  let nextHead = since;
+  for (const entry of entries) {
+    nextHead = Math.max(nextHead, normalizeSeq(entry.seq));
+    compactionHlc = maxHlcHex(compactionHlc, entry.hlc);
+    applyOpsToRuntimeRows(rows, entry.ops);
+    for (const op of entry.ops) {
+      compactionHlc = maxHlcHex(compactionHlc, op.hlc);
+    }
+    opsRead += entry.ops.length;
+  }
+  sitesCompacted[siteId] = nextHead;
+}</code></pre>
+
+<p>
+For each site, the compactor reads entries strictly after the last compacted
+sequence number. <code>takeContiguousEntriesSince()</code>
+(<code>src/core/replication.ts:28&ndash;46</code>) is a safety mechanism:
+it only advances through contiguous sequence numbers
+(<code>since+1, since+2, ...</code>), stopping at any gap. Each entry's
+CRDT ops are applied in order to the <code>rows</code> map via
+<code>applyOpsToRuntimeRows()</code>
+(<code>compaction.ts:226&ndash;233</code>).
+</p>
+
+<div class="warning">
+  <span class="box-title">Contiguous Entry Safety</span>
+  <p>
+    Under eventually-consistent storage (like Tigris S3), a LIST operation
+    might return seq&nbsp;5 and seq&nbsp;7 but not yet seq&nbsp;6.
+    <code>takeContiguousEntriesSince()</code> stops at seq&nbsp;5, ensuring
+    the compaction watermark only advances over fully-observed deltas. Without
+    this guard, the compactor could skip a delta and permanently lose data.
+  </p>
+</div>
+
+<span class="file-ref">src/core/replication.ts:28&ndash;46</span>
+<pre><code>export function takeContiguousEntriesSince(
+  entries: readonly LogEntry[],
+  since: LogPosition,
+): LogEntry[] {
+  const ordered = [...entries].sort((left, right) => left.seq - right.seq);
+  const contiguous: LogEntry[] = [];
+  let expected = since + 1;
+  for (const entry of ordered) {
+    if (entry.seq &lt; expected) continue;
+    if (entry.seq !== expected) break;
+    contiguous.push(entry);
+    expected += 1;
+  }
+  return contiguous;
+}</code></pre>
+
+<h3>Step 3: Build New Segments</h3>
+
+<span class="file-ref">src/platform/node/compactor.ts:91&ndash;104</span>
+<pre><code>const builtSegments = buildSegmentsFromRows({
+  schema,
+  rows,
+  defaultHlcMax: compactionHlc,
+});
+
+const manifestSegments: ManifestSegmentRef[] = [];
+const writtenSegments: string[] = [];
+for (const built of builtSegments) {
+  const bytes = encodeBin(built.segment);
+  await options.snapshots.putSegment(built.path, bytes);
+  manifestSegments.push(
+    buildManifestSegmentRef(built.path, built.segment, bytes.byteLength)
+  );
+  writtenSegments.push(built.path);
+}</code></pre>
+
+<p>
+<code>buildSegmentsFromRows()</code>
+(<code>compaction.ts:346&ndash;371</code>) performs the following:
+</p>
+
+<ol>
+  <li><strong>Group rows by (table, partition)</strong> via
+    <code>groupRowsByTableAndPartition()</code>
+    (<code>compaction.ts:272&ndash;301</code>). The partition is resolved
+    from the schema's <code>partitionBy</code> column.</li>
+  <li><strong>For each group, build a SegmentFile</strong> via
+    <code>buildSegmentFile()</code> (<code>compaction.ts:317&ndash;344</code>):
+    sort rows by primary key, convert <code>RuntimeRowState</code> to
+    <code>SegmentRow</code>, build a bloom filter, and compute
+    <code>hlc_max</code>.</li>
+  <li><strong>Generate the segment file path</strong>:
+    <code>segments/{table}_{partition}_{hlc_max_hex8}.seg.bin</code></li>
+</ol>
+
+<h3>Step 4: CAS-Update the Manifest</h3>
+
+<span class="file-ref">src/platform/node/compactor.ts:106&ndash;131</span>
+<pre><code>const nextManifest: ManifestFile = {
+  v: 1,
+  version: priorManifest.version + 1,
+  compaction_hlc: compactionHlc,
+  segments: manifestSegments,
+  sites_compacted: sitesCompacted,
+};
+
+const applied = await options.snapshots.putManifest(
+  nextManifest, priorManifest.version
+);
+if (!applied) {
+  const latestManifest =
+    (await options.snapshots.getManifest()) ?? makeEmptyManifest();
+  return {
+    applied: false,
+    manifest: latestManifest,
+    writtenSegments: [],
+    opsRead,
+  };
+}</code></pre>
+
+<p>
+The manifest is updated atomically via compare-and-swap:
+<code>putManifest()</code> only succeeds if the current manifest version
+matches <code>priorManifest.version</code>. If another compaction ran
+concurrently and bumped the version, the CAS fails and this compaction's
+work is discarded.
+</p>
+
+
+<!-- ============================================================ -->
+<!-- 5. CAS-ON-MANIFEST                                            -->
+<!-- ============================================================ -->
+
+<h2 id="cas-manifest">6.5 &ensp; CAS-on-Manifest: Safe Concurrent Compaction</h2>
+
+<p>
+The manifest version acts as an <strong>optimistic lock</strong>.
+If two compaction jobs race, the sequence of events unfolds as follows:
+</p>
+
+<!-- Diagram 3: CAS Sequence Diagram -->
+<div class="diagram-container">
+  <pre class="mermaid">
+sequenceDiagram
+    participant S as SnapshotStore
+    participant C1 as Compactor A
+    participant C2 as Compactor B
+
+    C1->>S: getManifest()
+    S-->>C1: manifest v=3
+
+    C2->>S: getManifest()
+    S-->>C2: manifest v=3
+
+    Note over C1: Read deltas, merge state,<br/>build segments
+    Note over C2: Read deltas, merge state,<br/>build segments
+
+    C1->>S: putSegment(seg_A)
+    S-->>C1: OK
+
+    C2->>S: putSegment(seg_B)
+    S-->>C2: OK
+
+    C1->>S: putManifest(v=4, expect v=3)
+    S-->>C1: applied: true
+
+    C2->>S: putManifest(v=4, expect v=3)
+    S-->>C2: applied: false (v is now 4)
+
+    Note over C2: Discards work.<br/>seg_B is orphaned<br/>(harmless).
+
+    C2->>S: getManifest()
+    S-->>C2: manifest v=4
+  </pre>
+  <div class="caption">
+    Figure 6.3 &mdash; CAS-on-manifest sequence: two concurrent compaction jobs
+    race. Only one wins the compare-and-swap; the other detects the conflict and
+    discards its work.
+  </div>
+</div>
+
+<p>
+The CAS implementations vary by backend:
+</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Backend</th>
+      <th>CAS Mechanism</th>
+      <th>Strength</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>FsSnapshotStore</code></td>
+      <td>Double-read manifest file before writing</td>
+      <td>Best-effort (race window exists between reads and writes across processes)</td>
+    </tr>
+    <tr>
+      <td><code>TigrisSnapshotStore</code></td>
+      <td>S3 ETag-based conditional PUT (<code>IfMatch</code> / <code>IfNoneMatch</code>)</td>
+      <td>True CAS semantics via S3 protocol</td>
+    </tr>
+    <tr>
+      <td><code>HttpSnapshotStore</code></td>
+      <td><code>PUT /manifest?expect_version=N</code>, checks HTTP 412</td>
+      <td>Server-side version check</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="note">
+  <span class="box-title">Implementation Detail: FsSnapshotStore CAS</span>
+  <p>
+    The filesystem-based CAS
+    (<code>src/platform/node/fsSnapshotStore.ts:53&ndash;71</code>)
+    double-reads the manifest file before writing to reduce&thinsp;&mdash;&thinsp;but
+    not eliminate&thinsp;&mdash;&thinsp;lost-update windows. This is acceptable
+    for single-machine development use, where concurrent compaction is rare.
+    Production deployments on Tigris use true ETag-based CAS.
+  </p>
+</div>
+
+
+<!-- ============================================================ -->
+<!-- 6. CORRECTNESS                                                -->
+<!-- ============================================================ -->
+
+<h2 id="correctness">6.6 &ensp; How Compaction Preserves CRDT Correctness</h2>
+
+<p>
+The fundamental correctness property is:
+</p>
+
+<blockquote>
+  Compacting a prefix of operations and then applying the remaining suffix
+  produces the same final state as applying all operations from scratch.
+</blockquote>
+
+<p>
+Formally, this is the <strong>fold-append law</strong>:
+</p>
+
+\[
+\text{fold}(f,\;\text{init},\;\text{prefix} \mathbin{+\!\!+} \text{suffix})
+\;=\;
+\text{fold}\!\big(f,\;\text{fold}(f,\;\text{init},\;\text{prefix}),\;\text{suffix}\big)
+\]
+
+<p>
+This holds for <em>any</em> step function \(f\)&thinsp;&mdash;&thinsp;no
+commutativity or associativity of the CRDT merge is required. The property
+follows directly from the definition of a left fold over a list concatenation.
+</p>
+
+<div class="theorem">
+  <span class="box-title">Theorem 6.1 &mdash; Compaction Preserves State</span>
+  <p>
+    For any step function \(f : \beta \to \alpha \to \beta\), initial state
+    \(\text{init} : \beta\), and operation lists
+    \(\text{preOps}, \text{postOps} : \text{List}\;\alpha\):
+  </p>
+  \[
+    \text{List.foldl}\;f\;(\text{List.foldl}\;f\;\text{init}\;\text{preOps})\;\text{postOps}
+    \;=\;
+    \text{List.foldl}\;f\;\text{init}\;(\text{preOps} \mathbin{+\!\!+} \text{postOps})
+  \]
+  <p>
+    This is formally verified in Lean&nbsp;4 as
+    <code>compaction_preserves_state</code>.
+  </p>
+</div>
+
+<span class="file-ref">lean/CrdtBase/Compaction/Props.lean:36&ndash;45</span>
+<pre><code>/-- Canonical compaction law: compacting a prefix and folding the suffix
+is equivalent to folding the full stream. -/
+theorem compaction_preserves_state {&alpha; &beta; : Type}
+    (step : &beta; &rarr; &alpha; &rarr; &beta;) (init : &beta;) (preOps postOps : List &alpha;) :
+    List.foldl step (List.foldl step init preOps) postOps =
+      List.foldl step init (preOps ++ postOps) := by
+  exact
+    (List.foldl_append
+      (f := step) (b := init) (l := preOps) (l' := postOps)).symm</code></pre>
+
+<p>
+The proof is surprisingly simple: it follows directly from
+<code>List.foldl_append</code> in Lean's standard library, which states that
+folding over a concatenation is the same as folding the first list and then
+continuing with the second.
+</p>
+
+<h3>6.6.1 &ensp; The foldPrefixSuffix Abstraction</h3>
+
+<p>
+The Lean proofs use a helper function that splits a list at an arbitrary
+point and folds both halves:
+</p>
+
+<span class="file-ref">lean/CrdtBase/Compaction/Defs.lean:13&ndash;15</span>
+<pre><code>def foldPrefixSuffix {&alpha; &beta; : Type}
+    (step : &beta; &rarr; &alpha; &rarr; &beta;) (init : &beta;) (ops : List &alpha;) (split : Nat) : &beta; :=
+  List.foldl step (List.foldl step init (ops.take split)) (ops.drop split)</code></pre>
+
+<div class="theorem">
+  <span class="box-title">Theorem 6.2 &mdash; foldPrefixSuffix Equals Full Fold</span>
+  <p>
+    For any split point, <code>foldPrefixSuffix</code> yields the same result
+    as folding the entire list:
+  </p>
+  \[
+    \forall\;\text{split} : \mathbb{N},\;
+    \text{foldPrefixSuffix}\;f\;\text{init}\;\text{ops}\;\text{split}
+    \;=\;
+    \text{List.foldl}\;f\;\text{init}\;\text{ops}
+  \]
+  <p>
+    Proved as <code>foldPrefixSuffix_eq_foldl_all</code> in
+    <code>Props.lean:28&ndash;32</code>.
+  </p>
+</div>
+
+<h3>6.6.2 &ensp; Per-CRDT-Type Specializations</h3>
+
+<p>
+The Lean proofs include specializations for each CRDT type, confirming that
+the concrete merge functions satisfy the compaction law:
+</p>
+
+<span class="file-ref">lean/CrdtBase/Compaction/Props.lean:55&ndash;103</span>
+<pre><code>theorem pn_counter_compaction_preserves_state ...
+theorem or_set_compaction_preserves_state ...
+theorem mv_register_compaction_preserves_state ...
+theorem lww_compaction_preserves_state ...</code></pre>
+
+<p>
+Each uses <code>foldPrefixSuffix</code> instantiated with the CRDT-specific
+merge function and empty initial state.
+</p>
+
+<h3>6.6.3 &ensp; Idempotence</h3>
+
+<div class="theorem">
+  <span class="box-title">Theorem 6.3 &mdash; Compaction Idempotence</span>
+  <p>
+    Compacting an already-compacted state with no new deltas is a no-op:
+  </p>
+  \[
+    \text{foldPrefixSuffix}\;f\;
+    (\text{foldPrefixSuffix}\;f\;\text{init}\;\text{ops}\;n)\;
+    [\,]\;n
+    \;=\;
+    \text{foldPrefixSuffix}\;f\;\text{init}\;\text{ops}\;n
+  \]
+</div>
+
+<span class="file-ref">lean/CrdtBase/Compaction/Props.lean:48&ndash;52</span>
+<pre><code>theorem compaction_idempotent {&alpha; &beta; : Type}
+    (step : &beta; &rarr; &alpha; &rarr; &beta;) (init : &beta;) (ops : List &alpha;) (split : Nat) :
+    foldPrefixSuffix step (foldPrefixSuffix step init ops split) [] split =
+      foldPrefixSuffix step init ops split := by
+  simp [foldPrefixSuffix]</code></pre>
+
+<h3>6.6.4 &ensp; The PN-Counter Subtlety</h3>
+
+<div class="warning">
+  <span class="box-title">PN-Counter Double-Application</span>
+  <p>
+    CRDT merge is idempotent for state-based types (LWW, OR-Set, MV-Register).
+    For PN-Counter, the segment contains the compacted counter state (max per
+    site), and applying the same increment op twice yields the wrong total.
+    A <code>+3</code> increment applied twice produces <code>+6</code>.
+  </p>
+  <p>
+    The system prevents this with the <strong>compaction watermark
+    rule</strong>: when a new manifest is loaded, any locally-cached deltas
+    from sites whose last seq is
+    <code>&le; manifest.sites_compacted[siteId]</code> are discarded. Only
+    deltas with seqs strictly greater than the compacted seq are applied.
+  </p>
+</div>
+
+<span class="file-ref">src/platform/node/nodeClient.ts:385&ndash;389</span>
+<pre><code>// Reset site cursors to compaction watermarks so uncompacted deltas
+// are replayed exactly once.
+for (const [siteId, seq] of Object.entries(manifest.sites_compacted)) {
+  this.syncedSeqBySite.set(siteId, seq);
+  this.syncedHlcBySite.delete(siteId);
+}</code></pre>
+
+
+<!-- ============================================================ -->
+<!-- 7. SEGMENT FILE OUTPUT                                        -->
+<!-- ============================================================ -->
+
+<h2 id="segment-output">6.7 &ensp; Segment File Output</h2>
+
+<p>
+Each segment file is a self-contained artifact with three properties
+that enable efficient query execution.
+</p>
+
+<h3>Sorted Rows</h3>
+
+<p>
+Rows within a segment are sorted by primary key
+(<code>compaction.ts:323&ndash;325</code>), enabling binary search for
+point lookups:
+</p>
+
+<span class="file-ref">src/core/compaction.ts:323&ndash;325</span>
+<pre><code>const sortedRows = [...params.rows].sort((left, right) =>
+  compareSqlPrimaryKeys(left.key, right.key),
+);</code></pre>
+
+<h3>Bloom Filters</h3>
+
+<p>
+A bloom filter is built over all primary keys in the segment, with 10 bits per
+element yielding approximately 1% false positive rate:
+</p>
+
+<span class="file-ref">src/core/compaction.ts:179&ndash;205</span>
+<pre><code>export function buildBloomFilter(
+  keys: SqlPrimaryKey[],
+  bitsPerElement = 10,
+): { bloom: Uint8Array; bloomK: number } {
+  const requestedBitCount = Math.max(8, Math.ceil(keys.length * bitsPerElement));
+  const byteCount = Math.ceil(requestedBitCount / 8);
+  const bitCount = byteCount * 8;
+  const bloom = new Uint8Array(byteCount);
+  const bloomK = Math.max(1, Math.round((bitCount / keys.length) * Math.log(2)));
+  // ...FNV-1a hashing with different seeds...
+}</code></pre>
+
+<p>
+The number of hash functions \(k\) is computed optimally as
+\(k = \lceil (m / n) \cdot \ln 2 \rceil\), where \(m\) is the total bit
+count and \(n\) is the number of keys. For the default 10 bits/element,
+this gives approximately 7 hash functions.
+</p>
+
+<div class="note">
+  <span class="box-title">Bloom Filter Hash Function</span>
+  <p>
+    The filter uses FNV-1a with multiple seeds (one per hash function).
+    Each seed is derived as <code>(index + 1) * 0x9e3779b1</code>, using
+    the golden-ratio constant to spread the seed space. Primary keys are
+    serialized to strings before hashing.
+  </p>
+</div>
+
+<h3>MessagePack Encoding</h3>
+
+<p>
+Segment files are encoded with MessagePack
+(<code>encodeBin()</code>/<code>decodeBin()</code> in
+<code>src/core/encoding.ts</code>), providing compact binary serialization
+that is universally inspectable with standard tools. The choice of MessagePack
+over protocol buffers or a custom format is a deliberate simplicity decision:
+any language with a MessagePack library can decode and inspect segment files.
+</p>
+
+
+<!-- ============================================================ -->
+<!-- 8. THE MANIFEST AS SINGLE SOURCE OF TRUTH                     -->
+<!-- ============================================================ -->
+
+<h2 id="manifest-truth">6.8 &ensp; The Manifest as the Single Source of Truth</h2>
+
+<p>
+The manifest file serves three distinct roles simultaneously:
+</p>
+
+<ol>
+  <li><strong>Segment registry:</strong> It lists every segment file that
+    comprises the current compacted state. Clients only download segments
+    referenced in the manifest.</li>
+  <li><strong>Compaction watermark:</strong> The
+    <code>sites_compacted</code> map tells clients which deltas are already
+    folded into segments, so they can skip those deltas during replay.</li>
+  <li><strong>Optimistic lock:</strong> The monotonic
+    <code>version</code> number enables compare-and-swap updates, preventing
+    concurrent compaction jobs from corrupting state.</li>
+</ol>
+
+<!-- Diagram 4: Timeline of Compaction Watermark Advancing -->
+<div class="diagram-container">
+  <pre class="mermaid">
+gantt
+    title Compaction Watermark Advancement
+    dateFormat X
+    axisFormat %s
+
+    section Site A Deltas
+    delta 1           :done,    a1, 0, 1
+    delta 2           :done,    a2, 1, 2
+    delta 3           :done,    a3, 2, 3
+    delta 4           :active,  a4, 3, 4
+    delta 5           :active,  a5, 4, 5
+
+    section Site B Deltas
+    delta 1           :done,    b1, 0, 1
+    delta 2           :done,    b2, 1, 2
+    delta 3           :active,  b3, 2, 3
+
+    section Compaction
+    Compaction 1 runs (watermark a:3 b:2) :milestone, c1, 3, 3
+    Compaction 2 runs (watermark a:5 b:3) :milestone, c2, 5, 5
+  </pre>
+  <div class="caption">
+    Figure 6.4 &mdash; The compaction watermark advances monotonically.
+    "Done" deltas (dark) are covered by the latest manifest's segments.
+    "Active" deltas (light) are post-watermark and must still be replayed
+    by clients. Each compaction run advances the watermark to incorporate
+    newly observed deltas.
+  </div>
+</div>
+
+<p>
+A new client's bootstrap sequence is:
+</p>
+
+<ol>
+  <li>Fetch <code>manifest.bin</code> from the SnapshotStore.</li>
+  <li>Download each segment file listed in <code>manifest.segments</code>.</li>
+  <li>Deserialize segments into in-memory row state.</li>
+  <li>For each site, pull deltas with
+    <code>seq &gt; manifest.sites_compacted[siteId]</code>.</li>
+  <li>Apply those post-watermark deltas to the in-memory state.</li>
+</ol>
+
+<p>
+This reduces bootstrap cost from \(O(\text{total\_ops})\) to
+\(O(\text{rows} + \text{recent\_ops})\), where "recent ops" are only those
+written since the last compaction.
+</p>
+
+
+<!-- ============================================================ -->
+<!-- 9. OR-SET TOMBSTONE HANDLING                                  -->
+<!-- ============================================================ -->
+
+<h2 id="tombstones">6.9 &ensp; OR-Set Tombstone Handling During Compaction</h2>
+
+<p>
+CRDTBase has two distinct tombstone mechanisms, both of which interact with
+compaction.
+</p>
+
+<h3>9.1 &ensp; OR-Set Element Tombstones</h3>
+
+<p>
+OR-Set removes are recorded as tombstones&thinsp;&mdash;&thinsp;tags
+identifying which add operations to suppress:
+</p>
+
+<span class="file-ref">src/core/crdt/orSet.ts:13&ndash;16</span>
+<pre><code>export type OrSet&lt;T&gt; = {
+  elements: Array&lt;OrSetElement&lt;T&gt;&gt;;
+  tombstones: OrSetTag[];
+};</code></pre>
+
+<p>
+During merge, any element whose add-tag appears in the tombstone set is
+filtered out. <strong>Tombstones are never garbage-collected</strong>&thinsp;&mdash;&thinsp;they
+persist in segment files to ensure that a removed element is not resurrected
+by a delayed add operation from another site.
+</p>
+
+<div class="warning">
+  <span class="box-title">Tombstone Retention Is Permanent</span>
+  <p>
+    OR-Set tombstones grow monotonically. Every remove operation adds entries
+    to the tombstone set, and compaction faithfully preserves them all. In
+    workloads with frequent adds and removes on set-typed columns, segment
+    files will grow over time even if the materialized set remains small.
+    This is the cost of causal consistency without a garbage collection protocol.
+  </p>
+</div>
+
+<h3>9.2 &ensp; Row-Level Deletion</h3>
+
+<p>
+Row-level <code>DELETE</code> is implemented as an LWW register write on a
+hidden <code>_deleted</code> column set to <code>true</code>. Reads filter
+out tombstoned rows. The SPEC mentions TTL-based garbage collection of row
+tombstones (default: 7 days), but this is <strong>not yet
+implemented</strong> in the current codebase. Compaction currently retains
+all row states including deleted rows.
+</p>
+
+<h3>9.3 &ensp; No File-Level Garbage Collection</h3>
+
+<p>
+Old segment files and old delta files are <strong>never deleted</strong>.
+They are never downloaded by clients (clients only fetch segments listed in
+the current manifest, and deltas newer than the compaction watermark).
+Storage cost is accepted as negligible for small-to-medium datasets. This is
+a deliberate simplicity tradeoff: no distributed garbage collection protocol
+is needed.
+</p>
+
+
+<!-- ============================================================ -->
+<!-- 10. CAS FAILURE                                               -->
+<!-- ============================================================ -->
+
+<h2 id="cas-failure">6.10 &ensp; What Happens on CAS Failure</h2>
+
+<p>
+When <code>putManifest()</code> returns <code>applied: false</code>, the
+compaction has failed the compare-and-swap. The consequences are well-defined
+and safe:
+</p>
+
+<ol>
+  <li><strong>Orphaned segments:</strong> The segment files written in Step 3
+    are now unreferenced by any manifest. They consume storage but are never
+    downloaded by any client. These are harmless.</li>
+  <li><strong>No state corruption:</strong> The manifest still points to the
+    prior set of segments. The system state is exactly as it was before this
+    compaction attempted to run.</li>
+  <li><strong>Retry is safe:</strong> The losing compactor fetches the latest
+    manifest (now at the winner's version) and can simply retry the entire
+    process with the new baseline. No special recovery logic is needed.</li>
+</ol>
+
+<span class="file-ref">src/platform/node/compactor.ts:114&ndash;123</span>
+<pre><code>if (!applied) {
+  const latestManifest =
+    (await options.snapshots.getManifest()) ?? makeEmptyManifest();
+  return {
+    applied: false,
+    manifest: latestManifest,
+    writtenSegments: [],
+    opsRead,
+  };
+}</code></pre>
+
+<div class="note">
+  <span class="box-title">Orphaned Segment Cleanup</span>
+  <p>
+    The codebase does not include an orphaned-segment cleaner. In principle,
+    one could diff the set of segment files in storage against the set
+    referenced in the current manifest and delete unreferenced files older than
+    some threshold. This is explicitly left as a future optimization.
+  </p>
+</div>
+
+
+<!-- ============================================================ -->
+<!-- 11. PERFORMANCE IMPLICATIONS                                  -->
+<!-- ============================================================ -->
+
+<h2 id="performance">6.11 &ensp; Performance Implications</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>Aspect</th>
+      <th>Without Compaction</th>
+      <th>With Compaction</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>New client bootstrap</td>
+      <td>Read all deltas: \(O(\text{total\_ops})\)</td>
+      <td>Read segments + recent deltas: \(O(\text{rows} + \text{recent\_ops})\)</td>
+    </tr>
+    <tr>
+      <td>Read path</td>
+      <td>Replay all deltas over base state</td>
+      <td>Load segment + overlay recent deltas</td>
+    </tr>
+    <tr>
+      <td>Write path</td>
+      <td>Append delta (unchanged)</td>
+      <td>Append delta (unchanged)</td>
+    </tr>
+    <tr>
+      <td>Storage</td>
+      <td>Deltas only</td>
+      <td>Deltas + segments + orphaned segments</td>
+    </tr>
+    <tr>
+      <td>Coordination</td>
+      <td>None</td>
+      <td>CAS on manifest only</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+The design accepts several tradeoffs in exchange for simplicity:
+</p>
+
+<div class="note">
+  <span class="box-title">Tradeoff 1: Full Segment Rewrite</span>
+  <p>
+    Every compaction rewrites <em>all</em> segments from scratch by reloading
+    prior segments plus new deltas. There is no incremental or partial
+    compaction. Compaction cost is \(O(\text{total\_rows})\), not
+    \(O(\text{new\_rows})\). This is acceptable at learning-project scale
+    but would not scale to very large datasets.
+  </p>
+</div>
+
+<div class="note">
+  <span class="box-title">Tradeoff 2: Single-Level Segments</span>
+  <p>
+    Unlike LSM-trees with their tiered compaction levels, CRDTBase produces
+    exactly one segment per (table, partition) pair containing all rows.
+    This keeps the design simple&thinsp;&mdash;&thinsp;no merge scheduling,
+    no level promotion, no size-based triggers&thinsp;&mdash;&thinsp;but means
+    that every compaction processes the full dataset.
+  </p>
+</div>
+
+<div class="note">
+  <span class="box-title">Tradeoff 3: No File Deletion</span>
+  <p>
+    Old segments and deltas accumulate forever. This eliminates the need for
+    distributed garbage collection (a notoriously difficult problem) at the
+    cost of monotonically growing storage. For CRDTBase's target scale, this
+    is the right tradeoff.
+  </p>
+</div>
+
+<div class="warning">
+  <span class="box-title">Tradeoff 4: Tombstone Retention</span>
+  <p>
+    OR-Set tombstones are retained forever. Row-level delete tombstones are
+    spec'd for TTL-based cleanup but not yet implemented. Both contribute to
+    segment size growth over time even as the "live" dataset stays constant.
+  </p>
+</div>
+
+<h3>Quantifying the Improvement</h3>
+
+<p>
+Consider a system with 3 sites that have collectively written 10,000 delta
+files, producing 500 unique rows. Without compaction, a new client must:
+</p>
+
+<ul>
+  <li>LIST and GET 10,000 small S3 objects (one per delta).</li>
+  <li>Deserialize and replay 10,000 delta entries.</li>
+</ul>
+
+<p>
+After compaction, the same client:
+</p>
+
+<ul>
+  <li>GETs 1 manifest file + 1 segment file (500 rows, a single S3 GET).</li>
+  <li>Pulls only the deltas written since the last compaction
+    (e.g., 50 if compaction runs every 5 minutes).</li>
+</ul>
+
+<p>
+This is a reduction from \(O(10{,}000)\) S3 operations to \(O(50)\),
+a 200&times; improvement in bootstrap latency.
+</p>
+
+
+<!-- ============================================================ -->
+<!-- 12. SUMMARY                                                   -->
+<!-- ============================================================ -->
+
+<h2 id="summary">6.12 &ensp; Summary</h2>
+
+<p>
+Compaction in CRDTBase is a periodic batch job that folds accumulated delta
+operations into pre-merged segment files, dramatically reducing the work
+needed for new client bootstrap and query execution. Its correctness rests on
+a formally verified property&thinsp;&mdash;&thinsp;the fold-append
+law&thinsp;&mdash;&thinsp;that holds for <em>any</em> step function and thus
+for all CRDT types in the system.
+</p>
+
+<p>
+The design prioritizes simplicity and debuggability:
+</p>
+
+<ul>
+  <li><strong>Single-level segments</strong> with no tiered compaction.</li>
+  <li><strong>No file deletion</strong>&thinsp;&mdash;&thinsp;old artifacts
+    are left in place.</li>
+  <li><strong>MessagePack encoding</strong> for universal inspectability.</li>
+  <li><strong>CAS-on-manifest</strong> as the only coordination
+    primitive.</li>
+  <li><strong>Machine-checked proofs</strong> in Lean 4 that the compaction
+    split law holds for every CRDT type.</li>
+</ul>
+
+<p>
+The manifest file is the keystone: it serves simultaneously as segment
+registry, compaction watermark, and optimistic lock. Clients trust the
+manifest completely, downloading only the segments it references and replaying
+only the deltas it does not cover.
+</p>
+
+
+<!-- ============================================================ -->
+<!-- NAVIGATION                                                    -->
+<!-- ============================================================ -->
+
+<nav class="chapter-nav">
+  <a href="ch05-data-model.html" class="prev">Chapter 5: Data Model</a>
+  <a href="ch07-e2e-flow.html" class="next">Chapter 7: End-to-End Flow</a>
+</nav>
+
+</body>
+</html>

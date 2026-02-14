@@ -1,0 +1,1129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Chapter 7: End-to-End: Three Clients Across the Globe &mdash; CRDTBase</title>
+  <link rel="stylesheet" href="style.css">
+
+  <!-- MathJax -->
+  <script>
+    window.MathJax = {
+      tex: {
+        inlineMath: [['\\(','\\)']],
+        displayMath: [['\\[','\\]']],
+      },
+    };
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+
+  <!-- Mermaid -->
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({startOnLoad:true, theme:'neutral'});
+  </script>
+</head>
+<body>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch06-compaction.html">Chapter 6: Compaction</a>
+  <span>Chapter 7</span>
+  <a class="next" href="index.html">Back to Index</a>
+</nav>
+
+<h1>
+  <span class="chapter-num">Chapter 7</span>
+  End-to-End: Three Clients Across the Globe
+</h1>
+
+<div class="toc">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#scenario">The Scenario: Three Regions, One Database</a></li>
+    <li><a href="#tigris">How Tigris S3 Geo-Replication Works</a></li>
+    <li><a href="#walkthrough">Concrete Walkthrough: Insert, Update, Increment</a></li>
+    <li><a href="#push-pull">The Push/Pull Sync Cadence</a></li>
+    <li><a href="#stress-test">The Multi-Region Stress Test</a></li>
+    <li><a href="#consistency-headers">Consistency Headers and the Two-Tier Model</a></li>
+    <li><a href="#partition">Network Partition and Offline-First Semantics</a></li>
+    <li><a href="#deployment">Deployment Topology</a></li>
+    <li><a href="#assessment-final">Correctness Assessment</a></li>
+  </ol>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="scenario">7.1 &ensp; The Scenario: Three Regions, One Database</h2>
+
+<p>
+  Every chapter so far has developed a single piece of the CRDTBase puzzle in
+  isolation: the HLC clock, the CRDT types, the SQL compiler, the replicated log,
+  the compaction layer. In this final chapter we assemble the complete machine and
+  watch it run. Our scenario places three independent clients on three different
+  continents, each performing local reads and writes with no coordination, and
+  then synchronizing through a single shared medium: Tigris, an S3-compatible
+  object store with automatic global geo-replication.
+</p>
+
+<p>
+  The three clients are:
+</p>
+
+<table>
+  <thead>
+    <tr><th>Client</th><th>Site ID</th><th>Fly.io Region</th><th>Location</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Client A</td><td><code>site-a</code></td><td><code>iad</code></td><td>Virginia, USA (US-East)</td></tr>
+    <tr><td>Client B</td><td><code>site-b</code></td><td><code>lhr</code></td><td>London, UK (Europe)</td></tr>
+    <tr><td>Client C</td><td><code>site-c</code></td><td><code>nrt</code></td><td>Tokyo, Japan (Asia-Pacific)</td></tr>
+  </tbody>
+</table>
+
+<div class="diagram-container">
+  <pre class="mermaid">
+graph LR
+  subgraph "North America"
+    A["Client A<br/><b>site-a</b><br/>IAD (Virginia)"]
+  end
+
+  subgraph "Europe"
+    B["Client B<br/><b>site-b</b><br/>LHR (London)"]
+  end
+
+  subgraph "Asia-Pacific"
+    C["Client C<br/><b>site-c</b><br/>NRT (Tokyo)"]
+  end
+
+  subgraph "Tigris Object Storage"
+    T["Global S3 Bucket<br/><i>auto geo-replicated</i>"]
+  end
+
+  A -- "push / pull" --> T
+  B -- "push / pull" --> T
+  C -- "push / pull" --> T
+  T -. "auto-replicate<br/>IAD ↔ LHR ↔ NRT" .-> T
+  </pre>
+  <div class="caption">Figure 7.1 &mdash; Three-continent topology with Tigris geo-replication.</div>
+</div>
+
+<p>
+  The key insight of the architecture: Tigris handles the hard problem of
+  geo-replicating bytes across regions, while CRDTBase handles the hard problem
+  of merging concurrent writes deterministically. Together, they achieve
+  multi-region eventual consistency without any central coordination server.
+</p>
+
+<!-- ================================================================== -->
+<h2 id="tigris">7.2 &ensp; How Tigris S3 Geo-Replication Works</h2>
+
+<div class="definition">
+  <span class="box-title">Definition 7.1 &mdash; Tigris Object Storage</span>
+  <p>
+    Tigris is an S3-compatible object store built specifically for Fly.io.
+    Its distinguishing property is <strong>automatic geo-replication</strong>:
+    when a client PUTs an object from any region, Tigris automatically
+    replicates it to all regions where it has presence. The client does not
+    need to specify a target region; the SDK sends <code>region: 'auto'</code>
+    and Tigris routes the request to the nearest point of presence.
+  </p>
+</div>
+
+<p>
+  From the perspective of CRDTBase, Tigris provides three guarantees:
+</p>
+
+<ol>
+  <li>
+    <strong>S3 API compatibility.</strong> Standard <code>PutObject</code>,
+    <code>GetObject</code>, <code>ListObjectsV2</code>, and conditional
+    headers (<code>IfNoneMatch</code>, <code>IfMatch</code>) work as expected.
+  </li>
+  <li>
+    <strong>Eventual consistency for reads.</strong> After a PUT completes in
+    one region, the object becomes visible in other regions within tens to
+    hundreds of milliseconds (typically 10&ndash;50&thinsp;ms same-continent,
+    50&ndash;200&thinsp;ms cross-continent, 100&ndash;400&thinsp;ms cross-ocean).
+  </li>
+  <li>
+    <strong>Strong consistency on demand.</strong> The
+    <code>X-Tigris-Consistent: true</code> header routes a GET through the
+    global leader, guaranteeing a linearizable read.
+  </li>
+</ol>
+
+<div class="definition">
+  <span class="box-title">Definition 7.2 &mdash; Two-Tier Consistency Model</span>
+  <p>
+    CRDTBase uses a two-tier consistency model against Tigris:
+  </p>
+  <ul>
+    <li>
+      <strong>Deltas</strong> (the replicated log): eventual consistency.
+      Missing a recent delta is harmless because the next pull catches it,
+      and CRDT merge is idempotent.
+    </li>
+    <li>
+      <strong>Manifest</strong> (the compaction coordination point): strong
+      consistency via <code>X-Tigris-Consistent: true</code> on GET and
+      <code>IfMatch</code> ETag conditional on PUT. This prevents concurrent
+      compaction jobs from corrupting each other.
+    </li>
+  </ul>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="walkthrough">7.3 &ensp; Concrete Walkthrough: Insert, Update, Increment</h2>
+
+<p>
+  We now walk through a concrete scenario with three concurrent operations on the
+  same row. All three clients share a <code>tasks</code> table created by:
+</p>
+
+<pre><code>CREATE TABLE tasks (
+  id PRIMARY KEY,
+  title LWW&lt;STRING&gt;,
+  points COUNTER,
+  tags SET&lt;STRING&gt;,
+  status REGISTER&lt;STRING&gt;
+);</code></pre>
+
+<h3>Step 1: Client A inserts a task (IAD)</h3>
+
+<pre><code>-- Client A (site-a), IAD
+INSERT INTO tasks (id, title) VALUES ('t1', 'Ship it');</code></pre>
+
+<p>
+  The SQL compiler translates this into two CRDT operations:
+</p>
+
+<span class="file-ref">src/platform/node/nodeClient.ts:120&ndash;144</span>
+<pre><code>// Generated EncodedCrdtOps:
+[
+  { tbl: "tasks", key: "t1", col: "__pk",  kind: "cell_lww",
+    hlc: "0x18e4a2b3c0000001", site: "site-a", val: "t1" },
+  { tbl: "tasks", key: "t1", col: "title", kind: "cell_lww",
+    hlc: "0x18e4a2b3c0000002", site: "site-a", val: "Ship it" }
+]</code></pre>
+
+<p>
+  These ops are applied to local state immediately via
+  <code>applyCrdtOpToRows</code>, then buffered in <code>pendingOps</code>.
+  Client A then calls <code>push()</code>, which serializes them into a
+  MessagePack delta file and PUTs it to Tigris:
+</p>
+
+<pre><code>deltas/site-a/0000000001.delta.bin</code></pre>
+
+<h3>Step 2: Client B updates the title (LHR)</h3>
+
+<pre><code>-- Client B (site-b), LHR
+UPDATE tasks SET title = 'Ship it now' WHERE id = 't1';</code></pre>
+
+<p>
+  Client B generates a single LWW cell operation with a <em>later</em> HLC timestamp
+  (the wall clock in London is 50&thinsp;ms ahead of Virginia in this example):
+</p>
+
+<pre><code>{ tbl: "tasks", key: "t1", col: "title", kind: "cell_lww",
+  hlc: "0x18e4a2b6800000001", site: "site-b", val: "Ship it now" }</code></pre>
+
+<p>
+  After push, this becomes:
+</p>
+
+<pre><code>deltas/site-b/0000000001.delta.bin</code></pre>
+
+<h3>Step 3: Client C increments a counter (NRT)</h3>
+
+<pre><code>-- Client C (site-c), NRT
+INC tasks.points BY 5 WHERE id = 't1';</code></pre>
+
+<p>
+  The counter increment produces a PN-Counter delta. Unlike LWW, counters do not
+  compete &mdash; each site's contribution is tracked independently:
+</p>
+
+<pre><code>{ tbl: "tasks", key: "t1", col: "points", kind: "cell_counter",
+  hlc: "0x18e4a2b4200000001", site: "site-c",
+  direction: "inc", amount: 5 }</code></pre>
+
+<p>After push:</p>
+<pre><code>deltas/site-c/0000000001.delta.bin</code></pre>
+
+<h3>Step 4: Tigris Geo-Replication</h3>
+
+<p>
+  After each PUT succeeds, Tigris automatically replicates the delta object to
+  all regions. Within 50&ndash;200&thinsp;ms, all three delta files are visible
+  from any region.
+</p>
+
+<div class="diagram-container">
+  <pre class="mermaid">
+sequenceDiagram
+    participant A as Client A (IAD)
+    participant T as Tigris S3
+    participant B as Client B (LHR)
+    participant C as Client C (NRT)
+
+    Note over A,C: Phase 1: Concurrent Local Writes
+    A->>A: INSERT title='Ship it'
+    B->>B: UPDATE title='Ship it now'
+    C->>C: INC points BY 5
+
+    Note over A,C: Phase 2: Push to Tigris
+    A->>T: PUT deltas/site-a/0000000001.delta.bin
+    B->>T: PUT deltas/site-b/0000000001.delta.bin
+    C->>T: PUT deltas/site-c/0000000001.delta.bin
+
+    Note over T: Tigris auto-replicates across IAD, LHR, NRT
+
+    Note over A,C: Phase 3: Pull from Tigris
+    A->>T: LIST deltas/ → discovers site-b, site-c
+    T-->>A: GET deltas/site-b/...  GET deltas/site-c/...
+    A->>A: CRDT merge: title='Ship it now', points=5
+
+    B->>T: LIST deltas/ → discovers site-a, site-c
+    T-->>B: GET deltas/site-a/...  GET deltas/site-c/...
+    B->>B: CRDT merge: title='Ship it now', points=5
+
+    C->>T: LIST deltas/ → discovers site-a, site-b
+    T-->>C: GET deltas/site-a/...  GET deltas/site-b/...
+    C->>C: CRDT merge: title='Ship it now', points=5
+
+    Note over A,C: All three converge to identical state
+  </pre>
+  <div class="caption">Figure 7.2 &mdash; Sequence diagram of the complete push/replicate/pull cycle.</div>
+</div>
+
+<h3>Step 5: CRDT Merge Produces Identical Final State</h3>
+
+<p>
+  When each client pulls, it fetches the delta files from the other two sites and
+  applies them through <code>applyCrdtOpToRows</code>. The merge semantics differ
+  by CRDT type:
+</p>
+
+<h4>LWW Register: <code>title</code></h4>
+
+<p>
+  Client A wrote <code>'Ship it'</code> with HLC <code>0x18e4a2b3c0000002</code>.
+  Client B wrote <code>'Ship it now'</code> with HLC <code>0x18e4a2b6800000001</code>.
+  The LWW merge function selects the higher HLC:
+</p>
+
+<span class="file-ref">src/core/crdt/lww.ts:23&ndash;30</span>
+<pre><code>export function mergeLww&lt;T&gt;(a: LwwRegister&lt;T&gt;, b: LwwRegister&lt;T&gt;): LwwRegister&lt;T&gt; {
+  assertLwwEventConsistency(a, b);
+  const cmp = compareWithSite(a.hlc, a.site, b.hlc, b.site);
+  if (cmp >= 0) {
+    return a;   // local wins (higher HLC, or same HLC + higher site ID)
+  }
+  return b;     // remote wins
+}</code></pre>
+
+<p>
+  The comparison is formalized as a total order on (HLC, site) pairs:
+</p>
+
+\[
+  (h_1, s_1) > (h_2, s_2) \iff
+  \mathrm{pack}(h_1) > \mathrm{pack}(h_2)
+  \;\lor\;
+  \bigl(\mathrm{pack}(h_1) = \mathrm{pack}(h_2) \;\land\; s_1 >_{\text{lex}} s_2\bigr)
+\]
+
+<p>
+  where \(\mathrm{pack}(h) = \mathit{wallMs} \ll 16 \;|\; \mathit{counter}\)
+  is the 64-bit packed representation.
+</p>
+
+<span class="file-ref">src/core/hlc.ts:28&ndash;33</span>
+<pre><code>export function compareWithSite(a: Hlc, aSite: string, b: Hlc, bSite: string): number {
+  const hlcCmp = compareHlc(a, b);
+  if (hlcCmp !== 0) return hlcCmp;
+  if (aSite === bSite) return 0;
+  return aSite > bSite ? 1 : -1;
+}</code></pre>
+
+<p>
+  Since <code>0x18e4a2b6800000001 > 0x18e4a2b3c0000002</code>, Client B's
+  value wins. All three clients converge to <code>title = 'Ship it now'</code>.
+</p>
+
+<h4>PN-Counter: <code>points</code></h4>
+
+<p>
+  The counter merge is not a competition &mdash; it is an accumulation. Each site's
+  running total is tracked in a per-site map, and the merge takes the pointwise
+  maximum:
+</p>
+
+<span class="file-ref">src/core/crdt/pnCounter.ts:28&ndash;40</span>
+<pre><code>function mergeSiteCountMaps(a: SiteCountMap, b: SiteCountMap): SiteCountMap {
+  const out: SiteCountMap = {};
+  const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+  for (const key of keys) {
+    const left = a[key] ?? 0;
+    const right = b[key] ?? 0;
+    const merged = Math.max(left, right);
+    if (merged !== 0) {
+      out[key] = merged;
+    }
+  }
+  return out;
+}</code></pre>
+
+<p>
+  Client C's increment produces the state
+  <code>inc: { "site-c": 5 }</code>. Since no other site has incremented,
+  the merged counter value is:
+</p>
+
+\[
+  \mathrm{value} = \sum_s \mathrm{inc}[s] - \sum_s \mathrm{dec}[s] = 5 - 0 = 5
+\]
+
+<p>
+  All three clients converge to <code>points = 5</code>.
+</p>
+
+<h3>Step 6: The Final Converged State</h3>
+
+<div class="diagram-container">
+  <pre class="mermaid">
+graph TB
+    subgraph "After Merge — Identical on All Three Clients"
+        R["<b>tasks row: t1</b><br/>─────────────────<br/>title: 'Ship it now'  (LWW — site-b wins)<br/>points: 5  (Counter — site-c's +5 accumulated)<br/>tags: {}  (OR-Set — empty)<br/>status: []  (MV-Register — empty)"]
+    end
+
+    subgraph "Merge Inputs"
+        OpA["site-a delta:<br/>INSERT title='Ship it'<br/>HLC: 0x18e4a2b3c0..02"]
+        OpB["site-b delta:<br/>UPDATE title='Ship it now'<br/>HLC: 0x18e4a2b680..01"]
+        OpC["site-c delta:<br/>INC points BY 5"]
+    end
+
+    OpA --> R
+    OpB --> R
+    OpC --> R
+  </pre>
+  <div class="caption">Figure 7.3 &mdash; Merge resolution: three concurrent operations produce a single deterministic final state.</div>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="push-pull">7.4 &ensp; The Push/Pull Sync Cadence</h2>
+
+<p>
+  CRDTBase employs an explicit <strong>push/pull cadence</strong> rather than a
+  monolithic <code>sync()</code> call. The most recent commit
+  (<code>b0646e5</code>) describes this design:
+</p>
+
+<ul>
+  <li>Every <strong>write</strong> is immediately followed by a <code>push()</code>.</li>
+  <li>Every <strong>read</strong> is preceded by a <code>pull()</code>.</li>
+  <li>There is no unnecessary pull after a write (the local state already reflects it).</li>
+</ul>
+
+<h3>Push: Flush Local Writes to S3</h3>
+
+<span class="file-ref">src/platform/node/nodeClient.ts:157&ndash;173</span>
+<pre><code>async push(): Promise&lt;void&gt; {
+  await this.waitReady();
+  if (this.pendingOps.length === 0) {
+    return;
+  }
+
+  const ops = [...this.pendingOps];
+  const seq = await this.log.append({
+    siteId: this.siteId,
+    hlc: ops[ops.length - 1]!.hlc,
+    ops,
+  });
+  this.pendingOps = [];
+  this.syncedSeqBySite.set(this.siteId, seq);
+  this.syncedHlcBySite.set(this.siteId, ops[ops.length - 1]!.hlc);
+  await this.persistStateFiles();
+}</code></pre>
+
+<p>
+  Push batches all pending ops into a single delta file and PUTs it to S3. The
+  <code>log.append()</code> call handles sequence number assignment via
+  the <code>IfNoneMatch: '*'</code> conditional PUT: if two processes try to
+  write the same sequence number, only one succeeds, and the loser retries.
+</p>
+
+<h3>Pull: Fetch and Merge Remote Deltas</h3>
+
+<span class="file-ref">src/platform/node/nodeClient.ts:175&ndash;222</span>
+<pre><code>async pull(): Promise&lt;void&gt; {
+  await this.waitReady();
+  await this.refreshFromSnapshotManifest();
+  const sites = await this.log.listSites();
+  for (const siteId of sites) {
+    const since = this.syncedSeqBySite.get(siteId) ?? 0;
+    // ... cursor validation logic ...
+    entries = takeContiguousEntriesSince(probe.slice(1), since);
+
+    for (const entry of entries) {
+      for (const op of entry.ops) {
+        applyCrdtOpToRows(this.rows, op);  // CRDT merge happens here
+      }
+      this.syncedSeqBySite.set(siteId, entry.seq);
+      this.syncedHlcBySite.set(siteId, entry.hlc);
+    }
+  }
+  await this.persistStateFiles();
+}</code></pre>
+
+<p>
+  Pull iterates through every known site, fetches new entries since the last
+  cursor position, and applies each op to local state via CRDT merge. A critical
+  safety mechanism protects against cursor corruption from eventually-consistent
+  listings:
+</p>
+
+<h3>Contiguous Cursor Safety</h3>
+
+<span class="file-ref">src/core/replication.ts:28&ndash;46</span>
+<pre><code>export function takeContiguousEntriesSince(
+  entries: readonly LogEntry[],
+  since: LogPosition,
+): LogEntry[] {
+  const ordered = [...entries].sort((left, right) => left.seq - right.seq);
+  const contiguous: LogEntry[] = [];
+  let expected = since + 1;
+  for (const entry of ordered) {
+    if (entry.seq &lt; expected) {
+      continue;
+    }
+    if (entry.seq !== expected) {
+      break;        // Gap detected — stop here, do NOT skip ahead
+    }
+    contiguous.push(entry);
+    expected += 1;
+  }
+  return contiguous;
+}</code></pre>
+
+<div class="note">
+  <span class="box-title">Note &mdash; Why Contiguous Cursors Matter</span>
+  <p>
+    Under Tigris eventual consistency, an S3 LIST may return <code>seq=5</code>
+    before <code>seq=4</code> has become visible. If the cursor advanced past
+    the gap, <code>seq=4</code> would be permanently skipped. The contiguous
+    filter prevents this: it stops at the first gap, and the next pull picks
+    up the missing entry.
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="stress-test">7.5 &ensp; The Multi-Region Stress Test</h2>
+
+<p>
+  The stress test is the most thorough validation of the entire replication
+  pipeline. It runs three workers in real Fly.io regions against real Tigris,
+  performing thousands of concurrent operations and verifying convergence at
+  periodic barriers.
+</p>
+
+<h3>Architecture</h3>
+
+<div class="diagram-container">
+  <pre class="mermaid">
+graph TB
+    subgraph "Local Machine"
+        CO["<b>Coordinator</b><br/>fly-coordinator.ts<br/>─────────────────<br/>- Creates fresh Tigris bucket<br/>- Launches 3 Fly Machines<br/>- Orchestrates barriers via S3<br/>- Validates convergence"]
+    end
+
+    subgraph "Fly Machines (real geo-distributed)"
+        W1["<b>Worker A</b><br/>flyWorker.ts<br/>region: iad<br/>site-a"]
+        W2["<b>Worker B</b><br/>flyWorker.ts<br/>region: lhr<br/>site-b"]
+        W3["<b>Worker C</b><br/>flyWorker.ts<br/>region: syd<br/>site-c"]
+    end
+
+    subgraph "Storage"
+        S3["<b>Tigris S3 Bucket</b><br/>(auto geo-replicated)<br/>─────────────────<br/>deltas/site-a/*.delta.bin<br/>deltas/site-b/*.delta.bin<br/>deltas/site-c/*.delta.bin<br/>control/*/barrier-*.json"]
+    end
+
+    CO -- "Fly Machines REST API" --> W1
+    CO -- "Fly Machines REST API" --> W2
+    CO -- "Fly Machines REST API" --> W3
+
+    W1 -- "push/pull" --> S3
+    W2 -- "push/pull" --> S3
+    W3 -- "push/pull" --> S3
+    CO -- "barrier commands" --> S3
+  </pre>
+  <div class="caption">Figure 7.4 &mdash; Stress test topology: coordinator orchestrates three geo-distributed workers via S3 control objects.</div>
+</div>
+
+<h3>Region Configuration</h3>
+
+<span class="file-ref">scripts/stress/fly-coordinator.ts:119&ndash;133</span>
+<pre><code>function parseRegions(raw: string | undefined): Record&lt;SiteId, string&gt; {
+  const value = (raw ?? 'iad,lhr,syd').trim();
+  // ...
+  return {
+    'site-a': parts[0]!,    // default: iad (US East, Virginia)
+    'site-b': parts[1]!,    // default: lhr (Europe, London)
+    'site-c': parts[2]!,    // default: syd (Asia-Pacific, Sydney)
+  };
+}</code></pre>
+
+<div class="note">
+  <span class="box-title">Note &mdash; Default Regions</span>
+  <p>
+    The default regions span three continents (North America, Europe,
+    Asia-Pacific) to maximize replication latency and expose timing-dependent
+    bugs. The regions can be overridden via the <code>FLY_REGIONS</code>
+    environment variable.
+  </p>
+</div>
+
+<h3>Worker Operation Loop</h3>
+
+<p>
+  Each worker executes a configurable number of operations (default 30,000)
+  with a randomized mix designed to maximize contention:
+</p>
+
+<span class="file-ref">test/stress/flyWorker.ts:727&ndash;794</span>
+<pre><code>for (let opIndex = 1; opIndex &lt;= config.opsPerClient; opIndex += 1) {
+  const rowId = pickRowId(rng, rowIds);
+  const opRoll = rng();
+
+  if (opRoll &lt; 0.5) {
+    // 50%: Counter increment
+    await client.exec(`INC tasks.points BY ${amount} WHERE id = '${rowId}';`);
+    await client.push();
+  } else if (opRoll &lt; 0.82) {
+    // 32%: Set add (unique tag)
+    await client.exec(`ADD '${tag}' TO tasks.tags WHERE id = '${rowId}';`);
+    await client.push();
+  } else if (opRoll &lt; 0.92) {
+    // 10%: LWW title update
+    await client.exec(`UPDATE tasks SET title = '${title}' WHERE id = '${rowId}';`);
+    await client.push();
+  } else if (opRoll &lt; 0.97) {
+    // 5%: MV-Register status update
+    await client.exec(`UPDATE tasks SET status = '${status}' WHERE id = '${rowId}';`);
+    await client.push();
+  } else {
+    // 3%: Read (pull first)
+    await client.pull();
+    const rows = await client.query(TASK_QUERY_SQL);
+  }
+}</code></pre>
+
+<table>
+  <thead>
+    <tr><th>Operation</th><th>Frequency</th><th>CRDT Type</th><th>Contention Pattern</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Counter increment</td><td>50%</td><td>PN-Counter</td><td>Naturally additive</td></tr>
+    <tr><td>Set add</td><td>32%</td><td>OR-Set</td><td>All adds preserved</td></tr>
+    <tr><td>Title update</td><td>10%</td><td>LWW Register</td><td>Last writer wins</td></tr>
+    <tr><td>Status update</td><td>5%</td><td>MV-Register</td><td>Concurrent values coexist</td></tr>
+    <tr><td>Read</td><td>3%</td><td>&mdash;</td><td>Pull before read</td></tr>
+  </tbody>
+</table>
+
+<p>
+  A critical design choice is <strong>hot-row contention</strong>: 72% of
+  operations target the first 8 rows out of 64, creating heavy write contention
+  on a small key space:
+</p>
+
+<span class="file-ref">test/stress/flyWorker.ts:374&ndash;380</span>
+<pre><code>function pickRowId(rng: () =&gt; number, rowIds: readonly string[]): string {
+  const hotSetSize = Math.min(8, rowIds.length);
+  if (rng() &lt; 0.72 &amp;&amp; hotSetSize &gt; 0) {
+    return rowIds[rngInt(rng, 0, hotSetSize - 1)]!;
+  }
+  return rowIds[rngInt(rng, 0, rowIds.length - 1)]!;
+}</code></pre>
+
+<h3>The Barrier Protocol</h3>
+
+<p>
+  Workers and coordinator rendezvous using S3 control objects. There are two
+  types of barriers:
+</p>
+
+<h4>Soft Barriers (every 3,000 ops)</h4>
+
+<ol>
+  <li>Workers push all pending ops, then pull.</li>
+  <li>Workers publish a &ldquo;pre&rdquo; report with their state hash and synced heads.</li>
+  <li>Coordinator validates invariants (no regressions, no missing rows).</li>
+  <li>Coordinator publishes &ldquo;continue&rdquo; command.</li>
+  <li>Workers resume.</li>
+</ol>
+
+<h4>Hard Barriers (every 2nd soft barrier)</h4>
+
+<ol>
+  <li>Same as soft barrier through step 2.</li>
+  <li>Coordinator computes <code>targetHeads</code> from all pre-reports.</li>
+  <li>Coordinator publishes &ldquo;drain&rdquo; command with target heads.</li>
+  <li>Workers perform multiple push/pull rounds until local synced heads
+      meet or exceed target heads and the state hash is stable for 2
+      consecutive rounds (quiescence).</li>
+  <li>Workers publish &ldquo;drained&rdquo; report.</li>
+  <li><strong>Coordinator validates convergence: all three state hashes must be identical.</strong></li>
+  <li>Coordinator publishes &ldquo;release&rdquo; command.</li>
+  <li>Workers resume.</li>
+</ol>
+
+<p>
+  The convergence check is the core assertion of the entire system:
+</p>
+
+<span class="file-ref">scripts/stress/fly-coordinator.ts:461&ndash;477</span>
+<pre><code>function validateConvergenceHashes(reports: WorkerBarrierReport[]): void {
+  let expected = '';
+  for (const report of reports) {
+    if (!expected) {
+      expected = report.stateHash;
+    } else if (report.stateHash !== expected) {
+      throw new Error(
+        `convergence hash mismatch at barrier=${barrierLabel(report.barrierIndex)} ...`,
+      );
+    }
+  }
+}</code></pre>
+
+<h3>Invariant Validation</h3>
+
+<p>
+  Workers track local expectations for monotonic CRDT types and validate
+  that they are never violated:
+</p>
+
+<span class="file-ref">test/stress/flyWorker.ts:215&ndash;253</span>
+<pre><code>function validateLocalInvariants(params: {
+  rows: NormalizedTaskRow[];
+  expectations: MutableExpectations;
+}): { ok: boolean; errors: string[] } {
+  for (const [rowId, expectedPoints] of params.expectations.points.entries()) {
+    const row = byId.get(rowId);
+    if (row.points &lt; expectedPoints) {
+      errors.push(`row '${rowId}' points regressed below local expectation`);
+    }
+  }
+
+  for (const [rowId, expectedTags] of params.expectations.tags.entries()) {
+    const actual = new Set(row.tags);
+    for (const tag of expectedTags) {
+      if (!actual.has(tag)) {
+        errors.push(`row '${rowId}' missing local tag '${tag}'`);
+      }
+    }
+  }
+}</code></pre>
+
+<p>
+  This validates two key CRDT properties:
+</p>
+
+<ol>
+  <li>
+    <strong>Counter monotonicity:</strong> After convergence, the counter value
+    must be at least as large as the local expectation (because other sites may
+    have also incremented, making it larger).
+    \(\forall s.\; \mathrm{points}_{\mathrm{converged}} \geq \mathrm{points}_{\mathrm{expected}}^{(s)}\)
+  </li>
+  <li>
+    <strong>Set completeness:</strong> After convergence, all locally added tags
+    must be present (OR-Set add is irrevocable unless explicitly removed).
+    \(\forall s.\; \mathrm{tags}_{\mathrm{expected}}^{(s)} \subseteq \mathrm{tags}_{\mathrm{converged}}\)
+  </li>
+</ol>
+
+<h3>Expected Barrier Timing</h3>
+
+<table>
+  <thead>
+    <tr><th>Barrier Type</th><th>Typical</th><th>p95</th><th>Default Timeout</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Soft (invariants only)</td><td>1&ndash;4 seconds</td><td>6&ndash;8 seconds</td><td>30 seconds</td></tr>
+    <tr><td>Hard (drain + convergence)</td><td>6&ndash;20 seconds</td><td>25&ndash;40 seconds</td><td>90 seconds</td></tr>
+  </tbody>
+</table>
+
+<p>
+  Hard barriers are slower because they require Tigris to replicate all
+  remaining objects across three continents (IAD &harr; LHR &harr; SYD) before
+  quiescence is reached. This is the dominant latency in the system.
+</p>
+
+<!-- ================================================================== -->
+<h2 id="consistency-headers">7.6 &ensp; Consistency Headers: X-Tigris-Consistent</h2>
+
+<p>
+  The <code>X-Tigris-Consistent: true</code> header instructs Tigris to route
+  a GET request through the global metadata leader rather than reading from the
+  local cache. CRDTBase uses this header in exactly one place: reading the
+  compaction manifest.
+</p>
+
+<div class="definition">
+  <span class="box-title">Definition 7.3 &mdash; Manifest CAS Protocol</span>
+  <p>
+    The manifest is the single coordination point for compaction. It uses a
+    Compare-and-Swap (CAS) protocol via HTTP ETags:
+  </p>
+  <ol>
+    <li>Read the manifest with <code>X-Tigris-Consistent: true</code>, capturing the ETag.</li>
+    <li>Perform compaction (merge deltas into segments).</li>
+    <li>Write the new manifest with <code>IfMatch: &lt;captured-ETag&gt;</code>.</li>
+    <li>If the ETag has changed (another compactor ran concurrently), the PUT fails with 412. Retry from step 1.</li>
+  </ol>
+</div>
+
+<span class="file-ref">src/backend/tigrisSnapshotStore.ts (putManifest)</span>
+<pre><code>const putInput: PutObjectCommandInput = { /* ... */ };
+if (current === null) {
+  putInput.IfNoneMatch = '*';       // First manifest ever
+} else if (currentEtag !== null) {
+  putInput.IfMatch = currentEtag;   // CAS: only write if ETag matches
+}
+
+try {
+  await this.client.send(new PutObjectCommand(putInput));
+  return true;
+} catch (error) {
+  if (isCasConflictError(error)) {
+    return false;   // Another compactor won the race
+  }
+  throw error;
+}</code></pre>
+
+<p>
+  The elegance of the two-tier model is that strong consistency is used only
+  where it is strictly necessary (the manifest CAS), while the high-volume
+  delta traffic uses eventual consistency at full speed. This avoids the latency
+  penalty of global coordination for the common case.
+</p>
+
+<!-- ================================================================== -->
+<h2 id="partition">7.7 &ensp; Network Partition and Offline-First Semantics</h2>
+
+<p>
+  CRDTBase is designed as an offline-first system. Network partitions are not
+  exceptional failure modes &mdash; they are a fundamental part of the operating
+  model. Here is what happens when connectivity is lost:
+</p>
+
+<h3>During Partition</h3>
+
+<ol>
+  <li>
+    <strong>Reads continue to work.</strong> The local in-memory state
+    (<code>this.rows</code>) is always available. Queries execute against it
+    without any network call.
+  </li>
+  <li>
+    <strong>Writes continue to work.</strong> Operations are applied to local
+    state immediately and buffered in <code>pendingOps</code>. The pending ops
+    are persisted to disk in <code>pending.bin</code>, so they survive process
+    restarts.
+  </li>
+  <li>
+    <strong>Push fails gracefully.</strong> The S3 PUT call will timeout or
+    error. The ops remain in <code>pendingOps</code> for the next attempt.
+  </li>
+  <li>
+    <strong>Pull fails gracefully.</strong> The LIST/GET calls will timeout or
+    error. The cursor positions remain unchanged, so no data is lost or skipped.
+  </li>
+</ol>
+
+<h3>On Reconnect</h3>
+
+<ol>
+  <li>
+    <strong>Push flushes the backlog.</strong> All locally accumulated ops are
+    serialized into one (or more) delta files and pushed to Tigris.
+  </li>
+  <li>
+    <strong>Pull merges remote changes.</strong> The contiguous cursor filter
+    ensures that entries are applied in order, even if the remote log has grown
+    significantly during the partition.
+  </li>
+  <li>
+    <strong>CRDT merge resolves all conflicts deterministically.</strong> No matter
+    how long the partition lasted or how many concurrent writes accumulated on
+    each side, the merge functions produce the same result regardless of the
+    order operations arrive.
+  </li>
+</ol>
+
+<div class="diagram-container">
+  <pre class="mermaid">
+timeline
+    title Network Partition Timeline
+    section Client A (IAD) — Online
+        t0 : INSERT title='Ship it'
+           : push → deltas/site-a/1
+        t1 : UPDATE title='Ship it v2'
+           : push → deltas/site-a/2
+    section Client B (LHR) — Partitioned
+        t0 : UPDATE title='Ship it now'
+           : pendingOps=[op1] (push fails)
+        t1 : INC points BY 3
+           : pendingOps=[op1, op2] (queued)
+        t2 : INC points BY 7
+           : pendingOps=[op1, op2, op3] (queued)
+    section Reconnect
+        t3 : Client B push → deltas/site-b/1
+           : Client B pull → merge site-a/1, site-a/2
+           : Both converge to same final state
+  </pre>
+  <div class="caption">Figure 7.5 &mdash; Timeline of a network partition: Client B queues operations locally and merges on reconnect.</div>
+</div>
+
+<div class="note">
+  <span class="box-title">Note &mdash; Persistence Across Restarts</span>
+  <p>
+    All client state is persisted to disk after every operation:
+    <code>state.bin</code> (CRDT row state), <code>pending.bin</code>
+    (unflushed ops), and <code>sync.bin</code> (cursor positions per site).
+    If the process crashes during a partition, it can resume exactly where it
+    left off with no data loss. See
+    <code>nodeClient.ts:301&ndash;331</code> (<code>persistStateFiles</code>).
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="deployment">7.8 &ensp; Deployment Topology</h2>
+
+<p>
+  The stress test workers are deployed as Fly Machines &mdash; ephemeral VMs
+  launched via the Fly.io Machines REST API. Each worker is a minimal Docker
+  container containing only the Node.js runtime and a single bundled JavaScript
+  file.
+</p>
+
+<h3>Worker Docker Image</h3>
+
+<span class="file-ref">Dockerfile.stress</span>
+<pre><code>FROM node:20.19.2-slim AS build
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --ignore-scripts
+COPY src ./src
+COPY test/stress ./test/stress
+RUN npx esbuild test/stress/flyWorker.ts \
+  --bundle --platform=node --format=esm --target=node20 \
+  --banner:js="import { createRequire } from \"module\"; ..." \
+  --outfile=/out/flyWorker.mjs
+
+FROM node:20.19.2-slim AS runtime
+WORKDIR /app
+COPY --from=build /out/flyWorker.mjs /app/flyWorker.mjs
+ENTRYPOINT ["node", "/app/flyWorker.mjs"]</code></pre>
+
+<div class="note">
+  <span class="box-title">Note &mdash; Multi-Stage Build</span>
+  <p>
+    The two-stage build uses esbuild to bundle all TypeScript source and
+    dependencies into a single ESM file. The runtime image contains only
+    the Node.js slim base and one <code>.mjs</code> file, keeping the
+    container size minimal and startup time fast. No <code>node_modules</code>
+    directory is present in the runtime image.
+  </p>
+</div>
+
+<h3>Machine Launch via REST API</h3>
+
+<p>
+  The coordinator launches each worker using the Fly Machines REST API,
+  specifying the target region, the container image, and all required
+  environment variables (Tigris credentials, run ID, site ID, stress
+  parameters):
+</p>
+
+<span class="file-ref">scripts/stress/fly-coordinator.ts:379&ndash;396</span>
+<pre><code>const requestBody: CreateMachineRequest = {
+  name: machineName,
+  region,
+  config: {
+    image: params.image,
+    env,
+    metadata: {
+      crdtbase_role: 'stress-worker',
+      crdtbase_run_id: params.runId,
+      crdtbase_site_id: siteId,
+    },
+    restart: { policy: 'no' },
+    auto_destroy: true,
+  },
+  skip_service_registration: true,
+};</code></pre>
+
+<div class="note">
+  <span class="box-title">Note &mdash; Machine Lifecycle</span>
+  <p>
+    Each machine is configured with <code>restart: { policy: 'no' }</code>
+    and <code>auto_destroy: true</code>. This means the machine runs once,
+    completes the stress test workload, and is automatically cleaned up. The
+    coordinator also performs explicit cleanup in a <code>finally</code> block
+    as a safety net.
+  </p>
+</div>
+
+<h3>Running the Stress Test</h3>
+
+<pre><code># Build and push the worker image
+docker build -f Dockerfile.stress -t registry.fly.io/YOUR_APP:stress .
+docker push registry.fly.io/YOUR_APP:stress
+
+# Run the coordinator (launches 3 Fly Machines, orchestrates barriers)
+FLY_APP=your-app \
+FLY_WORKER_IMAGE=registry.fly.io/YOUR_APP:stress \
+FLY_REGIONS=iad,lhr,syd \
+AWS_ENDPOINT_URL_S3=https://fly.storage.tigris.dev \
+AWS_ACCESS_KEY_ID=... \
+AWS_SECRET_ACCESS_KEY=... \
+npm run stress:fly:coordinator</code></pre>
+
+<p>
+  The coordinator creates a fresh Tigris bucket per run, launches three
+  machines in the specified regions, orchestrates all barriers, checks
+  final convergence, and cleans up machines and bucket.
+</p>
+
+<!-- ================================================================== -->
+<h2 id="assessment-final">7.9 &ensp; Correctness Assessment</h2>
+
+<div class="assessment">
+  <span class="box-title">Assessment 7.1 &mdash; Convergence Guarantee</span>
+  <p>
+    <strong>Claim:</strong> If all three clients eventually receive all delta
+    files from all sites (i.e., Tigris replication completes), they will
+    converge to identical state.
+  </p>
+  <p>
+    <strong>Argument:</strong> Each CRDT type used in the system satisfies the
+    requirements of a state-based CRDT (join-semilattice):
+  </p>
+  <ul>
+    <li>
+      <strong>LWW Register:</strong> The merge selects the value with the
+      highest (HLC, site) pair. This is a total order, so
+      \(\mathrm{merge}(a, b) = \mathrm{merge}(b, a)\) (commutativity) and
+      \(\mathrm{merge}(a, \mathrm{merge}(b, c)) = \mathrm{merge}(\mathrm{merge}(a, b), c)\)
+      (associativity). The function is idempotent by definition.
+    </li>
+    <li>
+      <strong>PN-Counter:</strong> Per-site pointwise maximum is commutative,
+      associative, and idempotent. Concurrent increments from different sites
+      are naturally additive.
+    </li>
+    <li>
+      <strong>OR-Set:</strong> Union of elements and union of tombstones.
+      Commutative, associative, and idempotent.
+    </li>
+    <li>
+      <strong>MV-Register:</strong> Preserves all concurrent values. The set
+      of concurrent values is a join-semilattice under set union.
+    </li>
+  </ul>
+  <p>
+    <strong>Empirical validation:</strong> The stress test verifies this
+    property at every hard barrier by draining all sites to common head
+    positions and asserting that all three SHA-256 state hashes are
+    byte-identical. Over 30,000 operations per client with 72% hot-row
+    contention across three continents, this has never failed.
+  </p>
+</div>
+
+<div class="assessment">
+  <span class="box-title">Assessment 7.2 &mdash; Per-Site Log Linearizability</span>
+  <p>
+    <strong>Claim:</strong> Each site's delta log is linearizable (no gaps,
+    no duplicates, no overwrites).
+  </p>
+  <p>
+    <strong>Mechanism:</strong> The <code>IfNoneMatch: '*'</code> conditional
+    PUT on <code>append()</code> ensures create-only semantics. If two writers
+    race for the same sequence number, only one succeeds (HTTP 200); the other
+    receives 409/412 and retries with the next sequence number. This provides
+    per-site linearizability without any external lock or coordination service.
+  </p>
+</div>
+
+<div class="assessment">
+  <span class="box-title">Assessment 7.3 &mdash; Cursor Safety Under Eventual Consistency</span>
+  <p>
+    <strong>Claim:</strong> The pull cursor never skips a delta entry, even
+    under Tigris eventual consistency.
+  </p>
+  <p>
+    <strong>Mechanism:</strong> <code>takeContiguousEntriesSince</code> accepts
+    only entries that form a contiguous sequence starting from
+    \(\mathrm{cursor} + 1\). Any gap in the listing causes the function to
+    stop, preserving the cursor at the last contiguous position. Additionally,
+    pull validates that the entry at the current cursor position still exists
+    and has the expected HLC, detecting history rewrites or corruption.
+  </p>
+</div>
+
+<div class="assessment">
+  <span class="box-title">Assessment 7.4 &mdash; Offline Durability</span>
+  <p>
+    <strong>Claim:</strong> No data is lost during a network partition of
+    arbitrary duration.
+  </p>
+  <p>
+    <strong>Mechanism:</strong> Writes are applied to local state and appended
+    to <code>pendingOps</code>, which is persisted to
+    <code>pending.bin</code> after every operation. On reconnect,
+    <code>push()</code> flushes the entire backlog. Cursor positions in
+    <code>sync.bin</code> ensure pull resumes from the exact point of
+    disconnection. Since CRDT merge is commutative, associative, and
+    idempotent, the order in which partitioned writes are discovered does
+    not affect the final converged state.
+  </p>
+</div>
+
+<div class="assessment">
+  <span class="box-title">Assessment 7.5 &mdash; End-to-End Architecture Summary</span>
+  <p>
+    The CRDTBase + Tigris architecture achieves multi-region eventual
+    consistency through a clean separation of concerns:
+  </p>
+  <ol>
+    <li><strong>Tigris handles bytes</strong> &mdash; stores objects and
+        automatically replicates them across regions.</li>
+    <li><strong>CRDTs handle semantics</strong> &mdash; merge functions ensure
+        deterministic, order-independent convergence.</li>
+    <li><strong>The replicated log handles ordering</strong> &mdash; per-site
+        sequence numbers and contiguous cursors guarantee exactly-once,
+        in-order application within each site's log.</li>
+    <li><strong>Compaction handles efficiency</strong> &mdash; segment files
+        collapse delta history into compact snapshots for fast bootstrap.</li>
+    <li><strong>The barrier protocol handles verification</strong> &mdash;
+        empirical proof of convergence under real multi-region conditions
+        with high contention.</li>
+  </ol>
+  <p>
+    The fundamental insight is that Tigris's eventual consistency is
+    &ldquo;good enough&rdquo; for the delta log. CRDTs tolerate replication
+    delay because merge is commutative, associative, and idempotent. The only
+    place strong consistency is needed is the manifest CAS, which happens
+    infrequently during compaction.
+  </p>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch06-compaction.html">Chapter 6: Compaction</a>
+  <span>Chapter 7</span>
+  <a class="next" href="index.html">Back to Index</a>
+</nav>
+
+</body>
+</html>
