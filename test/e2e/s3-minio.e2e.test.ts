@@ -208,7 +208,6 @@ describe('S3 direct replication over MinIO chaos', () => {
         siteId: 'site-d',
         log: logD,
         dataDir: clientDDir,
-        snapshots,
         clock: createHlcClock({ nowWallMs: () => 4_000 }),
       });
       await clientD.pull();

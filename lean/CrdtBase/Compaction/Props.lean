@@ -101,6 +101,19 @@ theorem lww_compaction_preserves_state {α : Type}
       (ops := ops)
       (split := split))
 
+/-- Snapshot cutover law: load compacted prefix state, then replay suffix deltas. -/
+theorem snapshot_then_suffix_replay_eq_full_fold {α β : Type}
+    (step : β → α → β) (init : β) (compactedPrefix suffix : List α) :
+    List.foldl step (List.foldl step init compactedPrefix) suffix =
+      List.foldl step init (compactedPrefix ++ suffix) := by
+  simpa using compaction_preserves_state step init compactedPrefix suffix
+
+/-- If no new suffix deltas exist, replay after snapshot cutover is a no-op. -/
+theorem snapshot_cutover_idempotent_without_new_suffix {α β : Type}
+    (step : β → α → β) (init : β) (compactedPrefix : List α) :
+    List.foldl step (List.foldl step init compactedPrefix) [] =
+      List.foldl step init compactedPrefix := by
+  simp
 end Compaction
 
 end CrdtBase

@@ -14,6 +14,7 @@ import {
   ReplicatedLog,
   takeContiguousEntriesSince,
 } from '../core/replication';
+import { TigrisSnapshotStore } from './tigrisSnapshotStore';
 
 type S3LikeClient = {
   send(command: unknown): Promise<unknown>;
@@ -22,6 +23,7 @@ type S3LikeClient = {
 export type S3ReplicatedLogOptions = {
   bucket: string;
   prefix?: string;
+  snapshotPrefix?: string;
   client?: S3LikeClient;
   clientConfig?: S3ClientConfig;
 };
@@ -87,12 +89,14 @@ async function bodyToUint8Array(body: unknown): Promise<Uint8Array> {
 export class S3ReplicatedLog implements ReplicatedLog {
   private readonly bucket: string;
   private readonly sitePrefix: string;
+  private readonly snapshotPrefix: string;
   private readonly client: S3LikeClient;
 
   constructor(options: S3ReplicatedLogOptions) {
     this.bucket = options.bucket;
     const rootPrefix = trimSlashes(options.prefix ?? 'deltas');
     this.sitePrefix = ensureTrailingSlash(rootPrefix);
+    this.snapshotPrefix = trimSlashes(options.snapshotPrefix ?? 'snapshots') || 'snapshots';
     this.client =
       options.client ??
       new S3Client({
@@ -229,6 +233,14 @@ export class S3ReplicatedLog implements ReplicatedLog {
       token = response.IsTruncated ? response.NextContinuationToken : undefined;
     } while (token);
     return maxSeq;
+  }
+
+  getSnapshotStore(): TigrisSnapshotStore {
+    return new TigrisSnapshotStore({
+      bucket: this.bucket,
+      prefix: this.snapshotPrefix,
+      client: this.client,
+    });
   }
 
   private siteRoot(siteId: string): string {

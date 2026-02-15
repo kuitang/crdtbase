@@ -2,6 +2,7 @@ import { describe, expect } from 'vitest';
 import { test } from '@fast-check/vitest';
 import fc from 'fast-check';
 import {
+  buildClientSqlExecutionPlanFromSql,
   buildSqlExecutionPlanFromSql,
   generateCrdtOpsFromSql,
 } from '../../src/core/sql';
@@ -63,6 +64,65 @@ describe('SQL to CRDT op generation', () => {
       expect(index).toBe(hlcSequence.length);
     },
   );
+});
+
+describe('Client SQL planner restrictions', () => {
+  test('DROP TABLE is rejected for append-only schema metadata', () => {
+    expect(() =>
+      buildClientSqlExecutionPlanFromSql('DROP TABLE tasks;', {
+        schema: {},
+        site: 'site-a',
+        nextHlc: () => '0x1',
+      }),
+    ).toThrow(/append-only/i);
+  });
+
+  test('ALTER TABLE ADD COLUMN maps to replicated metadata write ops', () => {
+    const create = buildClientSqlExecutionPlanFromSql(
+      'CREATE TABLE tasks (id PRIMARY KEY, title LWW<STRING>);',
+      {
+        schema: {},
+        site: 'site-a',
+        nextHlc: (() => {
+          let n = 1;
+          return () => `0x${(n++).toString(16)}`;
+        })(),
+      },
+    );
+    expect(create.kind).toBe('write');
+    if (create.kind !== 'write') {
+      return;
+    }
+    expect(create.statementKind).toBe('create_table');
+    expect(create.ops.length).toBeGreaterThan(0);
+
+    const alter = buildClientSqlExecutionPlanFromSql(
+      'ALTER TABLE tasks ADD COLUMN points COUNTER;',
+      {
+        schema: {
+          tasks: {
+            pk: 'id',
+            partitionBy: null,
+            columns: {
+              id: { crdt: 'scalar' },
+              title: { crdt: 'lww' },
+            },
+          },
+        },
+        site: 'site-a',
+        nextHlc: (() => {
+          let n = 100;
+          return () => `0x${(n++).toString(16)}`;
+        })(),
+      },
+    );
+    expect(alter.kind).toBe('write');
+    if (alter.kind !== 'write') {
+      return;
+    }
+    expect(alter.statementKind).toBe('alter_table_add_column');
+    expect(alter.ops.length).toBeGreaterThan(0);
+  });
 });
 
 describe('SQL execution planner', () => {

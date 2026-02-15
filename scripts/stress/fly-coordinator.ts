@@ -67,6 +67,8 @@ type CoordinatorConfig = {
   stressDrainMaxExtraRounds: number;
   stressRowCount: number;
   stressPollIntervalMs: number;
+  stressCompactionEveryOps: number;
+  stressSnapshotPrefix: string;
   stressSoftBarrierTimeoutS: number;
   stressHardBarrierTimeoutS: number;
   stressFinalTimeoutS: number;
@@ -164,6 +166,8 @@ function readConfig(): CoordinatorConfig {
     stressDrainMaxExtraRounds: parsePositiveIntEnv('STRESS_DRAIN_MAX_EXTRA_ROUNDS', 200),
     stressRowCount: parsePositiveIntEnv('STRESS_ROW_COUNT', 64),
     stressPollIntervalMs: parsePositiveIntEnv('STRESS_POLL_INTERVAL_MS', 250),
+    stressCompactionEveryOps: parsePositiveIntEnv('STRESS_COMPACTION_EVERY_OPS', stressBarrierEveryOps),
+    stressSnapshotPrefix: process.env.STRESS_SNAPSHOT_PREFIX?.trim() || 'snapshots',
     stressSoftBarrierTimeoutS: parsePositiveIntEnv('STRESS_SOFT_BARRIER_TIMEOUT_S', 30),
     stressHardBarrierTimeoutS: parsePositiveIntEnv('STRESS_HARD_BARRIER_TIMEOUT_S', 90),
     stressFinalTimeoutS: parsePositiveIntEnv('STRESS_FINAL_TIMEOUT_S', 120),
@@ -336,6 +340,7 @@ async function launchWorkers(params: {
   app: string;
   image: string;
   regions: Record<SiteId, string>;
+  compactorSite: SiteId;
   runId: string;
   bucket: string;
   seed: number;
@@ -363,6 +368,9 @@ async function launchWorkers(params: {
       STRESS_DRAIN_MAX_EXTRA_ROUNDS: String(params.config.stressDrainMaxExtraRounds),
       STRESS_ROW_COUNT: String(params.config.stressRowCount),
       STRESS_POLL_INTERVAL_MS: String(params.config.stressPollIntervalMs),
+      STRESS_COMPACTION_EVERY_OPS: String(params.config.stressCompactionEveryOps),
+      STRESS_COMPACTOR_SITE: params.compactorSite,
+      STRESS_SNAPSHOT_PREFIX: params.config.stressSnapshotPrefix,
       STRESS_COMMAND_TIMEOUT_S: String(params.config.stressCommandTimeoutS),
       AWS_ENDPOINT_URL_S3: params.config.awsEndpointUrlS3,
       AWS_REGION: params.config.awsRegion,
@@ -386,6 +394,7 @@ async function launchWorkers(params: {
           crdtbase_role: 'stress-worker',
           crdtbase_run_id: params.runId,
           crdtbase_site_id: siteId,
+          crdtbase_compactor: siteId === params.compactorSite ? 'true' : 'false',
         },
         restart: {
           policy: 'no',
@@ -395,7 +404,9 @@ async function launchWorkers(params: {
       skip_service_registration: true,
     };
 
-    log(`Launching worker site=${siteId} region=${region} machine=${machineName}`);
+    log(
+      `Launching worker site=${siteId} region=${region} machine=${machineName} compactor=${siteId === params.compactorSite ? 1 : 0}`,
+    );
     let machine: FlyMachine | null = null;
     let lastError: unknown = null;
     for (let attempt = 1; attempt <= 3; attempt += 1) {
@@ -786,11 +797,14 @@ async function runOnce(params: {
   fly: FlyMachinesApiClient;
 }): Promise<void> {
   const runSeed = randomU32();
+  const compactorSite = SITE_IDS[runSeed % SITE_IDS.length]!;
   const runId = `run-${new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}-${params.index}-${runSeed}`;
   const bucket = sanitizeBucketName(`${params.config.bucketPrefix}-${runId}`);
   const barrierCount = Math.ceil(params.config.stressOpsPerClient / params.config.stressBarrierEveryOps);
 
-  log(`Run ${params.index}/${params.config.stressRuns}: seed=${runSeed} run_id=${runId} bucket=${bucket}`);
+  log(
+    `Run ${params.index}/${params.config.stressRuns}: seed=${runSeed} run_id=${runId} bucket=${bucket} compactor_site=${compactorSite} compaction_every_ops=${params.config.stressCompactionEveryOps}`,
+  );
   await createBucket(params.s3, bucket);
 
   let workers: WorkerInstance[] = [];
@@ -800,6 +814,7 @@ async function runOnce(params: {
       app: params.config.flyApp,
       image: params.config.flyWorkerImage,
       regions: params.config.regions,
+      compactorSite,
       runId,
       bucket,
       seed: runSeed,

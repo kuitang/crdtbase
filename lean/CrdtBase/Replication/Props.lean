@@ -41,6 +41,21 @@ theorem readSince_mem_gt_since
     rw [hFalse] at hTrue
     contradiction
 
+/-- Watermark form of `readSince_mem_gt_since`: every returned seq is strictly newer. -/
+theorem readSince_after_watermark_only_returns_gt_watermark
+    (entries : List LogEntry) (siteId : String) (watermark seq : Nat)
+    (hMem : seq ∈ readSince entries siteId watermark) :
+    seq > watermark :=
+  readSince_mem_gt_since entries siteId watermark seq hMem
+
+/-- Entries at or below compaction watermark are never replayed by `readSince`. -/
+theorem readSince_compacted_prefix_exclusion
+    (entries : List LogEntry) (siteId : String) (watermark seq : Nat)
+    (hLe : seq ≤ watermark) :
+    seq ∉ readSince entries siteId watermark := by
+  intro hMem
+  have hGt := readSince_after_watermark_only_returns_gt_watermark entries siteId watermark seq hMem
+  exact (Nat.not_lt_of_ge hLe) hGt
 end Replication
 
 end CrdtBase

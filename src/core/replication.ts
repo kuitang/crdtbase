@@ -1,4 +1,5 @@
 import { EncodedCrdtOp } from './sql';
+import type { SnapshotStore } from './snapshotStore';
 
 export type LogPosition = number;
 
@@ -16,6 +17,7 @@ export interface ReplicatedLog {
   readSince(siteId: string, since: LogPosition): Promise<LogEntry[]>;
   listSites(): Promise<string[]>;
   getHead(siteId: string): Promise<LogPosition>;
+  getSnapshotStore?(): SnapshotStore | null;
 }
 
 /**

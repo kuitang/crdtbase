@@ -5,20 +5,30 @@ import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { S3ReplicatedLog } from '../../src/backend/s3ReplicatedLog';
+import { TigrisSnapshotStore } from '../../src/backend/tigrisSnapshotStore';
+import type { SqlSchema } from '../../src/core/sql';
 import { createHlcClock } from '../../src/core/hlc';
+import { compactReplicatedLog } from '../../src/platform/node/compactor';
 import { NodeCrdtClient } from '../../src/platform/node/nodeClient';
+import {
+  CREATE_TASKS_TABLE_SQL,
+  TASK_QUERY_SQL,
+  schemaOwnerForSeed,
+} from '../shared/tasksSchema';
 
-const CREATE_TASKS_TABLE_SQL = [
-  'CREATE TABLE tasks (',
-  'id PRIMARY KEY,',
-  'title LWW<STRING>,',
-  'points COUNTER,',
-  'tags SET<STRING>,',
-  'status REGISTER<STRING>',
-  ')',
-].join(' ');
-
-const TASK_QUERY_SQL = 'SELECT * FROM tasks;';
+const TASKS_SCHEMA: SqlSchema = {
+  tasks: {
+    pk: 'id',
+    partitionBy: null,
+    columns: {
+      id: { crdt: 'scalar' },
+      title: { crdt: 'lww' },
+      points: { crdt: 'pn_counter' },
+      tags: { crdt: 'or_set' },
+      status: { crdt: 'mv_register' },
+    },
+  },
+};
 
 type SiteId = 'site-a' | 'site-b' | 'site-c';
 
@@ -29,6 +39,9 @@ type WorkerConfig = {
   bucket: string;
   s3Prefix: string;
   controlPrefix: string;
+  compactorSiteId: SiteId | null;
+  compactionEveryOps: number;
+  snapshotPrefix: string;
   opsPerClient: number;
   barrierEveryOps: number;
   hardBarrierEvery: number;
@@ -128,6 +141,14 @@ function parseSiteId(raw: string | undefined): SiteId {
     return raw;
   }
   throw new Error(`invalid SITE_ID='${String(raw)}'`);
+}
+
+
+function parseOptionalSiteId(raw: string | undefined): SiteId | null {
+  if (!raw || raw.trim().length === 0) {
+    return null;
+  }
+  return parseSiteId(raw.trim());
 }
 
 function readRequiredEnv(name: string): string {
@@ -322,6 +343,9 @@ function readConfig(): WorkerConfig {
   const bucket = readRequiredEnv('BUCKET_NAME');
   const s3Prefix = process.env.S3_PREFIX ?? 'deltas';
   const controlPrefix = process.env.CONTROL_PREFIX ?? 'control';
+  const compactorSiteId = parseOptionalSiteId(process.env.STRESS_COMPACTOR_SITE);
+  const compactionEveryOps = parsePositiveIntEnv('STRESS_COMPACTION_EVERY_OPS', 3_000);
+  const snapshotPrefix = process.env.STRESS_SNAPSHOT_PREFIX?.trim() || 'snapshots';
   const opsPerClient = parsePositiveIntEnv('STRESS_OPS_PER_CLIENT', 30_000);
   const barrierEveryOps = parsePositiveIntEnv('STRESS_BARRIER_EVERY_OPS', 3_000);
   const hardBarrierEvery = parsePositiveIntEnv('STRESS_HARD_BARRIER_EVERY', 2);
@@ -350,6 +374,9 @@ function readConfig(): WorkerConfig {
     bucket,
     s3Prefix,
     controlPrefix,
+    compactorSiteId,
+    compactionEveryOps,
+    snapshotPrefix,
     opsPerClient,
     barrierEveryOps,
     hardBarrierEvery,
@@ -458,10 +485,12 @@ async function waitForCommand(params: {
 
 async function runMain(): Promise<void> {
   const config = readConfig();
+  const schemaOwner = schemaOwnerForSeed(config.seed);
+  const isCompactor = config.compactorSiteId === config.siteId;
   logLine(
     config.siteId,
     config.runId,
-    `worker starting region=${config.region} ops=${config.opsPerClient} barrierEvery=${config.barrierEveryOps} hardEvery=${config.hardBarrierEvery} pushAfterWrite=true pullBeforeRead=true drainRounds=${config.drainRounds} quiescence=${config.drainQuiescenceRounds} maxExtra=${config.drainMaxExtraRounds}`,
+    `worker starting region=${config.region} ops=${config.opsPerClient} barrierEvery=${config.barrierEveryOps} hardEvery=${config.hardBarrierEvery} pushAfterWrite=true pullBeforeRead=true drainRounds=${config.drainRounds} quiescence=${config.drainQuiescenceRounds} maxExtra=${config.drainMaxExtraRounds} schemaOwner=${schemaOwner} compactorSite=${config.compactorSiteId ?? "none"} isCompactor=${isCompactor ? 1 : 0} compactionEveryOps=${config.compactionEveryOps}`,
   );
   const baseSeed = (config.seed ^ siteSalt(config.siteId)) >>> 0;
   const rng = createSeededRng(baseSeed);
@@ -499,6 +528,7 @@ async function runMain(): Promise<void> {
   const log = new S3ReplicatedLog({
     bucket: config.bucket,
     prefix: config.s3Prefix,
+    snapshotPrefix: config.snapshotPrefix,
     clientConfig: {
       endpoint,
       region,
@@ -510,6 +540,49 @@ async function runMain(): Promise<void> {
       },
     },
   });
+
+  const snapshots = isCompactor
+    ? new TigrisSnapshotStore({
+        bucket: config.bucket,
+        prefix: config.snapshotPrefix,
+        clientConfig: {
+          endpoint,
+          region,
+          forcePathStyle: process.env.S3_FORCE_PATH_STYLE === 'true',
+          credentials: {
+            accessKeyId,
+            secretAccessKey,
+            ...(sessionToken ? { sessionToken } : {}),
+          },
+        },
+      })
+    : null;
+  let snapshotSchemaPublished = false;
+
+  const runCompaction = async (trigger: string): Promise<void> => {
+    if (!snapshots) {
+      return;
+    }
+    if (!snapshotSchemaPublished) {
+      await snapshots.putSchema(TASKS_SCHEMA);
+      snapshotSchemaPublished = true;
+      logLine(config.siteId, config.runId, 'published snapshot schema prefix=' + config.snapshotPrefix);
+    }
+    const result = await compactReplicatedLog({
+      log,
+      snapshots,
+      schema: TASKS_SCHEMA,
+    });
+    logLine(
+      config.siteId,
+      config.runId,
+      'compaction trigger=' + trigger +
+        ' applied=' + String(result.applied ? 1 : 0) +
+        ' opsRead=' + String(result.opsRead) +
+        ' manifestVersion=' + String(result.manifest.version) +
+        ' segments=' + String(result.manifest.segments.length),
+    );
+  };
 
   const client = await NodeCrdtClient.open({
     siteId: config.siteId,
@@ -602,6 +675,9 @@ async function runMain(): Promise<void> {
     );
 
     if (command.action === 'drain') {
+      if (isCompactor) {
+        await runCompaction(`barrier-${barrierIndex}-entry`);
+      }
       const requestedRounds = command.drainRounds ?? config.drainRounds;
       const hardRoundLimit = requestedRounds + config.drainMaxExtraRounds;
       const targetHeads = command.targetHeads ?? {};
@@ -651,6 +727,9 @@ async function runMain(): Promise<void> {
         config.runId,
         `completed drain index=${barrierIndex} requested=${requestedRounds} performed=${roundsPerformed} stableRounds=${stableRounds} target=${JSON.stringify(targetHeads)} localSynced=${JSON.stringify(client.getSyncedHeads())}`,
       );
+      if (isCompactor) {
+        await runCompaction(`barrier-${barrierIndex}-drained`);
+      }
       await publishBarrier({
         barrierIndex,
         barrierType: 'hard',
@@ -684,8 +763,8 @@ async function runMain(): Promise<void> {
   };
 
   try {
-    await client.exec(CREATE_TASKS_TABLE_SQL);
-    if (config.siteId === 'site-a') {
+    if (config.siteId === schemaOwner) {
+      await client.exec(CREATE_TASKS_TABLE_SQL);
       for (const rowId of rowIds) {
         await client.exec(
           [
@@ -707,19 +786,34 @@ async function runMain(): Promise<void> {
       while (Date.now() < startupDeadline) {
         await client.pull();
         stats.pulls += 1;
-        const rows = normalizeTaskRows(await client.query(TASK_QUERY_SQL));
+        let rows: NormalizedTaskRow[] = [];
+        try {
+          rows = normalizeTaskRows(await client.query(TASK_QUERY_SQL));
+        } catch {
+          await sleep(300);
+          continue;
+        }
         if (rows.length >= config.rowCount) {
           break;
         }
         await sleep(300);
       }
-      const rows = normalizeTaskRows(await client.query(TASK_QUERY_SQL));
+      let rows: NormalizedTaskRow[] = [];
+      try {
+        rows = normalizeTaskRows(await client.query(TASK_QUERY_SQL));
+      } catch {
+        rows = [];
+      }
       if (rows.length < config.rowCount) {
         throw new Error(
           `startup pull did not receive seeded rows: expected>=${config.rowCount} got=${rows.length}`,
         );
       }
       logLine(config.siteId, config.runId, `startup pull completed rows=${rows.length}`);
+    }
+
+    if (isCompactor) {
+      await runCompaction('startup');
     }
 
     let barrierIndex = 0;
@@ -780,6 +874,10 @@ async function runMain(): Promise<void> {
         stats.pushes += 1;
       }
 
+      if (isCompactor && opIndex % config.compactionEveryOps === 0) {
+        await runCompaction(`op-${opIndex}`);
+      }
+
       if (opIndex % config.barrierEveryOps === 0) {
         barrierIndex += 1;
         await runBarrier(barrierIndex, opIndex);
@@ -797,6 +895,10 @@ async function runMain(): Promise<void> {
     if (config.opsPerClient % config.barrierEveryOps !== 0) {
       barrierIndex += 1;
       await runBarrier(barrierIndex, config.opsPerClient);
+    }
+
+    if (isCompactor) {
+      await runCompaction('final');
     }
 
     await client.push();

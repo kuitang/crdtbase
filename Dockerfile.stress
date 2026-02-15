@@ -8,6 +8,7 @@ RUN npm ci --ignore-scripts
 
 COPY src ./src
 COPY test/stress ./test/stress
+COPY test/shared ./test/shared
 
 RUN npx esbuild test/stress/flyWorker.ts \
   --bundle \

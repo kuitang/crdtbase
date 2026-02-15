@@ -1,3 +1,9 @@
+import {
+  CREATE_TASKS_TABLE_SQL,
+  TASK_QUERY_SQL,
+  schemaOwnerForSeed,
+} from '../shared/tasksSchema';
+
 export type E2eSiteId = 'site-a' | 'site-b' | 'site-c';
 
 export type E2eClientAdapter = {
@@ -21,6 +27,7 @@ export type NormalizedTaskRow = {
 
 export type E2eChaosScenarioConfig = {
   seed: number;
+  schemaOwner?: E2eSiteId;
   stepsPerClient: number;
   maxDelayMs: number;
   rowIds: string[];
@@ -29,6 +36,7 @@ export type E2eChaosScenarioConfig = {
 };
 
 export type E2eChaosScenarioResult = {
+  schemaOwner: E2eSiteId;
   normalizedRowsBySite: Record<E2eSiteId, NormalizedTaskRow[]>;
   observerRows: NormalizedTaskRow[] | null;
   expectedPointsByRow: Record<string, number>;
@@ -42,17 +50,7 @@ export type E2eChaosScenarioResult = {
   };
 };
 
-export const CREATE_TASKS_TABLE_SQL = [
-  'CREATE TABLE tasks (',
-  'id PRIMARY KEY,',
-  'title LWW<STRING>,',
-  'points COUNTER,',
-  'tags SET<STRING>,',
-  'status REGISTER<STRING>',
-  ')',
-].join(' ');
-
-export const TASK_QUERY_SQL = 'SELECT * FROM tasks;';
+export { CREATE_TASKS_TABLE_SQL, TASK_QUERY_SQL };
 
 const SITE_IDS: E2eSiteId[] = ['site-a', 'site-b', 'site-c'];
 
@@ -344,14 +342,13 @@ async function initializeRows(params: {
   clients: E2eClientMap;
   observer?: E2eClientAdapter;
   rowIds: readonly string[];
+  schemaOwner: E2eSiteId;
 }): Promise<void> {
-  await Promise.all(SITE_IDS.map((siteId) => params.clients[siteId].exec(CREATE_TASKS_TABLE_SQL)));
-  if (params.observer) {
-    await params.observer.exec(CREATE_TASKS_TABLE_SQL);
-  }
+  await params.clients[params.schemaOwner].exec(CREATE_TASKS_TABLE_SQL);
+  await syncAll(params.clients);
 
   for (const rowId of params.rowIds) {
-    await params.clients['site-a'].exec(
+    await params.clients[params.schemaOwner].exec(
       [
         'INSERT INTO tasks (id, title, points, tags, status) VALUES (',
         `'${escapeSqlString(rowId)}',`,
@@ -376,6 +373,7 @@ export async function runThreeClientChaosScenario(params: {
     ...DEFAULT_CONFIG,
     ...params.config,
   };
+  const schemaOwner = config.schemaOwner ?? schemaOwnerForSeed(config.seed);
 
   if (!Number.isInteger(config.seed)) {
     throw new Error(`seed must be an integer, got ${String(config.seed)}`);
@@ -399,6 +397,7 @@ export async function runThreeClientChaosScenario(params: {
     clients: params.clients,
     observer: params.observer,
     rowIds: config.rowIds,
+    schemaOwner,
   });
 
   const scripts: Record<E2eSiteId, ScriptStep[]> = {
@@ -488,6 +487,7 @@ export async function runThreeClientChaosScenario(params: {
 
   const materialized = materializeExpectations(expectations);
   return {
+    schemaOwner,
     normalizedRowsBySite,
     observerRows,
     expectedPointsByRow: materialized.expectedPointsByRow,

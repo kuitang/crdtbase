@@ -135,3 +135,51 @@ aws --endpoint-url "$AWS_ENDPOINT_URL_S3" s3 cp \
   "s3://$BUCKET_NAME/deltas/site-a/0000000001.delta.bin" \
   - | node cli.mjs dump -
 ```
+
+## Fly Stress Checklist
+
+Use this checklist before running Fly multi-region stress to avoid token and image mismatches.
+
+- Ensure `flyctl` is installed at `/home/kuitang/.fly/bin/flyctl` and on `PATH`:
+```bash
+export PATH="$HOME/.fly/bin:$PATH"
+flyctl version
+```
+
+- Load canonical Tigris/AWS environment:
+```bash
+source deploy/tigris/.env.local
+```
+
+- Build and push a fresh stress worker image from current repo state:
+```bash
+APP=crdtbase-stress-260209055135
+TAG="stress-$(date -u +%Y%m%d)-$(date -u +%H%M%S)"
+IMAGE="registry.fly.io/${APP}:${TAG}"
+
+export PATH="$HOME/.fly/bin:$PATH"
+flyctl auth docker
+docker build -f Dockerfile.stress -t "$IMAGE" .
+docker push "$IMAGE"
+```
+
+- Export coordinator env (do not disable token refresh):
+```bash
+export FLY_APP="$APP"
+export FLY_WORKER_IMAGE="$IMAGE"
+export FLY_API_TOKEN_COMMAND='flyctl auth token --quiet'
+export FLY_API_TOKEN="$(flyctl auth token --quiet)"
+```
+
+- Run the coordinator (example timing shape used in reports):
+```bash
+export STRESS_RUNS=3
+export STRESS_OPS_PER_CLIENT=120
+export STRESS_BARRIER_EVERY_OPS=30
+export STRESS_HARD_BARRIER_EVERY=1
+export STRESS_COMPACTION_EVERY_OPS=30
+
+# Use bash built-in time (portable even when /usr/bin/time is unavailable)
+TIMEFORMAT='real %3R\nuser %3U\nsys %3S'
+time npm run stress:fly:coordinator
+```

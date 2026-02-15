@@ -7,6 +7,7 @@ import { NodeCrdtClient } from '../../src/platform/node/nodeClient';
 import type { E2eSiteId } from './orchestrator';
 import { assertAckedWritesVisible, readPositiveIntEnv } from './chaosShared';
 import { BackendMatrixKind, startBackendMatrixHarness } from './backendMatrixHarness';
+import { schemaOwnerForSeed } from '../shared/tasksSchema';
 import {
   buildDeterministicTrace,
   replayDeterministicTraceScenario,
@@ -101,6 +102,7 @@ async function runTraceOnBackend(params: {
         rowIds: params.rowIds,
         drainRounds: params.drainRounds,
         quiescenceRounds: params.quiescenceRounds,
+        schemaOwner: schemaOwnerForSeed(params.seed),
       },
     });
 

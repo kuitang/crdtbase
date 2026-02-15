@@ -35,6 +35,12 @@ export type DropTableStatement = {
   table: string;
 };
 
+export type AlterTableAddColumnStatement = {
+  kind: 'alter_table_add_column';
+  table: string;
+  column: SqlCreateColumn;
+};
+
 export type InsertStatement = {
   kind: 'insert';
   table: string;
@@ -100,6 +106,7 @@ export type RemoveStatement = SetStatementBase & {
 export type SqlStatement =
   | CreateTableStatement
   | DropTableStatement
+  | AlterTableAddColumnStatement
   | InsertStatement
   | UpdateStatement
   | SelectStatement
@@ -217,6 +224,7 @@ export type CrdtOpGenerationContext = {
 export type SqlExecutionPlan =
   | { kind: 'ddl_create_table'; table: string; schema: SqlTableSchema }
   | { kind: 'ddl_drop_table'; table: string }
+  | { kind: 'ddl_alter_table_add_column'; table: string; column: SqlCreateColumn }
   | { kind: 'read'; select: SelectQueryPlan }
   | {
       kind: 'write';
@@ -226,11 +234,46 @@ export type SqlExecutionPlan =
       | DecStatement['kind']
       | AddStatement['kind']
       | RemoveStatement['kind']
-      | DeleteStatement['kind'];
+      | DeleteStatement['kind']
+      | CreateTableStatement['kind']
+      | AlterTableAddColumnStatement['kind'];
       ops: EncodedCrdtOp[];
     };
 
 const COMPARISON_OPERATORS = new Set<SqlComparisonOp>(['=', '!=', '<', '>', '<=', '>=']);
+
+export const INFORMATION_SCHEMA_TABLES = 'information_schema.tables';
+export const INFORMATION_SCHEMA_COLUMNS = 'information_schema.columns';
+
+const INFORMATION_SCHEMA_METADATA: Readonly<Record<string, SqlTableSchema>> = {
+  [INFORMATION_SCHEMA_TABLES]: {
+    pk: 'table_name',
+    partitionBy: null,
+    columns: {
+      table_name: { crdt: 'scalar' },
+      pk_column: { crdt: 'lww' },
+      partition_by: { crdt: 'lww' },
+    },
+  },
+  [INFORMATION_SCHEMA_COLUMNS]: {
+    pk: 'column_id',
+    partitionBy: null,
+    columns: {
+      column_id: { crdt: 'scalar' },
+      table_name: { crdt: 'lww' },
+      column_name: { crdt: 'lww' },
+      crdt_kind: { crdt: 'lww' },
+    },
+  },
+};
+
+export type SqlClientExecutionPlan =
+  | { kind: 'read'; select: SelectQueryPlan }
+  | {
+      kind: 'write';
+      statementKind: SqlStatement['kind'];
+      ops: EncodedCrdtOp[];
+    };
 
 type Token =
   | { kind: 'identifier'; text: string }
@@ -365,6 +408,7 @@ class Parser {
   private parseStatement(): SqlStatement {
     if (this.matchKeyword('CREATE')) return this.parseCreateTable();
     if (this.matchKeyword('DROP')) return this.parseDropTable();
+    if (this.matchKeyword('ALTER')) return this.parseAlterTable();
     if (this.matchKeyword('INSERT')) return this.parseInsert();
     if (this.matchKeyword('UPDATE')) return this.parseUpdate();
     if (this.matchKeyword('SELECT')) return this.parseSelect();
@@ -378,7 +422,7 @@ class Parser {
 
   private parseCreateTable(): CreateTableStatement {
     this.expectKeyword('TABLE');
-    const table = this.expectIdentifier();
+    const table = this.parseTableIdentifier();
     this.expectSymbol('(');
     const columns = this.parseCreateColumns();
     this.expectSymbol(')');
@@ -456,13 +500,22 @@ class Parser {
 
   private parseDropTable(): DropTableStatement {
     this.expectKeyword('TABLE');
-    const table = this.expectIdentifier();
+    const table = this.parseTableIdentifier();
     return { kind: 'drop_table', table };
+  }
+
+  private parseAlterTable(): AlterTableAddColumnStatement {
+    this.expectKeyword('TABLE');
+    const table = this.parseTableIdentifier();
+    this.expectKeyword('ADD');
+    this.expectKeyword('COLUMN');
+    const column = this.parseCreateColumn();
+    return { kind: 'alter_table_add_column', table, column };
   }
 
   private parseInsert(): InsertStatement {
     this.expectKeyword('INTO');
-    const table = this.expectIdentifier();
+    const table = this.parseTableIdentifier();
     this.expectSymbol('(');
     const columns = this.parseIdentifierList();
     this.expectSymbol(')');
@@ -480,7 +533,7 @@ class Parser {
   }
 
   private parseUpdate(): UpdateStatement {
-    const table = this.expectIdentifier();
+    const table = this.parseTableIdentifier();
     this.expectKeyword('SET');
     const assignments = this.parseAssignments();
     const where = this.parseWhere(true);
@@ -505,7 +558,7 @@ class Parser {
   private parseSelect(): SelectStatement {
     const columns = this.matchSymbol('*') ? '*' : this.parseIdentifierList();
     this.expectKeyword('FROM');
-    const table = this.expectIdentifier();
+    const table = this.parseTableIdentifier();
     const where = this.parseWhere(false);
     return where
       ? { kind: 'select', table, columns, where }
@@ -514,7 +567,7 @@ class Parser {
 
   private parseDelete(): DeleteStatement {
     this.expectKeyword('FROM');
-    const table = this.expectIdentifier();
+    const table = this.parseTableIdentifier();
     const where = this.parseWhere(true);
     return { kind: 'delete', table, where };
   }
@@ -540,10 +593,24 @@ class Parser {
   }
 
   private parseQualifiedColumn(): { table: string; column: string } {
-    const table = this.expectIdentifier();
-    this.expectSymbol('.');
-    const column = this.expectIdentifier();
+    const parts: string[] = [this.expectIdentifier()];
+    while (this.matchSymbol('.')) {
+      parts.push(this.expectIdentifier());
+    }
+    if (parts.length < 2) {
+      this.raise('expected qualified column reference <table>.<column>');
+    }
+    const column = parts[parts.length - 1]!;
+    const table = parts.slice(0, parts.length - 1).join('.');
     return { table, column };
+  }
+
+  private parseTableIdentifier(): string {
+    const parts: string[] = [this.expectIdentifier()];
+    while (this.matchSymbol('.')) {
+      parts.push(this.expectIdentifier());
+    }
+    return parts.join('.');
   }
 
   private parseWhere(required: true): SqlWhereCondition[];
@@ -754,6 +821,12 @@ export function printSql(statement: SqlStatement): string {
     }
     case 'drop_table':
       return `DROP TABLE ${statement.table}`;
+    case 'alter_table_add_column': {
+      const column = statement.column.primaryKey
+        ? `${statement.column.name} PRIMARY KEY`
+        : `${statement.column.name} ${printColumnType(statement.column.type)}`;
+      return `ALTER TABLE ${statement.table} ADD COLUMN ${column}`;
+    }
     case 'insert':
       return `INSERT INTO ${statement.table} (${statement.columns.join(', ')}) VALUES (${statement.values
         .map(printSqlLiteral)
@@ -909,14 +982,47 @@ export function tableSchemaFromCreate(statement: CreateTableStatement): SqlTable
   };
 }
 
+function addColumnToTableSchema(
+  table: string,
+  tableSchema: SqlTableSchema,
+  column: SqlCreateColumn,
+): SqlTableSchema {
+  if (column.primaryKey) {
+    throw new Error(`ALTER TABLE ${table} ADD COLUMN cannot add PRIMARY KEY columns`);
+  }
+  if (tableSchema.columns[column.name]) {
+    throw new Error(`ALTER TABLE ${table} ADD COLUMN has duplicate column '${column.name}'`);
+  }
+  const nextColumns = {
+    ...tableSchema.columns,
+    [column.name]: {
+      crdt: columnTypeToSchema(column.type),
+    },
+  };
+  return {
+    ...tableSchema,
+    columns: nextColumns,
+  };
+}
+
 export function applyDdlToSchema(
   schema: SqlSchema,
-  statement: CreateTableStatement | DropTableStatement,
+  statement: CreateTableStatement | DropTableStatement | AlterTableAddColumnStatement,
 ): SqlSchema {
   if (statement.kind === 'create_table') {
     return {
       ...schema,
       [statement.table]: tableSchemaFromCreate(statement),
+    };
+  }
+  if (statement.kind === 'alter_table_add_column') {
+    const current = schema[statement.table];
+    if (!current) {
+      throw new Error(`unknown table '${statement.table}'`);
+    }
+    return {
+      ...schema,
+      [statement.table]: addColumnToTableSchema(statement.table, current, statement.column),
     };
   }
   const next = { ...schema };
@@ -989,6 +1095,209 @@ function createRowExistsOp(
 ): EncodedCrdtOp {
   const op = createOp(context, table, key);
   return { ...op, kind: 'row_exists', exists };
+}
+
+function isInformationSchemaTable(table: string): boolean {
+  return table.startsWith('information_schema.');
+}
+
+function assertUserTableWrite(table: string, statementKind: SqlStatement['kind']): void {
+  if (isInformationSchemaTable(table)) {
+    throw new Error(
+      `${statementKind.toUpperCase()} cannot target '${table}'; information_schema is append-only metadata`,
+    );
+  }
+}
+
+function tableSchemasEqual(left: SqlTableSchema, right: SqlTableSchema): boolean {
+  if (left.pk !== right.pk) {
+    return false;
+  }
+  if ((left.partitionBy ?? null) !== (right.partitionBy ?? null)) {
+    return false;
+  }
+  const leftColumns = Object.keys(left.columns).sort();
+  const rightColumns = Object.keys(right.columns).sort();
+  if (leftColumns.length !== rightColumns.length) {
+    return false;
+  }
+  for (let index = 0; index < leftColumns.length; index += 1) {
+    const leftName = leftColumns[index]!;
+    const rightName = rightColumns[index]!;
+    if (leftName !== rightName) {
+      return false;
+    }
+    if (left.columns[leftName]!.crdt !== right.columns[rightName]!.crdt) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function columnId(table: string, column: string): string {
+  return `${table}:${column}`;
+}
+
+function createInformationSchemaTableOps(
+  context: CrdtOpGenerationContext,
+  table: string,
+  schema: SqlTableSchema,
+): EncodedCrdtOp[] {
+  const ops: EncodedCrdtOp[] = [
+    createRowExistsOp(context, INFORMATION_SCHEMA_TABLES, table, true),
+    {
+      ...createOp(context, INFORMATION_SCHEMA_TABLES, table),
+      kind: 'cell_lww',
+      col: 'pk_column',
+      val: schema.pk,
+    },
+    {
+      ...createOp(context, INFORMATION_SCHEMA_TABLES, table),
+      kind: 'cell_lww',
+      col: 'partition_by',
+      val: schema.partitionBy ?? null,
+    },
+  ];
+  const columnNames = Object.keys(schema.columns).sort();
+  for (const name of columnNames) {
+    const key = columnId(table, name);
+    ops.push(createRowExistsOp(context, INFORMATION_SCHEMA_COLUMNS, key, true));
+    ops.push({
+      ...createOp(context, INFORMATION_SCHEMA_COLUMNS, key),
+      kind: 'cell_lww',
+      col: 'table_name',
+      val: table,
+    });
+    ops.push({
+      ...createOp(context, INFORMATION_SCHEMA_COLUMNS, key),
+      kind: 'cell_lww',
+      col: 'column_name',
+      val: name,
+    });
+    ops.push({
+      ...createOp(context, INFORMATION_SCHEMA_COLUMNS, key),
+      kind: 'cell_lww',
+      col: 'crdt_kind',
+      val: schema.columns[name]!.crdt,
+    });
+  }
+  return ops;
+}
+
+function createInformationSchemaColumnOps(
+  context: CrdtOpGenerationContext,
+  table: string,
+  column: string,
+  crdt: SqlColumnCrdt,
+): EncodedCrdtOp[] {
+  const key = columnId(table, column);
+  return [
+    createRowExistsOp(context, INFORMATION_SCHEMA_COLUMNS, key, true),
+    {
+      ...createOp(context, INFORMATION_SCHEMA_COLUMNS, key),
+      kind: 'cell_lww',
+      col: 'table_name',
+      val: table,
+    },
+    {
+      ...createOp(context, INFORMATION_SCHEMA_COLUMNS, key),
+      kind: 'cell_lww',
+      col: 'column_name',
+      val: column,
+    },
+    {
+      ...createOp(context, INFORMATION_SCHEMA_COLUMNS, key),
+      kind: 'cell_lww',
+      col: 'crdt_kind',
+      val: crdt,
+    },
+  ];
+}
+
+function requireSchemaWriteContext(
+  context: Partial<CrdtOpGenerationContext>,
+): CrdtOpGenerationContext {
+  if (!context.schema || !context.site || !context.nextHlc) {
+    throw new Error('DDL planning requires schema, site, and nextHlc');
+  }
+  return {
+    schema: context.schema,
+    site: context.site,
+    nextHlc: context.nextHlc,
+    resolveSetRemoveTags: context.resolveSetRemoveTags,
+  };
+}
+
+function planCreateTableSchemaMutation(
+  statement: CreateTableStatement,
+  context: CrdtOpGenerationContext,
+): EncodedCrdtOp[] {
+  if (isInformationSchemaTable(statement.table)) {
+    throw new Error(`CREATE TABLE cannot target reserved schema '${statement.table}'`);
+  }
+  const desired = tableSchemaFromCreate(statement);
+  const existing = context.schema[statement.table];
+  if (existing) {
+    if (tableSchemasEqual(existing, desired)) {
+      return [];
+    }
+    throw new Error(`CREATE TABLE '${statement.table}' conflicts with existing schema`);
+  }
+  return createInformationSchemaTableOps(context, statement.table, desired);
+}
+
+function planAlterAddColumnSchemaMutation(
+  statement: AlterTableAddColumnStatement,
+  context: CrdtOpGenerationContext,
+): EncodedCrdtOp[] {
+  if (isInformationSchemaTable(statement.table)) {
+    throw new Error(`ALTER TABLE cannot target reserved schema '${statement.table}'`);
+  }
+  const tableSchema = requireTableSchema(context.schema, statement.table);
+  if (statement.column.primaryKey) {
+    throw new Error(`ALTER TABLE ${statement.table} ADD COLUMN cannot add PRIMARY KEY columns`);
+  }
+  const newCrdt = columnTypeToSchema(statement.column.type);
+  const existingColumn = tableSchema.columns[statement.column.name];
+  if (existingColumn) {
+    if (existingColumn.crdt === newCrdt) {
+      return [];
+    }
+    throw new Error(
+      `ALTER TABLE ${statement.table} ADD COLUMN '${statement.column.name}' conflicts with existing definition`,
+    );
+  }
+  return createInformationSchemaColumnOps(
+    context,
+    statement.table,
+    statement.column.name,
+    newCrdt,
+  );
+}
+
+export function buildInformationSchemaMetadata(): SqlSchema {
+  return Object.fromEntries(
+    Object.entries(INFORMATION_SCHEMA_METADATA).map(([table, schema]) => [
+      table,
+      {
+        pk: schema.pk,
+        partitionBy: schema.partitionBy ?? null,
+        columns: Object.fromEntries(
+          Object.entries(schema.columns).map(([column, definition]) => [
+            column,
+            { crdt: definition.crdt },
+          ]),
+        ),
+      },
+    ]),
+  );
+}
+
+export function buildEffectiveSchemaForPlanning(schema: SqlSchema): SqlSchema {
+  return {
+    ...buildInformationSchemaMetadata(),
+    ...schema,
+  };
 }
 
 function createInsertColumnOp(
@@ -1233,6 +1542,7 @@ export function generateCrdtOps(
     | DeleteStatement,
   context: CrdtOpGenerationContext,
 ): EncodedCrdtOp[] {
+  assertUserTableWrite(statement.table, statement.kind);
   const tableSchema = requireTableSchema(context.schema, statement.table);
 
   switch (statement.kind) {
@@ -1257,7 +1567,12 @@ export function generateCrdtOpsFromSql(
   context: CrdtOpGenerationContext,
 ): EncodedCrdtOp[] {
   const statement = parseSql(sql);
-  if (statement.kind === 'select' || statement.kind === 'create_table' || statement.kind === 'drop_table') {
+  if (
+    statement.kind === 'select' ||
+    statement.kind === 'create_table' ||
+    statement.kind === 'drop_table' ||
+    statement.kind === 'alter_table_add_column'
+  ) {
     throw new Error(`statement '${statement.kind}' does not generate CRDT ops`);
   }
   return generateCrdtOps(statement, context);
@@ -1278,6 +1593,12 @@ export function buildSqlExecutionPlanFromStatement(
       return {
         kind: 'ddl_drop_table',
         table: statement.table,
+      };
+    case 'alter_table_add_column':
+      return {
+        kind: 'ddl_alter_table_add_column',
+        table: statement.table,
+        column: statement.column,
       };
     case 'select': {
       const tableSchema =
@@ -1320,4 +1641,72 @@ export function buildSqlExecutionPlanFromSql(
   context: Partial<CrdtOpGenerationContext> = {},
 ): SqlExecutionPlan {
   return buildSqlExecutionPlanFromStatement(parseSql(sql), context);
+}
+
+export function buildClientSqlExecutionPlanFromStatement(
+  statement: SqlStatement,
+  context: Partial<CrdtOpGenerationContext> = {},
+): SqlClientExecutionPlan {
+  switch (statement.kind) {
+    case 'create_table': {
+      const writeContext = requireSchemaWriteContext(context);
+      return {
+        kind: 'write',
+        statementKind: statement.kind,
+        ops: planCreateTableSchemaMutation(statement, writeContext),
+      };
+    }
+    case 'alter_table_add_column': {
+      const writeContext = requireSchemaWriteContext(context);
+      return {
+        kind: 'write',
+        statementKind: statement.kind,
+        ops: planAlterAddColumnSchemaMutation(statement, writeContext),
+      };
+    }
+    case 'drop_table':
+      throw new Error(
+        `DROP TABLE is not allowed; schema is append-only and supports CREATE TABLE + ALTER TABLE ADD COLUMN only`,
+      );
+    case 'select': {
+      const tableSchema =
+        (context.schema && context.schema[statement.table]) ||
+        INFORMATION_SCHEMA_METADATA[statement.table] ||
+        null;
+      return {
+        kind: 'read',
+        select: buildSelectPlan(statement, {
+          partitionBy: tableSchema?.partitionBy ?? null,
+        }),
+      };
+    }
+    case 'insert':
+    case 'update':
+    case 'inc':
+    case 'dec':
+    case 'add':
+    case 'remove':
+    case 'delete': {
+      if (!context.schema || !context.site || !context.nextHlc) {
+        throw new Error('write planning requires schema, site, and nextHlc');
+      }
+      return {
+        kind: 'write',
+        statementKind: statement.kind,
+        ops: generateCrdtOps(statement, {
+          schema: context.schema,
+          site: context.site,
+          nextHlc: context.nextHlc,
+          resolveSetRemoveTags: context.resolveSetRemoveTags,
+        }),
+      };
+    }
+  }
+}
+
+export function buildClientSqlExecutionPlanFromSql(
+  sql: string,
+  context: Partial<CrdtOpGenerationContext> = {},
+): SqlClientExecutionPlan {
+  return buildClientSqlExecutionPlanFromStatement(parseSql(sql), context);
 }

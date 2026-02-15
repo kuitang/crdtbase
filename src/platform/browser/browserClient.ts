@@ -1,10 +1,14 @@
+import { ManifestFile, SegmentFile, mergeRuntimeRowMaps, segmentFileToRuntimeRows } from '../../core/compaction';
+import { decodeBin } from '../../core/encoding';
 import { Hlc, HlcClock, createHlcClock } from '../../core/hlc';
 import { LogPosition, ReplicatedLog, takeContiguousEntriesSince } from '../../core/replication';
+import type { SnapshotStore } from '../../core/snapshotStore';
 import {
   EncodedCrdtOp,
-  SqlExecutionPlan,
+  SqlClientExecutionPlan,
   SqlSchema,
-  buildSqlExecutionPlanFromStatement,
+  buildClientSqlExecutionPlanFromStatement,
+  buildEffectiveSchemaForPlanning,
   parseSql,
 } from '../../core/sql';
 import {
@@ -12,6 +16,7 @@ import {
   applyCrdtOpToRows,
   decodeHlcHex,
   encodeHlcHex,
+  materializeSchemaFromRows,
   resolveSetRemoveTagsFromRows,
   runSelectPlan,
 } from '../../core/sqlEval';
@@ -49,6 +54,8 @@ export class BrowserCrdtClient {
   private readonly hlcClock: HlcClock;
   private readonly storage: BrowserHlcStorage | null;
   private readonly hlcStorageKey: string;
+  private readonly snapshots: SnapshotStore | null;
+  private localSnapshotManifestVersion = 0;
 
   constructor(
     public readonly siteId: string,
@@ -59,6 +66,7 @@ export class BrowserCrdtClient {
     this.hlcClock = clock ?? createHlcClock();
     this.storage = storage ?? resolveDefaultBrowserHlcStorage();
     this.hlcStorageKey = `${BROWSER_HLC_KEY_PREFIX}${this.siteId}`;
+    this.snapshots = this.log.getSnapshotStore?.() ?? null;
   }
 
   static async open(options: BrowserCrdtClientOptions): Promise<BrowserCrdtClient> {
@@ -77,14 +85,6 @@ export class BrowserCrdtClient {
     const plan = this.buildPlan(statement);
 
     switch (plan.kind) {
-      case 'ddl_create_table': {
-        this.schema[plan.table] = plan.schema;
-        return;
-      }
-      case 'ddl_drop_table': {
-        delete this.schema[plan.table];
-        return;
-      }
       case 'read':
         throw new Error('exec does not accept SELECT statements; use query(sql) instead');
       case 'write': {
@@ -92,6 +92,7 @@ export class BrowserCrdtClient {
           applyCrdtOpToRows(this.rows, op);
           this.pendingOps.push(op);
         }
+        this.refreshSchemaFromRows();
       }
     }
   }
@@ -102,7 +103,7 @@ export class BrowserCrdtClient {
     if (plan.kind !== 'read') {
       throw new Error(`query requires SELECT statement, got ${plan.kind}`);
     }
-    return runSelectPlan(plan.select, this.schema, this.rows);
+    return runSelectPlan(plan.select, buildEffectiveSchemaForPlanning(this.schema), this.rows);
   }
 
   async push(): Promise<void> {
@@ -122,6 +123,7 @@ export class BrowserCrdtClient {
   }
 
   async pull(): Promise<void> {
+    await this.refreshFromSnapshotManifest();
     const sites = await this.log.listSites();
     let localClockAdvanced = false;
     for (const siteId of sites) {
@@ -164,6 +166,7 @@ export class BrowserCrdtClient {
         for (const op of entry.ops) {
           applyCrdtOpToRows(this.rows, op);
         }
+        this.refreshSchemaFromRows();
         this.syncedSeqBySite.set(siteId, entry.seq);
         this.syncedHlcBySite.set(siteId, entry.hlc);
       }
@@ -178,8 +181,8 @@ export class BrowserCrdtClient {
     await this.pull();
   }
 
-  private buildPlan(statement: ReturnType<typeof parseSql>): SqlExecutionPlan {
-    return buildSqlExecutionPlanFromStatement(statement, {
+  private buildPlan(statement: ReturnType<typeof parseSql>): SqlClientExecutionPlan {
+    return buildClientSqlExecutionPlanFromStatement(statement, {
       schema: this.schema,
       site: this.siteId,
       nextHlc: () => this.nextLocalHlcHex(),
@@ -194,6 +197,14 @@ export class BrowserCrdtClient {
     const encoded = encodeHlcHex(next);
     this.persistLocalHlc(encoded);
     return encoded;
+  }
+
+  private refreshSchemaFromRows(): void {
+    const materialized = materializeSchemaFromRows(this.rows);
+    if (Object.keys(materialized).length === 0) {
+      return;
+    }
+    this.schema = materialized;
   }
 
   getSyncedHeads(): Record<string, LogPosition> {
@@ -220,6 +231,7 @@ export class BrowserCrdtClient {
       for (const [key, row] of params.rows.entries()) {
         this.rows.set(key, row);
       }
+      this.refreshSchemaFromRows();
     }
     if (params.syncedSeqBySite) {
       this.syncedSeqBySite.clear();
@@ -257,5 +269,78 @@ export class BrowserCrdtClient {
       return;
     }
     this.storage.setItem(this.hlcStorageKey, encodedHlc);
+  }
+
+  private async refreshFromSnapshotManifest(): Promise<void> {
+    if (!this.snapshots) {
+      return;
+    }
+    await this.hydrateSchemaFromSnapshotsIfMissing();
+    const manifest = await this.snapshots.getManifest();
+    if (manifest === null || manifest.version <= this.localSnapshotManifestVersion) {
+      return;
+    }
+    if (!this.manifestCoversKnownSites(manifest)) {
+      // Reject incomplete manifests for sites we already track; otherwise we may
+      // replace rows with a partial snapshot and skip required log replay.
+      return;
+    }
+
+    const rows = new Map<string, RuntimeRowState>();
+    for (const segmentRef of manifest.segments) {
+      const bytes = await this.snapshots.getSegment(segmentRef.path);
+      if (bytes === null) {
+        throw new Error(`manifest references missing segment: ${segmentRef.path}`);
+      }
+
+      const segment = decodeBin<SegmentFile>(bytes);
+      const loaded = segmentFileToRuntimeRows(segment);
+      mergeRuntimeRowMaps(rows, loaded);
+    }
+
+    // Preserve read-your-writes for local unpushed operations across segment reload.
+    for (const pending of this.pendingOps) {
+      applyCrdtOpToRows(rows, pending);
+    }
+
+    this.rows.clear();
+    for (const [key, row] of rows.entries()) {
+      this.rows.set(key, row);
+    }
+    this.refreshSchemaFromRows();
+
+    // Reset site cursors to compaction watermarks so uncompacted deltas are replayed exactly once.
+    for (const [siteId, seq] of Object.entries(manifest.sites_compacted)) {
+      this.syncedSeqBySite.set(siteId, seq);
+      this.syncedHlcBySite.delete(siteId);
+    }
+
+    this.localSnapshotManifestVersion = manifest.version;
+  }
+
+  private manifestCoversKnownSites(manifest: ManifestFile): boolean {
+    for (const [siteId, seq] of this.syncedSeqBySite.entries()) {
+      if (seq <= 0) {
+        continue;
+      }
+      if (!(siteId in manifest.sites_compacted)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private async hydrateSchemaFromSnapshotsIfMissing(): Promise<void> {
+    if (!this.snapshots) {
+      return;
+    }
+    if (Object.keys(this.schema).length > 0) {
+      return;
+    }
+    const snapshotSchema = await this.snapshots.getSchema();
+    if (snapshotSchema === null) {
+      return;
+    }
+    this.schema = snapshotSchema;
   }
 }

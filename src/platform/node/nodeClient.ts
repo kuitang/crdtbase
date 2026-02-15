@@ -7,9 +7,10 @@ import { LogPosition, ReplicatedLog, takeContiguousEntriesSince } from '../../co
 import { SnapshotStore, assertSafeSnapshotRelativePath } from '../../core/snapshotStore';
 import {
   EncodedCrdtOp,
-  SqlExecutionPlan,
+  SqlClientExecutionPlan,
   SqlSchema,
-  buildSqlExecutionPlanFromStatement,
+  buildClientSqlExecutionPlanFromStatement,
+  buildEffectiveSchemaForPlanning,
   parseSql,
 } from '../../core/sql';
 import {
@@ -19,6 +20,7 @@ import {
   decodeHlcHex,
   encodeHlcHex,
   evalRowsToRuntime,
+  materializeSchemaFromRows,
   resolveSetRemoveTagsFromRows,
   runSelectPlan,
   runtimeRowsToEval,
@@ -62,7 +64,6 @@ export type NodeCrdtClientOptions = {
   siteId: string;
   log: ReplicatedLog;
   dataDir: string;
-  snapshots?: SnapshotStore;
   clock?: HlcClock;
 };
 
@@ -90,11 +91,10 @@ export class NodeCrdtClient {
     public readonly siteId: string,
     private readonly log: ReplicatedLog,
     private readonly dataDir: string,
-    snapshots?: SnapshotStore,
     clock?: HlcClock,
   ) {
     this.hlcClock = clock ?? createHlcClock();
-    this.snapshots = snapshots ?? null;
+    this.snapshots = log.getSnapshotStore?.() ?? null;
     this.schemaPath = join(this.dataDir, 'schema.bin');
     this.atomicStateBundlePath = join(this.dataDir, 'state_bundle.bin');
     this.statePath = join(this.dataDir, 'state.bin');
@@ -110,7 +110,6 @@ export class NodeCrdtClient {
       options.siteId,
       options.log,
       options.dataDir,
-      options.snapshots,
       options.clock,
     );
     await client.waitReady();
@@ -122,16 +121,6 @@ export class NodeCrdtClient {
     const statement = parseSql(sql);
     const plan = this.buildPlan(statement);
     switch (plan.kind) {
-      case 'ddl_create_table': {
-        this.schema[plan.table] = plan.schema;
-        await this.persistSchema();
-        return;
-      }
-      case 'ddl_drop_table': {
-        delete this.schema[plan.table];
-        await this.persistSchema();
-        return;
-      }
       case 'read':
         throw new Error(`exec does not accept SELECT statements; use query(sql) instead`);
       case 'write': {
@@ -139,6 +128,7 @@ export class NodeCrdtClient {
           applyCrdtOpToRows(this.rows, op);
           this.pendingOps.push(op);
         }
+        this.refreshSchemaFromRows();
         await this.persistStateFiles();
       }
     }
@@ -151,7 +141,7 @@ export class NodeCrdtClient {
     if (plan.kind !== 'read') {
       throw new Error(`query requires SELECT statement, got ${plan.kind}`);
     }
-    return runSelectPlan(plan.select, this.schema, this.rows);
+    return runSelectPlan(plan.select, buildEffectiveSchemaForPlanning(this.schema), this.rows);
   }
 
   async push(): Promise<void> {
@@ -215,6 +205,7 @@ export class NodeCrdtClient {
         for (const op of entry.ops) {
           applyCrdtOpToRows(this.rows, op);
         }
+        this.refreshSchemaFromRows();
         this.syncedSeqBySite.set(siteId, entry.seq);
         this.syncedHlcBySite.set(siteId, entry.hlc);
       }
@@ -239,8 +230,8 @@ export class NodeCrdtClient {
     return this.dataDir;
   }
 
-  private buildPlan(statement: ReturnType<typeof parseSql>): SqlExecutionPlan {
-    return buildSqlExecutionPlanFromStatement(statement, {
+  private buildPlan(statement: ReturnType<typeof parseSql>): SqlClientExecutionPlan {
+    return buildClientSqlExecutionPlanFromStatement(statement, {
       schema: this.schema,
       site: this.siteId,
       nextHlc: () => this.nextLocalHlcHex(),
@@ -253,6 +244,14 @@ export class NodeCrdtClient {
     const next = this.hlcClock.next(this.lastLocalHlc);
     this.lastLocalHlc = next;
     return encodeHlcHex(next);
+  }
+
+  private refreshSchemaFromRows(): void {
+    const materialized = materializeSchemaFromRows(this.rows);
+    if (Object.keys(materialized).length === 0) {
+      return;
+    }
+    this.schema = materialized;
   }
 
   private async waitReady(): Promise<void> {
@@ -295,6 +294,10 @@ export class NodeCrdtClient {
     this.rows.clear();
     for (const [key, row] of evalRowsToRuntime(state.rows).entries()) {
       this.rows.set(key, row);
+    }
+    const materializedSchema = materializeSchemaFromRows(this.rows);
+    if (Object.keys(materializedSchema).length > 0) {
+      this.schema = materializedSchema;
     }
 
     this.localSnapshotManifestVersion = localManifest?.version ?? 0;
@@ -341,6 +344,7 @@ export class NodeCrdtClient {
 
     // Legacy split files remain for backwards compatibility and tooling.
     await Promise.all([
+      this.writeFileAtomically(this.schemaPath, encodeBin(this.schema)),
       this.writeFileAtomically(this.statePath, encodeBin(stateFile)),
       this.writeFileAtomically(this.pendingPath, encodeBin(pendingFile)),
       this.writeFileAtomically(this.syncPath, encodeBin(syncFile)),
@@ -381,6 +385,11 @@ export class NodeCrdtClient {
     if (manifest === null || manifest.version <= this.localSnapshotManifestVersion) {
       return;
     }
+    if (!this.manifestCoversKnownSites(manifest)) {
+      // Reject incomplete manifests for sites we already track; otherwise we may
+      // replace rows with a partial snapshot and skip required log replay.
+      return;
+    }
 
     const rows = new Map<string, RuntimeRowState>();
     await mkdir(this.snapshotRootDir, { recursive: true });
@@ -410,6 +419,7 @@ export class NodeCrdtClient {
     for (const [key, row] of rows.entries()) {
       this.rows.set(key, row);
     }
+    this.refreshSchemaFromRows();
 
     // Reset site cursors to compaction watermarks so uncompacted deltas are replayed exactly once.
     for (const [siteId, seq] of Object.entries(manifest.sites_compacted)) {
@@ -419,6 +429,18 @@ export class NodeCrdtClient {
 
     await this.writeFileAtomically(this.snapshotManifestPath, encodeBin(manifest));
     this.localSnapshotManifestVersion = manifest.version;
+  }
+
+  private manifestCoversKnownSites(manifest: ManifestFile): boolean {
+    for (const [siteId, seq] of this.syncedSeqBySite.entries()) {
+      if (seq <= 0) {
+        continue;
+      }
+      if (!(siteId in manifest.sites_compacted)) {
+        return false;
+      }
+    }
+    return true;
   }
 
   private async hydrateSchemaFromSnapshotsIfMissing(): Promise<void> {

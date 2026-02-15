@@ -193,7 +193,6 @@ describe('Filesystem SQL chaos end-to-end sync', () => {
         siteId: 'site-d',
         log: new HttpReplicatedLog(baseUrl),
         dataDir: clientDDir,
-        snapshots,
         clock: createHlcClock({ nowWallMs: () => 4_000 }),
       });
       await clientD.pull();

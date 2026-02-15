@@ -57,6 +57,7 @@ export type DeterministicReplayConfig = {
   rowIds: string[];
   drainRounds: number;
   quiescenceRounds: number;
+  schemaOwner?: E2eSiteId;
 };
 
 export type DeterministicReplayOptions = {
@@ -243,14 +244,13 @@ async function initializeRows(params: {
   clients: E2eClientMap;
   observer?: E2eClientAdapter;
   rowIds: readonly string[];
+  schemaOwner: E2eSiteId;
 }): Promise<void> {
-  await Promise.all(SITE_IDS.map((siteId) => params.clients[siteId].exec(CREATE_TASKS_TABLE_SQL)));
-  if (params.observer) {
-    await params.observer.exec(CREATE_TASKS_TABLE_SQL);
-  }
+  await params.clients[params.schemaOwner].exec(CREATE_TASKS_TABLE_SQL);
+  await syncAll(params.clients);
 
   for (const rowId of params.rowIds) {
-    await params.clients['site-a'].exec(
+    await params.clients[params.schemaOwner].exec(
       [
         'INSERT INTO tasks (id, title, points, tags, status) VALUES (',
         `'${escapeSqlString(rowId)}',`,
@@ -330,11 +330,13 @@ export async function replayDeterministicTraceScenario(
   };
 
   const sleepFn = options.sleepFn ?? defaultSleep;
+  const schemaOwner = options.config.schemaOwner ?? 'site-a';
 
   await initializeRows({
     clients: options.clients,
     observer: options.observer,
     rowIds: options.config.rowIds,
+    schemaOwner,
   });
 
   for (let index = 0; index < options.trace.length; index += 1) {
@@ -428,6 +430,7 @@ export async function replayDeterministicTraceScenario(
 
   const materialized = materializeExpectations(expectations);
   return {
+    schemaOwner,
     normalizedRowsBySite,
     observerRows,
     expectedPointsByRow: materialized.expectedPointsByRow,

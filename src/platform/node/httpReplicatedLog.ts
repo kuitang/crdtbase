@@ -1,4 +1,5 @@
 import { AppendLogEntry, LogEntry, LogPosition, ReplicatedLog } from '../../core/replication';
+import { HttpSnapshotStore } from './httpSnapshotStore';
 
 function normalizeBaseUrl(baseUrl: string): string {
   return baseUrl.replace(/\/+$/u, '');
@@ -66,5 +67,9 @@ export class HttpReplicatedLog implements ReplicatedLog {
     const response = await fetch(`${this.baseUrl}/logs/${encodeURIComponent(siteId)}/head`);
     const body = await readJsonResponse<{ seq: LogPosition }>(response);
     return body.seq;
+  }
+
+  getSnapshotStore(): HttpSnapshotStore {
+    return new HttpSnapshotStore(this.baseUrl);
   }
 }

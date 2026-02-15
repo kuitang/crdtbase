@@ -9,9 +9,12 @@ import {
   DeleteStatement,
   EncodedCrdtOp,
   IncStatement,
+  INFORMATION_SCHEMA_COLUMNS,
+  INFORMATION_SCHEMA_TABLES,
   RemoveStatement,
   RemoveTagResolverInput,
   SetRemoveTag,
+  SqlColumnCrdt,
   SelectQueryPlan,
   SqlComparisonOp,
   SqlExecutionPlan,
@@ -67,6 +70,7 @@ export type SqlEvalState = {
 export type SqlEvalResult =
   | { kind: 'ddl_create_table'; table: string; schema: SqlSchema[string] }
   | { kind: 'ddl_drop_table'; table: string }
+  | { kind: 'ddl_alter_table_add_column'; table: string; column: string }
   | {
       kind: 'write';
       statementKind:
@@ -74,9 +78,11 @@ export type SqlEvalResult =
         | IncStatement['kind']
         | DecStatement['kind']
         | DeleteStatement['kind']
-        | AddStatement['kind']
-        | RemoveStatement['kind']
-        | 'insert';
+      | AddStatement['kind']
+      | RemoveStatement['kind']
+      | 'insert'
+      | 'create_table'
+      | 'alter_table_add_column';
       ops: EncodedCrdtOp[];
     }
   | { kind: 'read'; select: SelectQueryPlan; rows: Record<string, unknown>[] };
@@ -385,6 +391,121 @@ export function materializeRow(row: RuntimeRowState): Record<string, unknown> {
   return values;
 }
 
+function rowIsDeleted(row: RuntimeRowState): boolean {
+  const exists = row.columns.get('_exists');
+  return Boolean(exists && exists.typ === 1 && exists.state.val === false);
+}
+
+function readLwwValue(row: RuntimeRowState, column: string): SqlValue | null {
+  const state = row.columns.get(column);
+  if (!state || state.typ !== 1) {
+    return null;
+  }
+  return state.state.val;
+}
+
+function parseColumnCrdt(raw: string): SqlColumnCrdt | null {
+  if (
+    raw === 'scalar' ||
+    raw === 'lww' ||
+    raw === 'pn_counter' ||
+    raw === 'or_set' ||
+    raw === 'mv_register'
+  ) {
+    return raw;
+  }
+  return null;
+}
+
+export function materializeSchemaFromRows(rows: Map<string, RuntimeRowState>): SqlSchema {
+  const tables = new Map<
+    string,
+    {
+      pk: string | null;
+      partitionBy: string | null;
+      columns: Record<string, { crdt: SqlColumnCrdt }>;
+    }
+  >();
+
+  for (const row of rows.values()) {
+    if (row.table !== INFORMATION_SCHEMA_TABLES || rowIsDeleted(row)) {
+      continue;
+    }
+    const tableName = String(row.key);
+    const entry = tables.get(tableName) ?? {
+      pk: null,
+      partitionBy: null,
+      columns: {},
+    };
+    const pkValue = readLwwValue(row, 'pk_column');
+    if (typeof pkValue === 'string' && pkValue.length > 0) {
+      entry.pk = pkValue;
+    }
+    const partitionBy = readLwwValue(row, 'partition_by');
+    if (partitionBy === null) {
+      entry.partitionBy = null;
+    } else if (typeof partitionBy === 'string' && partitionBy.length > 0) {
+      entry.partitionBy = partitionBy;
+    }
+    tables.set(tableName, entry);
+  }
+
+  for (const row of rows.values()) {
+    if (row.table !== INFORMATION_SCHEMA_COLUMNS || rowIsDeleted(row)) {
+      continue;
+    }
+    const tableName = readLwwValue(row, 'table_name');
+    const columnName = readLwwValue(row, 'column_name');
+    const crdtName = readLwwValue(row, 'crdt_kind');
+    if (typeof tableName !== 'string' || tableName.length === 0) {
+      continue;
+    }
+    if (typeof columnName !== 'string' || columnName.length === 0) {
+      continue;
+    }
+    if (typeof crdtName !== 'string') {
+      continue;
+    }
+    const crdt = parseColumnCrdt(crdtName);
+    if (!crdt) {
+      continue;
+    }
+    const entry = tables.get(tableName) ?? {
+      pk: null,
+      partitionBy: null,
+      columns: {},
+    };
+    entry.columns[columnName] = { crdt };
+    tables.set(tableName, entry);
+  }
+
+  const schema: SqlSchema = {};
+  for (const [tableName, entry] of tables.entries()) {
+    if (!entry.pk) {
+      continue;
+    }
+    const pkColumn = entry.columns[entry.pk];
+    if (!pkColumn || pkColumn.crdt !== 'scalar') {
+      continue;
+    }
+    const partitionBy =
+      entry.partitionBy !== null && !entry.columns[entry.partitionBy]
+        ? null
+        : entry.partitionBy;
+    schema[tableName] = {
+      pk: entry.pk,
+      partitionBy,
+      columns: Object.fromEntries(
+        Object.entries(entry.columns).map(([column, definition]) => [
+          column,
+          { crdt: definition.crdt },
+        ]),
+      ),
+    };
+  }
+  return schema;
+}
+
 export function resolveSetRemoveTagsFromRows(
   rows: Map<string, RuntimeRowState>,
   table: string,
@@ -604,6 +725,36 @@ export function evaluateSqlStatementMutable(
       return {
         kind: 'ddl_drop_table',
         table: plan.table,
+      };
+    case 'ddl_alter_table_add_column':
+      if (plan.column.primaryKey) {
+        throw new Error(`ALTER TABLE ${plan.table} ADD COLUMN cannot add PRIMARY KEY columns`);
+      }
+      if (!context.schema[plan.table]) {
+        throw new Error(`unknown table '${plan.table}'`);
+      }
+      context.schema[plan.table] = {
+        ...context.schema[plan.table]!,
+        columns: {
+          ...context.schema[plan.table]!.columns,
+          [plan.column.name]: {
+            crdt:
+              plan.column.type.kind === 'counter'
+                ? 'pn_counter'
+                : plan.column.type.kind === 'set'
+                  ? 'or_set'
+                  : plan.column.type.kind === 'register'
+                    ? 'mv_register'
+                    : plan.column.type.kind === 'scalar'
+                      ? 'scalar'
+                      : 'lww',
+          },
+        },
+      };
+      return {
+        kind: 'ddl_alter_table_add_column',
+        table: plan.table,
+        column: plan.column.name,
       };
     case 'read':
       return {

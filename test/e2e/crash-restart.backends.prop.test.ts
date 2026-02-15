@@ -8,6 +8,7 @@ import { decodeHlcHex } from '../../src/core/sqlEval';
 import type { E2eSiteId } from './orchestrator';
 import { assertAckedWritesVisible, readPositiveIntEnv } from './chaosShared';
 import { BackendMatrixKind, startBackendMatrixHarness } from './backendMatrixHarness';
+import { schemaOwnerForSeed } from '../shared/tasksSchema';
 import {
   buildDeterministicTrace,
   createSeededRng,
@@ -140,6 +141,7 @@ async function runRestartScenarioOnBackend(params: {
         rowIds: params.rowIds,
         drainRounds: params.drainRounds,
         quiescenceRounds: params.quiescenceRounds,
+        schemaOwner: schemaOwnerForSeed(params.seed),
       },
       afterStep: async ({ stepIndex }) => {
         for (const siteId of Object.keys(params.restartPlan) as E2eSiteId[]) {

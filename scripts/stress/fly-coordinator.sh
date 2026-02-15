@@ -25,4 +25,13 @@ set -euo pipefail
 #   FLY_API_TOKEN_COMMAND (default: "flyctl auth token"). This prevents multi-run batches
 #   from failing when short-lived tokens expire mid-job.
 
+# Ensure flyctl is available in non-interactive shells (CI, task runners).
+if [ -d "$HOME/.fly/bin" ]; then
+  export PATH="$HOME/.fly/bin:$PATH"
+fi
+
+# Keep token refresh enabled by default for multi-run batches.
+: "${FLY_API_TOKEN_COMMAND:=flyctl auth token --quiet}"
+export FLY_API_TOKEN_COMMAND
+
 exec npx tsx scripts/stress/fly-coordinator.ts "$@"
