@@ -5,8 +5,9 @@
 The `lean/` subdirectory of CrdtBase contains a formal specification and mechanized
 proof suite written in Lean 4 (v4.27.0). It verifies the core algebraic properties
 that every CRDT merge function must satisfy -- commutativity, associativity, and
-idempotence -- plus convergence, compaction correctness, tombstone semantics, SQL
-op-generation soundness, replication log safety, and HLC ordering invariants.
+idempotence -- plus convergence, table composition, compaction correctness, tombstone
+semantics, SQL op-generation soundness, replication log safety, and HLC ordering
+invariants.
 
 The project depends on **Batteries** (the Lean 4 community standard library) and
 **Mathlib** (for `Finset`, `List.Perm`, and the `aesop` tactic). The global option
@@ -31,26 +32,27 @@ CrdtBase.lean                      (root import -- pulls everything in)
   +-- Crdt/PnCounter/Props.lean    (semilattice proofs via Nat.max)
   |
   +-- Crdt/OrSet/Defs.lean         (OrSet with Finset elements and tombstones)
-  +-- Crdt/OrSet/Props.lean        (semilattice proofs; uses Mathlib Finset + aesop)
+  +-- Crdt/OrSet/Props.lean        (semilattice proofs + canonicalization chain + aesop)
   |
   +-- Crdt/MvRegister/Defs.lean    (MvRegister as Finset union)
   +-- Crdt/MvRegister/Props.lean   (semilattice proofs via Finset.union)
   |
-  +-- Crdt/Table/Defs.lean         (Composite row state, whole-table merge)
-  +-- Crdt/Table/Props.lean        (Lifting lemmas + operator commutativity)
+  +-- Crdt/Table/Defs.lean         (Composite row state, whole-table merge, apply ops)
+  +-- Crdt/Table/Props.lean        (Validity predicates, lifting, operator commutativity)
+  |     depends on all Crdt/*/Props
   |
   +-- Convergence/Defs.lean        (applyOps, SameOps via List.Perm)
   +-- Convergence/Props.lean       (Abstract + concrete convergence theorems)
   |     depends on all Crdt/*/Props
   |
   +-- Compaction/Defs.lean         (foldPrefixSuffix, empty states)
-  +-- Compaction/Props.lean        (compaction = full fold, idempotence)
+  +-- Compaction/Props.lean        (compaction = full fold, snapshot cutover, idempotence)
   |
   +-- Tombstone/Defs.lean          (TombstoneState as LwwRegister Bool)
   +-- Tombstone/Props.lean         (delete-wins, write-resurrects, stability)
   |
-  +-- Replication/Defs.lean        (LogEntry, readSince, getHead)
-  +-- Replication/Props.lean       (readSince cursor safety)
+  +-- Replication/Defs.lean        (LogEntry, readSince, getHead, canonicalSeqs)
+  +-- Replication/Props.lean       (readSince cursor safety + compaction exclusion)
   |
   +-- Sql/Defs.lean                (SQL AST, CRDT op generation, planner)
   +-- Sql/Props.lean               (type soundness, syncability, planner correctness)
@@ -59,9 +61,10 @@ CrdtBase.lean                      (root import -- pulls everything in)
 ```
 
 The dependency flow is strictly layered: `Hlc` is the foundation, `Crdt/*` types
-build on it, `Convergence` composes all CRDT proofs, and `Compaction`/`Tombstone`
-are derived consequences. The `Sql` and `Replication` modules are relatively
-standalone.
+build on it, `Table` composes all per-CRDT proofs into composite row/table
+theorems, `Convergence` composes the CRDT semilattice proofs with permutation
+invariance, and `Compaction`/`Tombstone`/`Replication` are derived consequences.
+The `Sql` module is relatively standalone.
 
 ---
 
@@ -219,7 +222,10 @@ and table merge is pointwise row merge.
 
 ## Complete Theorem Inventory
 
-### Tier 1: CRDT Semilattice Properties (12 theorems)
+The proof suite now contains **76 theorems** across 8 tiers (plus supporting
+private lemmas), spread over 12 `Props.lean` files.
+
+### Tier 1: CRDT Semilattice Properties (16 theorems)
 
 | CRDT | Commutativity | Associativity | Idempotence |
 |------|--------------|---------------|-------------|
@@ -228,18 +234,22 @@ and table merge is pointwise row merge.
 | OR-Set | `or_set_merge_comm` | `or_set_merge_assoc` | `or_set_merge_idem` |
 | MV-Register | `mv_register_merge_comm` | `mv_register_merge_assoc` | `mv_register_merge_idem` |
 
-Plus OR-Set canonicalization properties:
-- `or_set_canonicalize_idem`
-- `or_set_canonicalize_no_tombstoned_tags`
-- `or_set_canonicalize_preserves_visible_values`
+Plus OR-Set canonicalization chain (4 theorems):
+- `or_set_canonicalize_idem` -- canonicalization is idempotent
+- `or_set_canonicalize_no_tombstoned_tags` -- output has no tombstoned elements
+- `or_set_canonicalize_preserves_visible_values` -- visible-value semantics unchanged
+- `or_set_merge_canonicalized` -- merge output is always canonicalized
 
-Plus LWW event-consistency helpers:
+Plus LWW event-consistency helpers (4 theorems):
 - `lww_equal_key_implies_equal_payload`
 - `dedup_rejects_conflicting_same_key`
 - `lww_merge_comm_global_of_consistent`
 - `lww_merge_assoc_global_of_consistent`
 
-### Tier 2: HLC Ordering (14 theorems)
+Plus OR-Set precondition-free idempotence (1 theorem):
+- `or_set_merge_idem_general` -- `merge (merge a b) (merge a b) = merge a b`
+
+### Tier 2: HLC Ordering (19 theorems)
 
 - `hlc_total_order` -- trichotomy of packed values
 - `hlc_pack_preserves_order` -- higher wallMs implies higher pack
@@ -256,7 +266,7 @@ Plus LWW event-consistency helpers:
 - `recv_wallMs_monotonic` -- wall component is monotonically non-decreasing
 - `max3_ge_left` / `max3_ge_mid` / `max3_ge_right` -- max3 dominance
 
-### Tier 3: Convergence (7 theorems)
+### Tier 3: Convergence (9 theorems)
 
 - `convergence_of_perm` -- abstract: right-commutative folds are perm-invariant
 - `convergence_of_same_ops` -- same, via SameOps wrapper
@@ -267,31 +277,54 @@ Plus LWW event-consistency helpers:
 - `convergence_mv_register` -- MV-Register instantiation
 - `convergence_composite` -- 2-column composite row
 
-### Tier 4: Compaction (7 theorems)
+### Tier 4: Table Composition (16 theorems)
+
+Row-level semilattice under validity predicates (3 theorems):
+- `mergeTableRow_comm_of_valid` -- row commutativity under `ValidTableRowPair`
+- `mergeTableRow_assoc_of_valid` -- row associativity under `ValidTableRowTriple`
+- `mergeTableRow_idem_of_valid` -- row idempotence under OR-Set canonicalization
+
+Lifted whole-table theorems (3 theorems):
+- `mergeTable_comm_of_valid` -- table commutativity under `ValidTableState`
+- `mergeTable_assoc_of_valid` -- table associativity under `ValidTableStateTriple`
+- `mergeTable_idem_of_valid` -- table idempotence under `ValidTableStateIdem`
+
+Operator visibility preservation (3 theorems):
+- `apply_counter_preserves_visibility` -- counter updates do not change row visibility
+- `apply_set_preserves_visibility` -- OR-Set updates do not change row visibility
+- `apply_register_preserves_visibility` -- MV-register updates do not change row visibility
+
+Column commutativity (3 theorems):
+- `row_exists_counter_commute` -- row-existence and counter updates commute
+- `row_exists_set_commute` -- row-existence and OR-Set updates commute
+- `row_counter_register_commute` -- counter and MV-register updates commute
+
+Disjoint key commutativity (1 theorem):
+- `modify_row_at_disjoint_commute` -- updates at distinct keys commute at table level
+
+Plus 3 validity predicate definitions used as theorem preconditions:
+- `ValidTableState`, `ValidTableStateTriple`, `ValidTableStateIdem`
+
+### Tier 5: Compaction (9 theorems)
 
 - `foldPrefixSuffix_eq_foldl` -- split compaction = full fold
 - `foldPrefixSuffix_eq_foldl_all` -- universally quantified over split point
 - `compaction_preserves_state` -- canonical form: prefix fold then suffix fold
 - `compaction_idempotent` -- re-compacting with no new ops is identity
-- `pn_counter_compaction_preserves_state`
-- `or_set_compaction_preserves_state`
-- `mv_register_compaction_preserves_state`
-- `lww_compaction_preserves_state`
+- `pn_counter_compaction_preserves_state` -- PN-Counter specialization
+- `or_set_compaction_preserves_state` -- OR-Set specialization
+- `mv_register_compaction_preserves_state` -- MV-Register specialization
+- `lww_compaction_preserves_state` -- LWW specialization (with `Option` base)
+- `snapshot_then_suffix_replay_eq_full_fold` -- snapshot cutover law
+- `snapshot_cutover_idempotent_without_new_suffix` -- no-op with empty suffix
 
-### Tier 5: Tombstone (3 theorems)
+### Tier 6: Tombstone (3 theorems)
 
 - `delete_wins_if_later` -- later delete beats earlier write
 - `write_resurrects_if_later` -- later write beats earlier delete
 - `tombstone_stable_without_new_writes` -- idempotent re-merge
 
-### Table Composition (9 theorems)
-
-- `table_merge_comm_of_row_comm` / `table_merge_assoc_of_row_assoc` / `table_merge_idem_of_row_idem`
-- `apply_counter_preserves_visibility` / `apply_set_preserves_visibility` / `apply_register_preserves_visibility`
-- `row_exists_counter_commute` / `row_exists_set_commute` / `row_counter_register_commute`
-- `modify_row_at_disjoint_commute`
-
-### SQL Soundness (8 theorems)
+### Tier 7: SQL Soundness (8 theorems)
 
 - `write_ops_type_sound` -- all emitted ops have valid CRDT type tags
 - `write_ops_syncable` -- all emitted ops have non-empty sync identifiers
@@ -301,10 +334,12 @@ Plus LWW event-consistency helpers:
 - `planner_partition_sound_all_partitions` / `planner_partition_sound_all_partitions_of_no_match`
 - `planner_filter_preservation` / `planner_filter_preservation_no_partition` / `planner_filter_preservation_all_partitions`
 
-### Replication (2 theorems)
+### Tier 8: Replication (3 theorems)
 
 - `mem_takeContiguousFrom_mem` -- contiguous subsequence membership
 - `readSince_mem_gt_since` -- all returned seqs are strictly greater than cursor
+- `readSince_after_watermark_only_returns_gt_watermark` -- watermark form of cursor safety
+- `readSince_compacted_prefix_exclusion` -- compacted entries are never replayed
 
 ---
 
@@ -320,16 +355,16 @@ Plus LWW event-consistency helpers:
 | `omega` | Not directly used (surprisingly), but `Nat.lt_irrefl`, `Nat.lt_asymm`, `Nat.lt_trans` etc. serve the same purpose for natural number reasoning. |
 | `aesop` | Used in OR-Set associativity proof to close complex Finset membership goals after `simp` reduces them. |
 | `subst` | Key in LWW proofs: when event-consistency gives `a = b`, `subst` eliminates the variable. |
-| `by_cases` | Pervasive in HLC proofs for case-splitting on `<` comparisons. |
-| `calc` | Used for multi-step equalities/inequalities, especially in `hlc_recv_monotonic`. |
-| `funext` | For table-level proofs where equality of functions requires pointwise reasoning. |
+| `by_cases` | Pervasive in HLC proofs for case-splitting on `<` comparisons. Also in `modify_row_at_disjoint_commute` for key equality. |
+| `calc` | Used for multi-step equalities/inequalities, especially in `hlc_recv_monotonic` and `modify_row_at_disjoint_commute`. |
+| `funext` | For table-level proofs where equality of functions requires pointwise reasoning. Central to the lifting pattern. |
 | `simpa` | Combines `simp` with `assumption`, used extensively for clean proof closures. |
-| `rfl` | Closes goals where both sides are definitionally equal after `cases`. Used elegantly in table operator commutativity proofs. |
+| `rfl` | Closes goals where both sides are definitionally equal after `cases`. Used elegantly in all table operator commutativity proofs. |
 | `congrArg` | Extracts field equalities from structure equalities (e.g., `congrArg Hlc.wallMs hEq`). |
 
 ---
 
-## Deep Dive: Three Elegant Proofs
+## Deep Dive: Five Elegant Proofs
 
 ### 1. PN-Counter Semilattice (The One-Liner Trio)
 
@@ -383,7 +418,7 @@ forms a semilattice, then fold over any permutation of the same operations
 converges to the same state."
 
 ```lean
--- Convergence/Props.lean:27-42
+-- Convergence/Props.lean:28-42
 theorem convergence_of_comm_assoc {alpha : Type}
     (merge : alpha -> alpha -> alpha)
     (hComm : forall a b : alpha, merge a b = merge b a)
@@ -432,7 +467,7 @@ perm-invariant). The `calc` proof reads like a textbook algebraic derivation.
 The concrete per-CRDT convergence theorems then become one-liners:
 
 ```lean
--- Convergence/Props.lean:127-131
+-- Convergence/Props.lean:126-131
 theorem convergence_pn_counter
     (init : PnCounter) {ops1 ops2 : List PnCounter}
     (hPerm : List.Perm ops1 ops2) :
@@ -512,6 +547,287 @@ contradiction argument. The proof structure mirrors the mathematical argument
 exactly: "for any total order, max is associative; the only subtle cases are
 ties, where event-consistency substitutes equality."
 
+### 4. Table Composition: Validity Predicates and the Lifting Pattern
+
+**File:** `/home/kuitang/git/crdtbase/lean/CrdtBase/Crdt/Table/Props.lean`
+
+The table composition proofs represent the most architecturally significant
+addition to the proof suite. They show that composite rows -- carrying one column
+of each CRDT type -- preserve semilattice properties when each column's merge
+function does so under the appropriate preconditions.
+
+The key innovation is the **validity predicate** design. Rather than requiring
+unconditional semilattice properties (which LWW does not have), the proofs
+thread preconditions through structured predicates:
+
+```lean
+-- Table/Props.lean:58-63
+structure ValidTableRowPair (a b : TableRowState alpha beta gamma Hlc) : Prop where
+  alive_consistent   : LwwConsistentPair a.alive b.alive
+  lwwCol_consistent  : LwwConsistentPair a.lwwCol b.lwwCol
+  setCol_a_clean     : forall x in a.setCol.elements, x.tag not_in a.setCol.tombstones
+  setCol_b_clean     : forall x in b.setCol.elements, x.tag not_in b.setCol.tombstones
+```
+
+For three-way associativity, a separate `ValidTableRowTriple` captures pairwise
+LWW consistency for `(a,b)` and `(b,c)`:
+
+```lean
+-- Table/Props.lean:79-83
+structure ValidTableRowTriple (a b c : TableRowState alpha beta gamma Hlc) : Prop where
+  alive_ab : LwwConsistentPair a.alive b.alive
+  alive_bc : LwwConsistentPair b.alive c.alive
+  lww_ab   : LwwConsistentPair a.lwwCol b.lwwCol
+  lww_bc   : LwwConsistentPair b.lwwCol c.lwwCol
+```
+
+Row-level commutativity then assembles per-column proofs via a 5-tuple:
+
+```lean
+-- Table/Props.lean:66-75
+theorem mergeTableRow_comm_of_valid
+    (a b : TableRowState alpha beta gamma Hlc)
+    (hValid : ValidTableRowPair a b)
+    : mergeTableRow a b = mergeTableRow b a := by
+  simp only [mergeTableRow, TableRowState.mk.injEq]
+  exact <<lww_merge_comm_of_consistent a.alive b.alive hValid.alive_consistent,
+         lww_merge_comm_of_consistent a.lwwCol b.lwwCol hValid.lwwCol_consistent,
+         pn_counter_merge_comm a.counterCol b.counterCol,
+         or_set_merge_comm a.setCol b.setCol,
+         mv_register_merge_comm a.registerCol b.registerCol>>
+```
+
+The lifting from row-level to whole-table is accomplished via `funext`:
+
+```lean
+-- Table/Props.lean:125-130
+theorem mergeTable_comm_of_valid {kappa : Type}
+    (a b : TableState kappa alpha beta gamma Hlc)
+    (hValid : ValidTableState a b)
+    : mergeTable a b = mergeTable b a := by
+  funext key
+  exact mergeTableRow_comm_of_valid (a key) (b key) (hValid key)
+```
+
+**Why this is significant:** The table composition proofs close the gap between
+individual CRDT correctness and system-level correctness. The validity predicates
+encode the operational invariants that the runtime must maintain (event-consistency
+for LWW columns, canonicalization for OR-Set columns), and the theorems state
+precisely what guarantees follow from those invariants. This is the Cedar-style
+approach at its best: the spec makes system-level assumptions explicit.
+
+### 5. OR-Set Idempotence Chain
+
+**File:** `/home/kuitang/git/crdtbase/lean/CrdtBase/Crdt/OrSet/Props.lean`
+
+OR-Set idempotence is the trickiest of the semilattice properties because merge
+includes a canonicalization step that filters out tombstoned elements. Naively,
+`merge a a` might not equal `a` if `a` has elements whose tags appear in its
+own tombstone set (i.e., `a` is not canonicalized).
+
+The proof suite resolves this with a four-theorem chain:
+
+**Step 1:** Canonicalization is idempotent.
+
+```lean
+-- OrSet/Props.lean:9-12
+theorem or_set_canonicalize_idem {alpha Hlc : Type} [DecidableEq alpha] [DecidableEq Hlc]
+    (a : OrSet alpha Hlc) :
+    OrSet.canonicalize (OrSet.canonicalize a) = OrSet.canonicalize a := by
+  ext x <;> simp [OrSet.canonicalize]
+```
+
+**Step 2:** Canonicalized output has no tombstoned element tags.
+
+```lean
+-- OrSet/Props.lean:15-19
+theorem or_set_canonicalize_no_tombstoned_tags {alpha Hlc : Type} ...
+    (a : OrSet alpha Hlc) :
+    forall x, x in (OrSet.canonicalize a).elements -> x.tag not_in (OrSet.canonicalize a).tombstones := by
+  intro x hx
+  exact (Finset.mem_filter.mp hx).2
+```
+
+**Step 3:** Merge output is always canonicalized.
+
+```lean
+-- OrSet/Props.lean:62-67
+theorem or_set_merge_canonicalized {alpha Hlc : Type} ...
+    (a b : OrSet alpha Hlc) :
+    forall x in (OrSet.merge a b).elements, x.tag not_in (OrSet.merge a b).tombstones := by
+  intro x hx
+  simp [OrSet.merge] at hx |-
+  exact hx.2
+```
+
+**Step 4:** Precondition-free idempotence for merge outputs.
+
+```lean
+-- OrSet/Props.lean:71-74
+theorem or_set_merge_idem_general {alpha Hlc : Type} ...
+    (a b : OrSet alpha Hlc) :
+    OrSet.merge (OrSet.merge a b) (OrSet.merge a b) = OrSet.merge a b := by
+  exact or_set_merge_idem (OrSet.merge a b) (or_set_merge_canonicalized a b)
+```
+
+The chain works as follows: `or_set_merge_idem` requires a cleanness precondition
+(no element tag in tombstones). `or_set_merge_canonicalized` proves that any
+merge output satisfies this precondition. `or_set_merge_idem_general` composes
+the two: since `merge a b` is always clean, `merge (merge a b) (merge a b) =
+merge a b`. This is exactly the property needed by the table composition layer
+(Tier 4), where `mergeTableRow_idem_of_valid` requires OR-Set canonicalization.
+
+**Why this is elegant:** The `or_set_merge_idem_general` proof is a single `exact`
+-- one line. All the work was already done by the preceding lemmas. This
+composition pattern, where each lemma does exactly one thing and the final
+theorem is a trivial assembly, is characteristic of well-structured Lean proofs.
+
+---
+
+## Deep Dive: Replication and Compaction Proofs
+
+### Replication Log Safety
+
+**File:** `/home/kuitang/git/crdtbase/lean/CrdtBase/Replication/Props.lean` (62 lines)
+
+The replication module proves three theorems about the `readSince` function, which
+returns log entries strictly newer than a watermark cursor.
+
+The central theorem is `readSince_mem_gt_since`:
+
+```lean
+-- Replication/Props.lean:26-42
+theorem readSince_mem_gt_since
+    (entries : List LogEntry) (siteId : String) (since seq : Nat)
+    (hMem : seq in readSince entries siteId since) :
+    seq > since := by
+  unfold readSince at hMem
+  have hInFilter : seq in (canonicalSeqs entries siteId).filter (fun candidate => candidate > since) :=
+    mem_takeContiguousFrom_mem
+      (expected := since + 1) (seq := seq)
+      (seqs := (canonicalSeqs entries siteId).filter (fun candidate => candidate > since))
+      hMem
+  have hTrue : decide (seq > since) = true := (List.mem_filter.mp hInFilter).2
+  by_cases hGt : seq > since
+  . exact hGt
+  . have hFalse : decide (seq > since) = false := by simp [hGt]
+    rw [hFalse] at hTrue
+    contradiction
+```
+
+The proof first unfolds `readSince`, which composes `canonicalSeqs` (site-filtered
+sorted sequence numbers) with `filter` (keep only those > watermark) with
+`takeContiguousFrom` (take the maximal contiguous prefix starting at
+`since + 1`). The helper `mem_takeContiguousFrom_mem` establishes that membership
+in `takeContiguousFrom`'s output implies membership in the input list, which is
+the filtered list. Then `List.mem_filter` extracts the filter predicate, and
+`by_cases` on the decidable `>` closes the proof.
+
+The compaction exclusion theorem builds directly on cursor safety:
+
+```lean
+-- Replication/Props.lean:52-58
+theorem readSince_compacted_prefix_exclusion
+    (entries : List LogEntry) (siteId : String) (watermark seq : Nat)
+    (hLe : seq <= watermark) :
+    seq not_in readSince entries siteId watermark := by
+  intro hMem
+  have hGt := readSince_after_watermark_only_returns_gt_watermark entries siteId watermark seq hMem
+  exact (Nat.not_lt_of_ge hLe) hGt
+```
+
+This is the formal guarantee that compacted log entries (those at or below the
+watermark) are never replayed to clients. The proof is a one-step contradiction:
+if `seq <= watermark` and `seq > watermark`, we have `not_lt_of_ge` against `hGt`.
+
+### Compaction Correctness
+
+**File:** `/home/kuitang/git/crdtbase/lean/CrdtBase/Compaction/Props.lean` (120 lines)
+
+Compaction correctness reduces to a single standard library lemma, but the file
+develops a complete theory around it.
+
+The foundational theorem is `foldPrefixSuffix_eq_foldl`:
+
+```lean
+-- Compaction/Props.lean:10-25
+theorem foldPrefixSuffix_eq_foldl {alpha beta : Type}
+    (step : beta -> alpha -> beta) (init : beta) (ops : List alpha) (split : Nat) :
+    foldPrefixSuffix step init ops split = List.foldl step init ops := by
+  calc
+    foldPrefixSuffix step init ops split
+        = List.foldl step (List.foldl step init (List.take split ops)) (List.drop split ops) := by
+            rfl
+    _ = List.foldl step init (List.take split ops ++ List.drop split ops) := by
+          simpa using
+            (List.foldl_append ...).symm
+    _ = List.foldl step init ops := by
+          exact congrArg (List.foldl step init) (List.take_append_drop split ops)
+```
+
+The `calc` chain is pedagogically clear: (1) unfold `foldPrefixSuffix` to its
+definition as nested `foldl`; (2) apply `List.foldl_append` in reverse to merge
+the two folds; (3) apply `List.take_append_drop` to recover the original list.
+
+The per-CRDT specializations instantiate this generic theorem:
+
+```lean
+-- Compaction/Props.lean:55-64
+theorem pn_counter_compaction_preserves_state
+    (ops : List PnCounter) (split : Nat) :
+    foldPrefixSuffix PnCounter.merge pnCounterEmpty ops split =
+      List.foldl PnCounter.merge pnCounterEmpty ops := by
+  simpa using
+    (foldPrefixSuffix_eq_foldl
+      (step := PnCounter.merge) (init := pnCounterEmpty) (ops := ops) (split := split))
+```
+
+Note how the LWW specialization differs: it uses `Option (LwwRegister alpha)` as
+the initial state (since there may be no initial value), with `lwwStep` as the
+step function:
+
+```lean
+-- Compaction/Props.lean:93-102
+theorem lww_compaction_preserves_state {alpha : Type}
+    (ops : List (LwwRegister alpha)) (split : Nat) :
+    foldPrefixSuffix lwwStep none ops split =
+      List.foldl lwwStep none ops := by
+  simpa using
+    (foldPrefixSuffix_eq_foldl
+      (step := lwwStep) (init := (none : Option (LwwRegister alpha)))
+      (ops := ops) (split := split))
+```
+
+The snapshot cutover theorems formalize the operational pattern used by the
+runtime: load a compacted prefix state, then replay only the suffix:
+
+```lean
+-- Compaction/Props.lean:105-109
+theorem snapshot_then_suffix_replay_eq_full_fold {alpha beta : Type}
+    (step : beta -> alpha -> beta) (init : beta) (compactedPrefix suffix : List alpha) :
+    List.foldl step (List.foldl step init compactedPrefix) suffix =
+      List.foldl step init (compactedPrefix ++ suffix) := by
+  simpa using compaction_preserves_state step init compactedPrefix suffix
+```
+
+And the no-op case when no new suffix deltas exist:
+
+```lean
+-- Compaction/Props.lean:112-116
+theorem snapshot_cutover_idempotent_without_new_suffix {alpha beta : Type}
+    (step : beta -> alpha -> beta) (init : beta) (compactedPrefix : List alpha) :
+    List.foldl step (List.foldl step init compactedPrefix) [] =
+      List.foldl step init compactedPrefix := by
+  simp
+```
+
+The entire compaction proof machinery is built on `List.foldl_append` and
+`List.take_append_drop` from the standard library. No commutativity or
+associativity of the merge function is needed -- these are properties of `foldl`
+itself. This means compaction correctness holds even for merge functions that
+are not commutative (i.e., the guarantees apply during the compaction process
+itself, independent of convergence).
+
 ---
 
 ## Key Design Decisions
@@ -539,6 +855,12 @@ identical (same payload). This is an operational invariant -- if violated (e.g.,
 cloned site IDs), the system provides no convergence guarantee. The proofs make
 this assumption explicit rather than silently assuming it.
 
+The table composition proofs propagate this precondition through
+`ValidTableRowPair` and `ValidTableRowTriple`, which bundle LWW consistency
+for each LWW column alongside OR-Set canonicalization cleanness. This propagation
+is the formal analogue of the runtime's invariant maintenance: each write assigns
+a unique `(hlc, site)` pair, and each merge canonicalizes OR-Set output.
+
 ### Finset for OR-Set (Mathlib Dependency)
 
 The OR-Set and MV-Register use `Finset` from Mathlib, which provides:
@@ -562,7 +884,7 @@ public-facing theorems clean while containing the if-branch reasoning in one pla
 Compaction correctness reduces to a single library lemma:
 
 ```lean
--- Compaction/Props.lean:39-45
+-- Compaction/Props.lean:36-45
 theorem compaction_preserves_state {alpha beta : Type}
     (step : beta -> alpha -> beta) (init : beta) (preOps postOps : List alpha) :
     List.foldl step (List.foldl step init preOps) postOps =
@@ -573,8 +895,62 @@ theorem compaction_preserves_state {alpha beta : Type}
 This is `List.foldl_append` from the standard library, applied in reverse. The
 entire compaction proof machinery is an elegant wrapper around this single fact:
 splitting a fold at any point and resuming is the same as folding the whole list.
-No commutativity or associativity of the merge function is needed -- this is a
-property of `foldl` itself.
+The per-CRDT specializations (PN-Counter, OR-Set, MV-Register, LWW) and the
+snapshot cutover laws are all direct applications of this core lemma with
+type-specific instantiations.
+
+### Table Operator Commutativity via Definitional Equality
+
+The six operator commutativity theorems in the Table module
+(`apply_counter_preserves_visibility`, `row_exists_counter_commute`, etc.) all
+share the same proof pattern: `cases row; rfl`. This works because after
+destructuring the row into its five fields, the two sides of the equation
+become definitionally equal -- Lean can verify them by computation alone,
+without any rewriting. This is a consequence of the table operations being
+pure field updates that do not interact across columns.
+
+```lean
+-- Table/Props.lean:189-197
+theorem row_exists_counter_commute
+    (row : TableRowState alpha beta gamma Hlc)
+    (existsEvent : LwwRegister Bool)
+    (counterDelta : PnCounter)
+    : applyCounterCell (applyRowExists row existsEvent) counterDelta =
+      applyRowExists (applyCounterCell row counterDelta) existsEvent := by
+  cases row
+  rfl
+```
+
+### Disjoint Key Commutativity via calc
+
+The `modify_row_at_disjoint_commute` theorem is the most involved table proof,
+establishing that updates at distinct keys `k1 != k2` commute at the whole-table
+level. The proof uses `funext` to reason pointwise about each key `current`, then
+case-splits on whether `current = k1` or `current = k2`:
+
+```lean
+-- Table/Props.lean:225-248
+theorem modify_row_at_disjoint_commute
+    (table : TableState kappa alpha beta gamma Hlc)
+    (k1 k2 : kappa) (hNe : k1 != k2)
+    (f g : TableRowState alpha beta gamma Hlc -> TableRowState alpha beta gamma Hlc)
+    : modifyRowAt (modifyRowAt table k1 f) k2 g =
+      modifyRowAt (modifyRowAt table k2 g) k1 f := by
+  funext current
+  by_cases hCurrentK1 : current = k1
+  . have hCurrentNeK2 : current != k2 := by
+      intro hCurrentK2; apply hNe
+      calc k1 = current := hCurrentK1.symm
+           _ = k2 := hCurrentK2
+    simp [modifyRowAt, hCurrentK1, hNe]
+  . by_cases hCurrentK2 : current = k2
+    . ...
+    . simp [modifyRowAt, hCurrentK1, hCurrentK2]
+```
+
+The `calc` chain in the first branch is worth noting: it derives `k1 = k2` from
+`current = k1` and `current = k2`, contradicting `hNe`. This is a common Lean
+pattern for proving disjointness of key-indexed operations.
 
 ---
 
@@ -584,28 +960,37 @@ The proof architecture follows a clear layering strategy:
 
 1. **Foundation layer** (HLC): Establish that `compareWithSite` is a strict total
    order with antisymmetry, transitivity, and reflexivity. All proofs here are
-   direct natural number reasoning.
+   direct natural number reasoning. (19 theorems)
 
 2. **CRDT layer**: Each CRDT type proves its own semilattice triple (comm, assoc,
    idem). The techniques vary by type:
-   - **LWW**: Case analysis on comparison results + HLC order properties
+   - **LWW**: Case analysis on comparison results + HLC order properties + event-consistency
    - **PN-Counter**: Extensionality + `Nat.max` properties
-   - **OR-Set**: Finset algebra + `aesop`
+   - **OR-Set**: Finset algebra + `aesop` + canonicalization chain
    - **MV-Register**: Finset union algebra
+   (16 theorems)
 
-3. **Lifting layer** (Table): Proves that pointwise application of row merges
-   preserves semilattice properties, and that independent column operations commute.
-   These proofs are almost all `cases row; rfl`.
+3. **Table composition layer**: Proves that composite rows preserve semilattice
+   properties under validity predicates (`ValidTableRowPair`, `ValidTableRowTriple`),
+   lifts row-level proofs to whole-table via `funext`, and establishes operator
+   commutativity for independent columns and disjoint keys. (16 theorems)
 
-4. **Composition layer** (Convergence): Takes the per-CRDT semilattice proofs and
-   composes them with the permutation-invariance of foldl to prove system-wide
-   convergence. The key bridge is constructing `RightCommutative` from `comm + assoc`.
+4. **Convergence layer**: Takes the per-CRDT semilattice proofs and composes them
+   with the permutation-invariance of foldl to prove system-wide convergence. The
+   key bridge is constructing `RightCommutative` from `comm + assoc`. (9 theorems)
 
-5. **Application layer** (Compaction, Tombstone, SQL, Replication): Derives
-   domain-specific consequences. Compaction uses `List.foldl_append`. Tombstones
-   reuse LWW proofs directly. SQL proofs use `decide` and boolean reflection.
+5. **Compaction layer**: Proves that fold splitting is lossless via
+   `List.foldl_append`, with per-CRDT specializations and snapshot cutover laws.
+   (9 theorems)
 
-The total proof codebase is approximately 900 lines of proof text spread across
-12 `Props.lean` files, covering 60+ theorems. Every theorem has a docstring, and
+6. **Application layer** (Tombstone, SQL, Replication): Derives domain-specific
+   consequences. Tombstones reuse LWW proofs directly. SQL proofs use `decide` and
+   boolean reflection. Replication proves cursor safety and compaction exclusion.
+   (14 theorems)
+
+The total proof codebase is approximately 1000 lines of proof text spread across
+12 `Props.lean` files, covering 76+ theorems. Every theorem has a docstring, and
 the proofs are readable enough to serve as documentation of the system's
-correctness invariants.
+correctness invariants. The table composition and OR-Set idempotence chain
+represent the most recent additions, closing the gap between per-CRDT correctness
+and the composite row/table level that the actual runtime operates on.

@@ -55,8 +55,12 @@
     <li><a href="#event-consistency">The Event-Consistency Invariant</a></li>
     <li><a href="#pn-counter">PN-Counter Proofs</a></li>
     <li><a href="#or-set">OR-Set Proofs</a></li>
-    <li><a href="#elegant-proofs">Three Elegant Proofs</a></li>
+    <li><a href="#or-set-idempotence-chain">OR-Set Idempotence Chain</a></li>
     <li><a href="#table-composition">Table Composition Proofs</a></li>
+    <li><a href="#convergence">Convergence Proofs</a></li>
+    <li><a href="#compaction">Compaction Proofs</a></li>
+    <li><a href="#replication">Replication Log Safety Proofs</a></li>
+    <li><a href="#elegant-proofs">Five Elegant Proofs</a></li>
     <li><a href="#verification-tiers">Verification Tiers and Coverage</a></li>
     <li><a href="#proven-vs-sorry">What Is Proven vs. What Uses <code>sorry</code></a></li>
   </ol>
@@ -79,8 +83,8 @@
   algebraic properties&mdash;commutativity, associativity, and
   idempotence of the merge function&mdash;those properties must not merely be
   argued informally. They should be machine-checked. The <code>lean/</code>
-  subdirectory contains roughly 900 lines of Lean 4 proof text, spread across
-  12 <code>Props.lean</code> files, covering 60+ theorems. Every theorem
+  subdirectory contains roughly 1,000 lines of Lean 4 proof text, spread across
+  12 <code>Props.lean</code> files, covering 76+ theorems. Every theorem
   compiles without <code>sorry</code>.
 </p>
 
@@ -108,6 +112,12 @@
   From these three properties, a standard result (which CRDTBase also proves)
   gives <em>convergence</em>: any two replicas that have received the same set
   of operations&mdash;in any order&mdash;will arrive at the same state.
+  But the proof suite goes well beyond the semilattice core. It also proves
+  table composition (composite rows inherit semilattice properties from their
+  columns), compaction correctness (split-fold equals full fold), replication
+  log safety (compacted entries are never replayed), and the full OR-Set
+  idempotence chain (merge output is always self-idempotent without
+  preconditions).
 </p>
 
 <!-- ═══════════════════════════════════════════════════════════ -->
@@ -173,6 +183,10 @@ graph TD
     OD --> TD2
     MD --> TD2
     TD2 --> TP
+    LP --> TP
+    PP --> TP
+    OP --> TP
+    MP --> TP
     LP --> CP
     PP --> CP
     OP --> CP
@@ -191,7 +205,9 @@ graph TD
   </pre>
   <div class="caption">Figure 3.1 &mdash; File dependency graph. Arrows point from
     dependency to dependent. The layering is strict: HLC at the foundation,
-    individual CRDTs in the middle, convergence and table composition at top.</div>
+    individual CRDTs in the middle, table composition and convergence at top.
+    Note that Table/Props.lean depends on <em>all</em> per-CRDT Props files,
+    because it must assemble their proofs into composite row theorems.</div>
 </div>
 
 <p>
@@ -261,9 +277,10 @@ graph TD
 </div>
 
 <p>
-  The HLC Props file proves 14 theorems establishing that
-  <code>compareWithSite</code> forms a strict total order. The key results
-  are:
+  The HLC Props file proves 19 theorems establishing that
+  <code>compareWithSite</code> forms a strict total order plus
+  monotonicity of the <code>now()</code> and <code>recv()</code> clock
+  operations. The key results are:
 </p>
 
 <div class="theorem">
@@ -341,6 +358,17 @@ graph TD
   have hacLt : siteLexLt a c := siteLexLt_trans habLt hbcLt
   exact (compareWithSite_eq_lt_iff a c).2 hacLt</code></pre>
 </div>
+
+<p>
+  The remaining HLC theorems include <code>hlc_counter_breaks_tie</code>
+  (same wallMs: pack order equals counter order),
+  <code>hlc_now_monotonic</code> and <code>hlc_now_strict_monotonic</code>
+  (<code>now()</code> strictly increases), <code>hlc_recv_monotonic</code>
+  and <code>hlc_recv_strict_monotonic</code> (<code>recv()</code> strictly
+  increases), <code>recv_none_of_drift</code> (drift rejection),
+  <code>recv_some_bounds</code> / <code>now_some_bounds</code> (output
+  stays in bounds), and the <code>max3</code> dominance lemmas.
+</p>
 
 <!-- ═══════════════════════════════════════════════════════════ -->
 <h2 id="lww-semilattice">3.4 &ensp; LWW Semilattice Proofs</h2>
@@ -767,58 +795,423 @@ def OrSet.merge (a b : OrSet &alpha; Hlc) : OrSet &alpha; Hlc :=
   </p>
 </div>
 
-<div class="note">
-  <span class="box-title">Idempotence Precondition</span>
+<div class="theorem">
+  <span class="box-title">Theorem 3.16 &mdash; or_set_merge_idem</span>
+  <span class="file-ref">lean/CrdtBase/Crdt/OrSet/Props.lean:47&ndash;59</span>
+  \[
+    \forall a.\; (\forall x \in a.\text{elements},\; x.\text{tag} \notin a.\text{tombstones})
+    \implies \text{OrSet.merge}(a, a) = a
+  \]
+<pre><code>theorem or_set_merge_idem (a : OrSet &alpha; Hlc)
+    (hClean : &forall; x &isin; a.elements, x.tag &notin; a.tombstones) :
+    OrSet.merge a a = a := by
+  ext x
+  &middot; constructor
+    &middot; intro hx
+      simp [OrSet.merge] at hx
+      exact hx.1
+    &middot; intro hx
+      have hNotInTombs : x.tag &notin; a.tombstones := hClean x hx
+      simp [OrSet.merge, hx, hNotInTombs]
+  &middot; simp [OrSet.merge]</code></pre>
   <p>
-    OR-Set idempotence (<code>or_set_merge_idem</code>) requires a
-    precondition: the input must already be canonicalized (no element has a
-    tombstoned tag). This is stated as <code>hClean : &forall; x &isin;
-    a.elements, x.tag &notin; a.tombstones</code>. After merge, the
-    canonicalization step always produces a clean state, so this precondition
-    is automatically satisfied in practice.
+    Idempotence requires a cleanness precondition: the input must be
+    canonicalized. The next section shows how this precondition is
+    automatically discharged for merge outputs.
   </p>
 </div>
 
 <!-- ═══════════════════════════════════════════════════════════ -->
-<h2 id="elegant-proofs">3.8 &ensp; Three Elegant Proofs</h2>
-
-<h3>1. The PN-Counter One-Liner Trio</h3>
+<h2 id="or-set-idempotence-chain">3.8 &ensp; OR-Set Idempotence Chain</h2>
 
 <p>
-  The PN-Counter semilattice proofs are the most elegant in the codebase.
-  Each consists of exactly one tactic invocation:
+  OR-Set idempotence is the trickiest of the semilattice properties because
+  merge includes a canonicalization step that filters out tombstoned elements.
+  Naively, <code>merge a a</code> might not equal <code>a</code> if
+  <code>a</code> has elements whose tags appear in its own tombstone set
+  (i.e., <code>a</code> is not canonicalized). The proof suite resolves this
+  with a four-theorem chain that was a key P1-3 fix.
 </p>
 
-<div class="proof">
-  <span class="box-title">Complete PN-Counter Semilattice</span>
-  <span class="file-ref">lean/CrdtBase/Crdt/PnCounter/Props.lean:8&ndash;21</span>
-<pre><code>-- Commutativity:
-  ext site &lt;;&gt; simp [PnCounter.merge, Nat.max_comm]
--- Associativity:
-  ext site &lt;;&gt; simp [PnCounter.merge, Nat.max_assoc]
--- Idempotence:
-  ext site &lt;;&gt; simp [PnCounter.merge]</code></pre>
+<div class="diagram-container">
+  <pre class="mermaid">
+graph LR
+    A["or_set_canonicalize_idem<br/><em>canonicalize is idempotent</em>"]
+    B["or_set_canonicalize_no_tombstoned_tags<br/><em>output is clean</em>"]
+    C["or_set_merge_canonicalized<br/><em>merge output is clean</em>"]
+    D["or_set_merge_idem_general<br/><em>merge output is self-idempotent</em>"]
+
+    A --> C
+    B --> C
+    C --> D
+
+    style D fill:#e8f5e9,stroke:#2d6a30,stroke-width:2px
+  </pre>
+  <div class="caption">Figure 3.3 &mdash; The OR-Set idempotence chain.
+    Each lemma does exactly one thing; the final theorem is a trivial assembly.</div>
+</div>
+
+<p><strong>Step 1: Canonicalization is idempotent</strong>
+  (<code>or_set_canonicalize_idem</code>, Theorem 3.12 above).
+  Applying <code>canonicalize</code> twice produces the same result as
+  applying it once.</p>
+
+<p><strong>Step 2: Canonicalized output is clean</strong>
+  (<code>or_set_canonicalize_no_tombstoned_tags</code>, Theorem 3.13
+  above). No element in the canonicalized output has its tag in the
+  tombstone set.</p>
+
+<p><strong>Step 3: Merge output is always canonicalized.</strong>
+  Since <code>merge</code> applies <code>canonicalize</code> as its
+  last step, every merge output satisfies the cleanness precondition.</p>
+
+<div class="theorem">
+  <span class="box-title">Theorem 3.17 &mdash; or_set_merge_canonicalized</span>
+  <span class="file-ref">lean/CrdtBase/Crdt/OrSet/Props.lean:62&ndash;67</span>
+  \[
+    \forall a, b.\;
+    \forall x \in (\text{merge}(a, b)).\text{elements}.\;
+    x.\text{tag} \notin (\text{merge}(a, b)).\text{tombstones}
+  \]
+<pre><code>theorem or_set_merge_canonicalized (a b : OrSet &alpha; Hlc) :
+    &forall; x &isin; (OrSet.merge a b).elements,
+      x.tag &notin; (OrSet.merge a b).tombstones := by
+  intro x hx
+  simp [OrSet.merge] at hx &vdash;
+  exact hx.2</code></pre>
+</div>
+
+<p><strong>Step 4: Precondition-free idempotence for merge outputs.</strong>
+  Composing Steps 3 and the conditional idempotence theorem yields a
+  result with no preconditions on the inputs:</p>
+
+<div class="theorem">
+  <span class="box-title">Theorem 3.18 &mdash; or_set_merge_idem_general</span>
+  <span class="file-ref">lean/CrdtBase/Crdt/OrSet/Props.lean:71&ndash;74</span>
+  \[
+    \forall a, b.\;
+    \text{merge}(\text{merge}(a, b),\, \text{merge}(a, b)) = \text{merge}(a, b)
+  \]
+<pre><code>theorem or_set_merge_idem_general (a b : OrSet &alpha; Hlc) :
+    OrSet.merge (OrSet.merge a b) (OrSet.merge a b) = OrSet.merge a b := by
+  exact or_set_merge_idem (OrSet.merge a b) (or_set_merge_canonicalized a b)</code></pre>
   <p>
-    The elegance comes from the modeling choice. By representing the counter
-    as <code>String &rarr; Nat</code> (pure functions) instead of
-    <code>HashMap String Nat</code>, the <code>ext</code> tactic gives
-    pointwise reasoning for free. With <code>HashMap</code>, you would
-    need to reason about finite map equality, key enumeration, and
-    missing-key defaults. With pure functions, the proof reduces to the
-    corresponding property of <code>Nat.max</code> from Batteries.
+    The proof is a single <code>exact</code>&mdash;one line. Since
+    <code>merge a b</code> is always clean (by
+    <code>or_set_merge_canonicalized</code>), the conditional idempotence
+    theorem (<code>or_set_merge_idem</code>) applies directly. This is
+    exactly the property needed by the table composition layer (Section 3.9),
+    where <code>mergeTableRow_idem_of_valid</code> requires OR-Set
+    canonicalization.
   </p>
 </div>
 
-<h3>2. Convergence via RightCommutative Construction</h3>
+<div class="note">
+  <span class="box-title">Design Note</span>
+  <p>
+    The chain composition pattern&mdash;where each lemma does exactly one thing
+    and the final theorem is a trivial assembly&mdash;is characteristic of
+    well-structured Lean proofs. It also provides a visible &ldquo;proof
+    dependency graph&rdquo; that makes the logical structure auditable.
+  </p>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<h2 id="table-composition">3.9 &ensp; Table Composition Proofs</h2>
 
 <p>
-  This is the crown jewel&mdash;the abstract convergence theorem that says
-  &ldquo;if merge forms a semilattice, then fold over any permutation of the
-  same operations converges to the same state.&rdquo;
+  The table composition proofs represent the most architecturally significant
+  addition to the proof suite. They show that composite rows&mdash;carrying
+  one column of each CRDT type&mdash;preserve semilattice properties when each
+  column&rsquo;s merge function does so under the appropriate preconditions.
+  This was a major P1-2 fix that closed the gap between individual CRDT
+  correctness and system-level correctness.
+</p>
+
+<div class="definition">
+  <span class="box-title">Definition 3.8 &mdash; TableRowState</span>
+  <span class="file-ref">lean/CrdtBase/Crdt/Table/Defs.lean:11&ndash;16</span>
+<pre><code>structure TableRowState (&alpha; &beta; &gamma; Hlc : Type) where
+  alive       : LwwRegister Bool
+  lwwCol      : LwwRegister &alpha;
+  counterCol  : PnCounter
+  setCol      : OrSet &beta; Hlc
+  registerCol : MvRegister &gamma;</code></pre>
+</div>
+
+<p>
+  Whole-table state is <code>&kappa; &rarr; TableRowState ...</code> (a function
+  from keys to rows), and table merge is pointwise row merge.
+</p>
+
+<h3>Validity Predicates</h3>
+
+<p>
+  The key innovation is the <strong>validity predicate</strong> design.
+  Rather than requiring unconditional semilattice properties (which LWW
+  does not have), the proofs thread preconditions through structured
+  predicates:
+</p>
+
+<div class="definition">
+  <span class="box-title">Definition 3.9 &mdash; ValidTableRowPair</span>
+  <span class="file-ref">lean/CrdtBase/Crdt/Table/Props.lean:58&ndash;63</span>
+<pre><code>structure ValidTableRowPair (a b : TableRowState &alpha; &beta; &gamma; Hlc) : Prop where
+  alive_consistent   : LwwConsistentPair a.alive b.alive
+  lwwCol_consistent  : LwwConsistentPair a.lwwCol b.lwwCol
+  setCol_a_clean     : &forall; x &isin; a.setCol.elements, x.tag &notin; a.setCol.tombstones
+  setCol_b_clean     : &forall; x &isin; b.setCol.elements, x.tag &notin; b.setCol.tombstones</code></pre>
+  <p>
+    The predicate bundles two kinds of invariants: LWW event-consistency for
+    the <code>alive</code> and <code>lwwCol</code> columns, and OR-Set
+    canonicalization cleanness for both sides. PN-Counter and MV-Register
+    require no preconditions, so they are absent from the predicate.
+  </p>
+</div>
+
+<div class="definition">
+  <span class="box-title">Definition 3.10 &mdash; ValidTableRowTriple</span>
+  <span class="file-ref">lean/CrdtBase/Crdt/Table/Props.lean:79&ndash;83</span>
+<pre><code>structure ValidTableRowTriple (a b c : TableRowState &alpha; &beta; &gamma; Hlc) : Prop where
+  alive_ab : LwwConsistentPair a.alive b.alive
+  alive_bc : LwwConsistentPair b.alive c.alive
+  lww_ab   : LwwConsistentPair a.lwwCol b.lwwCol
+  lww_bc   : LwwConsistentPair b.lwwCol c.lwwCol</code></pre>
+  <p>
+    For three-way associativity, a separate predicate captures pairwise LWW
+    consistency for \((a, b)\) and \((b, c)\).
+  </p>
+</div>
+
+<h3>Row-Level Semilattice</h3>
+
+<p>
+  Row-level commutativity assembles per-column proofs via a 5-tuple
+  of individually proved properties:
 </p>
 
 <div class="theorem">
-  <span class="box-title">Theorem 3.16 &mdash; convergence_of_comm_assoc</span>
+  <span class="box-title">Theorem 3.19 &mdash; mergeTableRow_comm_of_valid</span>
+  <span class="file-ref">lean/CrdtBase/Crdt/Table/Props.lean:66&ndash;75</span>
+  \[
+    \text{ValidTableRowPair}(a, b) \implies
+    \text{mergeTableRow}(a, b) = \text{mergeTableRow}(b, a)
+  \]
+<pre><code>theorem mergeTableRow_comm_of_valid
+    (a b : TableRowState &alpha; &beta; &gamma; Hlc)
+    (hValid : ValidTableRowPair a b)
+    : mergeTableRow a b = mergeTableRow b a := by
+  simp only [mergeTableRow, TableRowState.mk.injEq]
+  exact &langle;lww_merge_comm_of_consistent a.alive b.alive hValid.alive_consistent,
+         lww_merge_comm_of_consistent a.lwwCol b.lwwCol hValid.lwwCol_consistent,
+         pn_counter_merge_comm a.counterCol b.counterCol,
+         or_set_merge_comm a.setCol b.setCol,
+         mv_register_merge_comm a.registerCol b.registerCol&rangle;</code></pre>
+  <p>
+    After <code>simp</code> reduces the goal to equality of the five fields,
+    each component is dispatched to the appropriate per-CRDT theorem. The LWW
+    columns use the validity predicate&rsquo;s consistency fields; the
+    PN-Counter, OR-Set, and MV-Register components need no preconditions.
+  </p>
+</div>
+
+<div class="theorem">
+  <span class="box-title">Theorem 3.20 &mdash; mergeTableRow_assoc_of_valid</span>
+  <span class="file-ref">lean/CrdtBase/Crdt/Table/Props.lean:86&ndash;97</span>
+  \[
+    \text{ValidTableRowTriple}(a, b, c) \implies
+    \text{mergeTableRow}(\text{mergeTableRow}(a, b), c)
+    = \text{mergeTableRow}(a, \text{mergeTableRow}(b, c))
+  \]
+<pre><code>theorem mergeTableRow_assoc_of_valid
+    (a b c : TableRowState &alpha; &beta; &gamma; Hlc)
+    (hValid : ValidTableRowTriple a b c)
+    : mergeTableRow (mergeTableRow a b) c = mergeTableRow a (mergeTableRow b c) := by
+  simp only [mergeTableRow, TableRowState.mk.injEq]
+  exact &langle;lww_merge_assoc_of_consistent a.alive b.alive c.alive
+           hValid.alive_ab hValid.alive_bc,
+         lww_merge_assoc_of_consistent a.lwwCol b.lwwCol c.lwwCol
+           hValid.lww_ab hValid.lww_bc,
+         pn_counter_merge_assoc a.counterCol b.counterCol c.counterCol,
+         or_set_merge_assoc a.setCol b.setCol c.setCol,
+         mv_register_merge_assoc a.registerCol b.registerCol c.registerCol&rangle;</code></pre>
+</div>
+
+<div class="theorem">
+  <span class="box-title">Theorem 3.21 &mdash; mergeTableRow_idem_of_valid</span>
+  <span class="file-ref">lean/CrdtBase/Crdt/Table/Props.lean:105&ndash;115</span>
+  \[
+    (\forall x \in a.\text{setCol}.\text{elements},\; x.\text{tag} \notin a.\text{setCol}.\text{tombstones})
+    \implies \text{mergeTableRow}(a, a) = a
+  \]
+<pre><code>theorem mergeTableRow_idem_of_valid
+    (a : TableRowState &alpha; &beta; &gamma; Hlc)
+    (hSetClean : &forall; x &isin; a.setCol.elements, x.tag &notin; a.setCol.tombstones)
+    : mergeTableRow a a = a := by
+  cases a with | mk aAlive aLww aCounter aSet aReg =&gt;
+  simp only [mergeTableRow, TableRowState.mk.injEq]
+  exact &langle;lww_merge_idem aAlive,
+         lww_merge_idem aLww,
+         pn_counter_merge_idem aCounter,
+         or_set_merge_idem aSet hSetClean,
+         mv_register_merge_idem aReg&rangle;</code></pre>
+  <p>
+    The OR-Set column requires the cleanness precondition, which is exactly
+    the property guaranteed by <code>or_set_merge_canonicalized</code>
+    (Theorem 3.17). After any merge, the OR-Set output is automatically
+    canonicalized, so idempotence holds in practice.
+  </p>
+</div>
+
+<h3>Whole-Table Lift</h3>
+
+<p>
+  The lifting from row-level to whole-table is accomplished via
+  <code>funext</code>:
+</p>
+
+<div class="theorem">
+  <span class="box-title">Theorem 3.22 &mdash; mergeTable_comm_of_valid</span>
+  <span class="file-ref">lean/CrdtBase/Crdt/Table/Props.lean:125&ndash;130</span>
+<pre><code>theorem mergeTable_comm_of_valid {&kappa; : Type}
+    (a b : TableState &kappa; &alpha; &beta; &gamma; Hlc)
+    (hValid : ValidTableState a b)
+    : mergeTable a b = mergeTable b a := by
+  funext key
+  exact mergeTableRow_comm_of_valid (a key) (b key) (hValid key)</code></pre>
+  <p>
+    Where <code>ValidTableState a b</code> is defined as
+    <code>&forall; key : &kappa;, ValidTableRowPair (a key) (b key)</code>.
+    The proof instantiates the row-level theorem at each key.
+    Associativity (<code>mergeTable_assoc_of_valid</code>) and
+    idempotence (<code>mergeTable_idem_of_valid</code>) follow the same
+    pattern with their respective predicates
+    (<code>ValidTableStateTriple</code>, <code>ValidTableStateIdem</code>).
+  </p>
+</div>
+
+<h3>Operator Visibility Preservation</h3>
+
+<p>
+  Three theorems prove that column-specific updates do not affect row
+  visibility (the <code>alive</code> flag):
+</p>
+
+<div class="theorem">
+  <span class="box-title">Theorems 3.23&ndash;3.25 &mdash; Visibility Preservation</span>
+  <span class="file-ref">lean/CrdtBase/Crdt/Table/Props.lean:163&ndash;186</span>
+<pre><code>-- Counter updates do not change row visibility.
+theorem apply_counter_preserves_visibility
+    (row : TableRowState &alpha; &beta; &gamma; Hlc)
+    (counterDelta : PnCounter)
+    : rowVisible (applyCounterCell row counterDelta) = rowVisible row := by
+  cases row; rfl
+
+-- OR-Set updates do not change row visibility.
+theorem apply_set_preserves_visibility ...
+    : rowVisible (applySetCell row setDelta) = rowVisible row := by
+  cases row; rfl
+
+-- MV-register updates do not change row visibility.
+theorem apply_register_preserves_visibility ...
+    : rowVisible (applyRegisterCell row registerDelta) = rowVisible row := by
+  cases row; rfl</code></pre>
+  <p>
+    Each proof works by destructuring the row into its five fields
+    via <code>cases row</code>. Since each <code>apply*Cell</code> function
+    modifies exactly one field of the structure via
+    <code>{ row with field := ... }</code>, both sides become
+    definitionally equal and <code>rfl</code> closes the goal.
+  </p>
+</div>
+
+<h3>Column Commutativity</h3>
+
+<p>
+  Three theorems prove that updates to independent columns commute:
+</p>
+
+<div class="theorem">
+  <span class="box-title">Theorems 3.26&ndash;3.28 &mdash; Column Commutativity</span>
+  <span class="file-ref">lean/CrdtBase/Crdt/Table/Props.lean:188&ndash;218</span>
+<pre><code>-- Row-existence updates commute with counter updates
+theorem row_exists_counter_commute
+    (row : TableRowState &alpha; &beta; &gamma; Hlc)
+    (existsEvent : LwwRegister Bool) (counterDelta : PnCounter)
+    : applyCounterCell (applyRowExists row existsEvent) counterDelta =
+      applyRowExists (applyCounterCell row counterDelta) existsEvent := by
+  cases row; rfl
+
+-- Row-existence updates commute with OR-Set updates
+theorem row_exists_set_commute ...
+    : applySetCell (applyRowExists row existsEvent) setDelta =
+      applyRowExists (applySetCell row setDelta) existsEvent := by
+  cases row; rfl
+
+-- Counter and MV-register updates commute
+theorem row_counter_register_commute ...
+    : applyRegisterCell (applyCounterCell row counterDelta) registerDelta =
+      applyCounterCell (applyRegisterCell row registerDelta) counterDelta := by
+  cases row; rfl</code></pre>
+  <p>
+    All three share the same proof pattern: <code>cases row; rfl</code>.
+    This works because each <code>apply*Cell</code> function modifies
+    exactly one field, so the two compositions produce definitionally
+    equal structures regardless of application order.
+  </p>
+</div>
+
+<h3>Disjoint Key Commutativity</h3>
+
+<div class="theorem">
+  <span class="box-title">Theorem 3.29 &mdash; modify_row_at_disjoint_commute</span>
+  <span class="file-ref">lean/CrdtBase/Crdt/Table/Props.lean:225&ndash;248</span>
+  <p>Updates at disjoint keys commute at the whole-table level:</p>
+  \[
+    k_1 \ne k_2 \implies
+    \text{modify}(\text{modify}(T, k_1, f), k_2, g) =
+    \text{modify}(\text{modify}(T, k_2, g), k_1, f)
+  \]
+<pre><code>theorem modify_row_at_disjoint_commute
+    (table : TableState &kappa; &alpha; &beta; &gamma; Hlc)
+    (k1 k2 : &kappa;) (hNe : k1 &ne; k2)
+    (f g : TableRowState &alpha; &beta; &gamma; Hlc &rarr; TableRowState &alpha; &beta; &gamma; Hlc)
+    : modifyRowAt (modifyRowAt table k1 f) k2 g =
+      modifyRowAt (modifyRowAt table k2 g) k1 f := by
+  funext current
+  by_cases hCurrentK1 : current = k1
+  &middot; have hCurrentNeK2 : current &ne; k2 := by
+      intro hCurrentK2; apply hNe
+      calc k1 = current := hCurrentK1.symm
+           _ = k2 := hCurrentK2
+    simp [modifyRowAt, hCurrentK1, hNe]
+  &middot; by_cases hCurrentK2 : current = k2
+    &middot; have hK2NeK1 : k2 &ne; k1 := by intro h; exact hNe h.symm
+      simp [modifyRowAt, hCurrentK2, hK2NeK1]
+    &middot; simp [modifyRowAt, hCurrentK1, hCurrentK2]</code></pre>
+  <p>
+    The proof uses <code>funext</code> to reason pointwise about each key
+    <code>current</code>, then case-splits on whether <code>current = k1</code>
+    or <code>current = k2</code>. In the first branch, a <code>calc</code>
+    chain derives \(k_1 = k_2\) from <code>current = k1</code> and
+    <code>current = k2</code>, contradicting <code>hNe</code>. The remaining
+    cases are closed by <code>simp</code> with the <code>modifyRowAt</code>
+    definition.
+  </p>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<h2 id="convergence">3.10 &ensp; Convergence Proofs</h2>
+
+<p>
+  The convergence module takes the per-CRDT semilattice proofs and composes them
+  with the permutation-invariance of <code>foldl</code> to prove system-wide
+  convergence. The key bridge is constructing <code>RightCommutative</code>
+  from commutativity and associativity.
+</p>
+
+<div class="theorem">
+  <span class="box-title">Theorem 3.30 &mdash; convergence_of_comm_assoc</span>
   <span class="file-ref">lean/CrdtBase/Convergence/Props.lean:28&ndash;42</span>
   \[
     \forall \mathtt{merge}.\;
@@ -865,16 +1258,312 @@ def OrSet.merge (a b : OrSet &alpha; Hlc) : OrSet &alpha; Hlc :=
     \;=\; \merge(\merge(a, c), b)
   \]
   <p>Each step uses exactly one axiom. The <code>.symm</code> at the end
-    flips the direction of the associativity rewrite. The concrete per-CRDT
-    convergence theorems then become one-liners:</p>
-<pre><code>-- Convergence/Props.lean:126-130
-theorem convergence_pn_counter
+    flips the direction of the associativity rewrite.</p>
+</div>
+
+<p>
+  The concrete per-CRDT convergence theorems are one-liners. For PN-Counter,
+  OR-Set, and MV-Register, <code>Std.Commutative</code> and
+  <code>Std.Associative</code> instances are registered, and Mathlib can
+  derive <code>RightCommutative</code> from those:
+</p>
+
+<div class="theorem">
+  <span class="box-title">Theorem 3.31 &mdash; convergence_pn_counter</span>
+  <span class="file-ref">lean/CrdtBase/Convergence/Props.lean:126&ndash;130</span>
+<pre><code>theorem convergence_pn_counter
     (init : PnCounter) {ops&sub1; ops&sub2; : List PnCounter}
     (hPerm : List.Perm ops&sub1; ops&sub2;) :
     applyOps PnCounter.merge init ops&sub1; =
       applyOps PnCounter.merge init ops&sub2; := by
   simpa using convergence_of_perm PnCounter.merge init hPerm</code></pre>
 </div>
+
+<p>
+  LWW convergence requires explicit event-consistency hypotheses:
+</p>
+
+<div class="theorem">
+  <span class="box-title">Theorem 3.32 &mdash; convergence_lww_of_consistent</span>
+  <span class="file-ref">lean/CrdtBase/Convergence/Props.lean:108&ndash;116</span>
+<pre><code>theorem convergence_lww_of_consistent
+    (init : LwwRegister &alpha;) {ops&sub1; ops&sub2; : List (LwwRegister &alpha;)}
+    (hPerm : List.Perm ops&sub1; ops&sub2;)
+    (hCons : &forall; a b : LwwRegister &alpha;, LwwConsistentPair a b) :
+    applyOps LwwRegister.merge init ops&sub1; = applyOps LwwRegister.merge init ops&sub2; := by
+  simpa using convergence_lww init hPerm
+    (lww_merge_comm_global_of_consistent hCons)
+    (lww_merge_assoc_global_of_consistent hCons)</code></pre>
+</div>
+
+<p>
+  The module also includes <code>convergence_composite</code>, which
+  proves convergence for a 2-column composite row by constructing
+  commutativity and associativity for the componentwise merge from the
+  individual column properties.
+</p>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<h2 id="compaction">3.11 &ensp; Compaction Proofs</h2>
+
+<p>
+  Compaction correctness reduces to a single standard library lemma, but the
+  file develops a complete theory around it with per-CRDT specializations and
+  snapshot cutover laws.
+</p>
+
+<h3>The Foundational Split-Fold Theorem</h3>
+
+<div class="theorem">
+  <span class="box-title">Theorem 3.33 &mdash; foldPrefixSuffix_eq_foldl</span>
+  <span class="file-ref">lean/CrdtBase/Compaction/Props.lean:10&ndash;25</span>
+  \[
+    \forall \mathtt{step},\, \mathtt{init},\, \mathtt{ops},\, n.\;
+    \foldl(\mathtt{step},\, \foldl(\mathtt{step},\, \mathtt{init},\, \text{take}(n, \mathtt{ops})),\,
+    \text{drop}(n, \mathtt{ops})) = \foldl(\mathtt{step},\, \mathtt{init},\, \mathtt{ops})
+  \]
+<pre><code>theorem foldPrefixSuffix_eq_foldl {&alpha; &beta; : Type}
+    (step : &beta; &rarr; &alpha; &rarr; &beta;) (init : &beta;) (ops : List &alpha;) (split : Nat) :
+    foldPrefixSuffix step init ops split = List.foldl step init ops := by
+  calc
+    foldPrefixSuffix step init ops split
+        = List.foldl step (List.foldl step init (List.take split ops))
+            (List.drop split ops) := by rfl
+    _ = List.foldl step init (List.take split ops ++ List.drop split ops) := by
+          simpa using (List.foldl_append ..).symm
+    _ = List.foldl step init ops := by
+          exact congrArg (List.foldl step init) (List.take_append_drop split ops)</code></pre>
+  <p>
+    The <code>calc</code> chain is pedagogically clear: (1) unfold
+    <code>foldPrefixSuffix</code> to its definition as nested
+    <code>foldl</code>; (2) apply <code>List.foldl_append</code> in
+    reverse to merge the two folds; (3) apply
+    <code>List.take_append_drop</code> to recover the original list.
+  </p>
+</div>
+
+<div class="theorem">
+  <span class="box-title">Theorem 3.34 &mdash; compaction_preserves_state</span>
+  <span class="file-ref">lean/CrdtBase/Compaction/Props.lean:36&ndash;45</span>
+<pre><code>theorem compaction_preserves_state {&alpha; &beta; : Type}
+    (step : &beta; &rarr; &alpha; &rarr; &beta;) (init : &beta;) (preOps postOps : List &alpha;) :
+    List.foldl step (List.foldl step init preOps) postOps =
+      List.foldl step init (preOps ++ postOps) := by
+  exact (List.foldl_append ..).symm</code></pre>
+  <p>
+    This is <code>List.foldl_append</code> from the standard library, applied
+    in reverse. The entire compaction proof machinery is an elegant wrapper
+    around this single fact.
+  </p>
+</div>
+
+<h3>Per-CRDT Specializations</h3>
+
+<p>
+  Four specialization theorems instantiate the generic split-fold theorem for
+  each CRDT type with its appropriate initial state and merge function:
+</p>
+
+<div class="theorem">
+  <span class="box-title">Theorems 3.35&ndash;3.38 &mdash; Per-CRDT Compaction</span>
+  <span class="file-ref">lean/CrdtBase/Compaction/Props.lean:55&ndash;102</span>
+<pre><code>-- PN-Counter compaction
+theorem pn_counter_compaction_preserves_state
+    (ops : List PnCounter) (split : Nat) :
+    foldPrefixSuffix PnCounter.merge pnCounterEmpty ops split =
+      List.foldl PnCounter.merge pnCounterEmpty ops := by
+  simpa using (foldPrefixSuffix_eq_foldl ...)
+
+-- OR-Set compaction
+theorem or_set_compaction_preserves_state {&alpha; Hlc : Type} ...
+    (ops : List (OrSet &alpha; Hlc)) (split : Nat) :
+    foldPrefixSuffix OrSet.merge (orSetEmpty &alpha; Hlc) ops split =
+      List.foldl OrSet.merge (orSetEmpty &alpha; Hlc) ops := by
+  simpa using (foldPrefixSuffix_eq_foldl ...)
+
+-- MV-Register compaction
+theorem mv_register_compaction_preserves_state {&alpha; : Type} ...
+    (ops : List (MvRegister &alpha;)) (split : Nat) :
+    foldPrefixSuffix MvRegister.merge (mvRegisterEmpty &alpha;) ops split =
+      List.foldl MvRegister.merge (mvRegisterEmpty &alpha;) ops := by
+  simpa using (foldPrefixSuffix_eq_foldl ...)
+
+-- LWW compaction (with Option empty base)
+theorem lww_compaction_preserves_state {&alpha; : Type}
+    (ops : List (LwwRegister &alpha;)) (split : Nat) :
+    foldPrefixSuffix lwwStep none ops split =
+      List.foldl lwwStep none ops := by
+  simpa using (foldPrefixSuffix_eq_foldl ...)</code></pre>
+  <p>
+    Note that the LWW specialization differs from the others: it uses
+    <code>Option (LwwRegister &alpha;)</code> as the initial state (since there
+    may be no initial value), with <code>lwwStep</code> as the step function.
+  </p>
+</div>
+
+<h3>Snapshot Cutover Laws</h3>
+
+<div class="theorem">
+  <span class="box-title">Theorem 3.39 &mdash; snapshot_then_suffix_replay_eq_full_fold</span>
+  <span class="file-ref">lean/CrdtBase/Compaction/Props.lean:105&ndash;109</span>
+  <p>Loading a compacted prefix state and replaying only the suffix is
+    equivalent to folding the entire operation history:</p>
+<pre><code>theorem snapshot_then_suffix_replay_eq_full_fold {&alpha; &beta; : Type}
+    (step : &beta; &rarr; &alpha; &rarr; &beta;) (init : &beta;) (compactedPrefix suffix : List &alpha;) :
+    List.foldl step (List.foldl step init compactedPrefix) suffix =
+      List.foldl step init (compactedPrefix ++ suffix) := by
+  simpa using compaction_preserves_state step init compactedPrefix suffix</code></pre>
+</div>
+
+<div class="theorem">
+  <span class="box-title">Theorem 3.40 &mdash; snapshot_cutover_idempotent_without_new_suffix</span>
+  <span class="file-ref">lean/CrdtBase/Compaction/Props.lean:112&ndash;116</span>
+  <p>If no new suffix deltas exist, replay after snapshot cutover is a no-op:</p>
+<pre><code>theorem snapshot_cutover_idempotent_without_new_suffix {&alpha; &beta; : Type}
+    (step : &beta; &rarr; &alpha; &rarr; &beta;) (init : &beta;) (compactedPrefix : List &alpha;) :
+    List.foldl step (List.foldl step init compactedPrefix) [] =
+      List.foldl step init compactedPrefix := by
+  simp</code></pre>
+</div>
+
+<div class="theorem">
+  <span class="box-title">Theorem 3.41 &mdash; compaction_idempotent</span>
+  <span class="file-ref">lean/CrdtBase/Compaction/Props.lean:48&ndash;52</span>
+  <p>Re-compacting with no new ops is the identity:</p>
+<pre><code>theorem compaction_idempotent {&alpha; &beta; : Type}
+    (step : &beta; &rarr; &alpha; &rarr; &beta;) (init : &beta;) (ops : List &alpha;) (split : Nat) :
+    foldPrefixSuffix step (foldPrefixSuffix step init ops split) [] split =
+      foldPrefixSuffix step init ops split := by
+  simp [foldPrefixSuffix]</code></pre>
+</div>
+
+<div class="note">
+  <span class="box-title">Design Note</span>
+  <p>
+    The entire compaction proof machinery is built on
+    <code>List.foldl_append</code> and <code>List.take_append_drop</code>
+    from the standard library. No commutativity or associativity of the merge
+    function is needed&mdash;these are properties of <code>foldl</code>
+    itself. This means compaction correctness holds even for merge functions
+    that are not commutative, independent of the convergence guarantees.
+  </p>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<h2 id="replication">3.12 &ensp; Replication Log Safety Proofs</h2>
+
+<p>
+  The replication module proves three theorems about the
+  <code>readSince</code> function, which returns log entries strictly newer
+  than a watermark cursor. These theorems formalize the guarantee that
+  compacted log entries are never replayed to clients.
+</p>
+
+<div class="theorem">
+  <span class="box-title">Theorem 3.42 &mdash; readSince_mem_gt_since</span>
+  <span class="file-ref">lean/CrdtBase/Replication/Props.lean:26&ndash;42</span>
+  <p>All returned sequence numbers are strictly greater than the cursor:</p>
+  \[
+    \mathtt{seq} \in \text{readSince}(\mathtt{entries}, \mathtt{siteId}, \mathtt{since})
+    \implies \mathtt{seq} > \mathtt{since}
+  \]
+<pre><code>theorem readSince_mem_gt_since
+    (entries : List LogEntry) (siteId : String) (since seq : Nat)
+    (hMem : seq &isin; readSince entries siteId since) :
+    seq &gt; since := by
+  unfold readSince at hMem
+  have hInFilter : seq &isin; (canonicalSeqs entries siteId).filter
+      (fun candidate =&gt; candidate &gt; since) :=
+    mem_takeContiguousFrom_mem
+      (expected := since + 1) (seq := seq)
+      (seqs := (canonicalSeqs entries siteId).filter
+        (fun candidate =&gt; candidate &gt; since))
+      hMem
+  have hTrue : decide (seq &gt; since) = true := (List.mem_filter.mp hInFilter).2
+  by_cases hGt : seq &gt; since
+  &middot; exact hGt
+  &middot; have hFalse : decide (seq &gt; since) = false := by simp [hGt]
+    rw [hFalse] at hTrue
+    contradiction</code></pre>
+  <p>
+    The proof first unfolds <code>readSince</code>, which composes
+    <code>canonicalSeqs</code> (site-filtered sorted sequence numbers) with
+    <code>filter</code> (keep only those \(&gt;\) watermark) with
+    <code>takeContiguousFrom</code> (take the maximal contiguous prefix
+    starting at <code>since + 1</code>). The helper
+    <code>mem_takeContiguousFrom_mem</code> establishes that membership in
+    <code>takeContiguousFrom</code>&rsquo;s output implies membership in the
+    input list, which is the filtered list. Then
+    <code>List.mem_filter</code> extracts the filter predicate, and
+    <code>by_cases</code> on the decidable \(&gt;\) closes the proof.
+  </p>
+</div>
+
+<div class="theorem">
+  <span class="box-title">Theorem 3.43 &mdash; readSince_compacted_prefix_exclusion</span>
+  <span class="file-ref">lean/CrdtBase/Replication/Props.lean:52&ndash;58</span>
+  <p>Entries at or below the compaction watermark are never replayed:</p>
+  \[
+    \mathtt{seq} \le \mathtt{watermark} \implies
+    \mathtt{seq} \notin \text{readSince}(\mathtt{entries}, \mathtt{siteId}, \mathtt{watermark})
+  \]
+<pre><code>theorem readSince_compacted_prefix_exclusion
+    (entries : List LogEntry) (siteId : String) (watermark seq : Nat)
+    (hLe : seq &le; watermark) :
+    seq &notin; readSince entries siteId watermark := by
+  intro hMem
+  have hGt := readSince_after_watermark_only_returns_gt_watermark
+    entries siteId watermark seq hMem
+  exact (Nat.not_lt_of_ge hLe) hGt</code></pre>
+  <p>
+    This is the formal guarantee that compacted log entries are never replayed
+    to clients. The proof is a one-step contradiction: if
+    \(\mathtt{seq} \le \mathtt{watermark}\) and
+    \(\mathtt{seq} > \mathtt{watermark}\), we have
+    <code>Nat.not_lt_of_ge</code> against the cursor safety theorem.
+  </p>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<h2 id="elegant-proofs">3.13 &ensp; Five Elegant Proofs</h2>
+
+<h3>1. The PN-Counter One-Liner Trio</h3>
+
+<p>
+  The PN-Counter semilattice proofs are the most elegant in the codebase.
+  Each consists of exactly one tactic invocation:
+</p>
+
+<div class="proof">
+  <span class="box-title">Complete PN-Counter Semilattice</span>
+  <span class="file-ref">lean/CrdtBase/Crdt/PnCounter/Props.lean:8&ndash;21</span>
+<pre><code>-- Commutativity:
+  ext site &lt;;&gt; simp [PnCounter.merge, Nat.max_comm]
+-- Associativity:
+  ext site &lt;;&gt; simp [PnCounter.merge, Nat.max_assoc]
+-- Idempotence:
+  ext site &lt;;&gt; simp [PnCounter.merge]</code></pre>
+  <p>
+    The elegance comes from the modeling choice. By representing the counter
+    as <code>String &rarr; Nat</code> (pure functions) instead of
+    <code>HashMap String Nat</code>, the <code>ext</code> tactic gives
+    pointwise reasoning for free. With <code>HashMap</code>, you would
+    need to reason about finite map equality, key enumeration, and
+    missing-key defaults. With pure functions, the proof reduces to the
+    corresponding property of <code>Nat.max</code> from Batteries.
+  </p>
+</div>
+
+<h3>2. Convergence via RightCommutative Construction</h3>
+
+<p>
+  The abstract convergence theorem is the crown jewel&mdash;it says
+  &ldquo;if merge forms a semilattice, then fold over any permutation of the
+  same operations converges to the same state.&rdquo; The three-step
+  <code>calc</code> chain that bridges commutativity + associativity to
+  <code>RightCommutative</code> reads like a textbook algebraic derivation
+  (see Theorem 3.30 above).
+</p>
 
 <h3>3. LWW Associativity Under Event-Consistency</h3>
 
@@ -888,154 +1577,66 @@ theorem convergence_pn_counter
   ties, where event-consistency substitutes equality.&rdquo;
 </p>
 
+<h3>4. Table Composition via Validity Predicates</h3>
+
 <p>
-  The <code>&lt;;&gt;</code> combinator means the case split and initial
-  <code>simp</code> are written once and applied to all 27 branches
-  simultaneously. Only the 6 survivors need individual attention, and each
-  is a one-liner.
+  The table composition proofs (Section 3.9) are architecturally significant
+  because they demonstrate the <em>lifting pattern</em>: proving a property
+  for each column and then assembling those proofs into a composite row
+  theorem. The validity predicate design makes the operational invariants
+  that the runtime must maintain explicit in the theorem statements.
+  Each row-level theorem is a 5-tuple of per-column proofs, and
+  each table-level lift is a single <code>funext</code> + instantiation.
+</p>
+
+<h3>5. The OR-Set Idempotence Chain</h3>
+
+<p>
+  The four-theorem chain from <code>or_set_canonicalize_idem</code> to
+  <code>or_set_merge_idem_general</code> (Section 3.8) resolves OR-Set
+  idempotence without preconditions on the inputs. The final
+  <code>or_set_merge_idem_general</code> proof is a single
+  <code>exact</code>&mdash;one line. All the work was already done by
+  the preceding lemmas. This composition pattern, where each lemma does
+  exactly one thing and the final theorem is a trivial assembly, is
+  characteristic of well-structured Lean proofs.
 </p>
 
 <!-- ═══════════════════════════════════════════════════════════ -->
-<h2 id="table-composition">3.9 &ensp; Table Composition Proofs</h2>
-
-<p>
-  A composite row carries one column of each CRDT type plus a visibility
-  flag:
-</p>
-
-<div class="definition">
-  <span class="box-title">Definition 3.8 &mdash; TableRowState</span>
-  <span class="file-ref">lean/CrdtBase/Crdt/Table/Defs.lean:11&ndash;16</span>
-<pre><code>structure TableRowState (&alpha; &beta; &gamma; Hlc : Type) where
-  alive       : LwwRegister Bool
-  lwwCol      : LwwRegister &alpha;
-  counterCol  : PnCounter
-  setCol      : OrSet &beta; Hlc
-  registerCol : MvRegister &gamma;</code></pre>
-</div>
-
-<p>
-  Whole-table state is <code>&kappa; &rarr; TableRowState ...</code> (a function
-  from keys to rows), and table merge is pointwise row merge. The composition
-  proofs use the <em>lifting</em> pattern: if each column&rsquo;s merge has a
-  property, the whole row inherits it.
-</p>
-
-<div class="theorem">
-  <span class="box-title">Theorem 3.17 &mdash; table_merge_comm_of_row_comm</span>
-  <span class="file-ref">lean/CrdtBase/Crdt/Table/Props.lean:13&ndash;18</span>
-  \[
-    (\forall x, y.\; \text{mergeRow}(x, y) = \text{mergeRow}(y, x))
-    \implies
-    \forall a, b.\; \text{mergeTable}(a, b) = \text{mergeTable}(b, a)
-  \]
-<pre><code>theorem table_merge_comm_of_row_comm
-    (hRowComm : &forall; x y : TableRowState &alpha; &beta; &gamma; Hlc,
-      mergeTableRow x y = mergeTableRow y x)
-    (a b : TableState &kappa; &alpha; &beta; &gamma; Hlc)
-    : mergeTable a b = mergeTable b a := by
-  funext key
-  exact hRowComm (a key) (b key)</code></pre>
-  <p>
-    The proof is a single <code>funext</code> followed by instantiation.
-    Associativity and idempotence follow the same pattern.
-  </p>
-</div>
-
-<p>
-  The operator commutativity theorems are particularly clean&mdash;each is
-  proved by <code>cases row; rfl</code>:
-</p>
-
-<div class="theorem">
-  <span class="box-title">Theorem 3.18 &mdash; Independent Column Operations Commute</span>
-  <span class="file-ref">lean/CrdtBase/Crdt/Table/Props.lean:70&ndash;99</span>
-<pre><code>-- Row-existence updates commute with counter updates
-theorem row_exists_counter_commute
-    (row : TableRowState &alpha; &beta; &gamma; Hlc)
-    (existsEvent : LwwRegister Bool) (counterDelta : PnCounter)
-    : applyCounterCell (applyRowExists row existsEvent) counterDelta =
-      applyRowExists (applyCounterCell row counterDelta) existsEvent := by
-  cases row; rfl
-
--- Counter and MV-register updates commute
-theorem row_counter_register_commute
-    (row : TableRowState &alpha; &beta; &gamma; Hlc)
-    (counterDelta : PnCounter) (registerDelta : MvRegister &gamma;)
-    : applyRegisterCell (applyCounterCell row counterDelta) registerDelta =
-      applyCounterCell (applyRegisterCell row registerDelta) counterDelta := by
-  cases row; rfl</code></pre>
-  <p>
-    These proofs work because each <code>apply*Cell</code> function modifies
-    exactly one field of the row structure via <code>{ row with field := ... }</code>.
-    After <code>cases row</code> destructs the structure, both sides are
-    definitionally equal, and <code>rfl</code> closes the goal.
-  </p>
-</div>
-
-<div class="theorem">
-  <span class="box-title">Theorem 3.19 &mdash; modify_row_at_disjoint_commute</span>
-  <span class="file-ref">lean/CrdtBase/Crdt/Table/Props.lean:106&ndash;129</span>
-  <p>Updates at disjoint keys commute at the whole-table level:</p>
-  \[
-    k_1 \ne k_2 \implies
-    \text{modify}(\text{modify}(T, k_1, f), k_2, g) =
-    \text{modify}(\text{modify}(T, k_2, g), k_1, f)
-  \]
-<pre><code>theorem modify_row_at_disjoint_commute
-    (table : TableState &kappa; &alpha; &beta; &gamma; Hlc)
-    (k1 k2 : &kappa;) (hNe : k1 &ne; k2)
-    (f g : TableRowState &alpha; &beta; &gamma; Hlc &rarr; TableRowState &alpha; &beta; &gamma; Hlc)
-    : modifyRowAt (modifyRowAt table k1 f) k2 g =
-      modifyRowAt (modifyRowAt table k2 g) k1 f := by
-  funext current
-  by_cases hCurrentK1 : current = k1
-  &middot; have hCurrentNeK2 : current &ne; k2 := by
-      intro hCurrentK2; apply hNe
-      calc k1 = current := hCurrentK1.symm
-           _ = k2 := hCurrentK2
-    simp [modifyRowAt, hCurrentK1, hNe]
-  &middot; by_cases hCurrentK2 : current = k2
-    &middot; have hK2NeK1 : k2 &ne; k1 := by intro h; exact hNe h.symm
-      simp [modifyRowAt, hCurrentK2, hK2NeK1]
-    &middot; simp [modifyRowAt, hCurrentK1, hCurrentK2]</code></pre>
-</div>
-
-<!-- ═══════════════════════════════════════════════════════════ -->
-<h2 id="verification-tiers">3.10 &ensp; Verification Tiers and Coverage</h2>
+<h2 id="verification-tiers">3.14 &ensp; Verification Tiers and Coverage</h2>
 
 <div class="diagram-container">
   <pre class="mermaid">
 graph BT
-    T1["<strong>Tier 1: CRDT Semilattice</strong><br/>12 core theorems<br/>LWW, PnCounter, OrSet, MvRegister<br/><em>comm, assoc, idem per type</em>"]
+    T1["<strong>Tier 1: CRDT Semilattice</strong><br/>16 theorems<br/>LWW, PnCounter, OrSet, MvRegister<br/><em>comm, assoc, idem + canonicalization chain</em>"]
 
-    T2["<strong>Tier 2: HLC Ordering</strong><br/>14 theorems<br/>total order, transitivity, antisymmetry<br/>pack_preserves_order, monotonicity"]
+    T2["<strong>Tier 2: HLC Ordering</strong><br/>19 theorems<br/>total order, transitivity, antisymmetry<br/>pack_preserves_order, now/recv monotonicity"]
 
-    T3["<strong>Tier 3: Convergence</strong><br/>7 theorems<br/>abstract + concrete per CRDT<br/>convergence_of_comm_assoc"]
+    T3["<strong>Tier 3: Convergence</strong><br/>9 theorems<br/>abstract + concrete per CRDT + composite<br/>convergence_of_comm_assoc"]
 
-    T4["<strong>Tier 4: Compaction</strong><br/>7 theorems<br/>foldl splitting, per-CRDT instantiation<br/>compaction_preserves_state"]
+    T4["<strong>Tier 4: Table Composition</strong><br/>16 theorems<br/>validity predicates, row/table lifting<br/>column + disjoint-key commutativity"]
 
-    T5["<strong>Tier 5: Domain Properties</strong><br/>Tombstone: 3 theorems<br/>Table: 9 theorems<br/>Replication: 2 theorems"]
+    T5["<strong>Tier 5: Compaction</strong><br/>9 theorems<br/>foldl splitting, per-CRDT specialization<br/>snapshot cutover, idempotence"]
 
-    T6["<strong>Tier 6: SQL Soundness</strong><br/>8 theorems<br/>type soundness, syncability<br/>planner correctness"]
+    T6["<strong>Tier 6: Domain Properties</strong><br/>Tombstone: 3 theorems<br/>Replication: 4 theorems<br/>SQL: 8 theorems"]
 
     T2 --> T1
     T1 --> T3
     T1 --> T4
     T1 --> T5
-    T3 --> T5
-    T5 --> T6
+    T3 --> T6
+    T4 --> T6
 
     style T1 fill:#f5f0e8,stroke:#8b0000,stroke-width:2px
     style T2 fill:#e8eef5,stroke:#2c5282,stroke-width:2px
     style T3 fill:#eef2e8,stroke:#2d6a30,stroke-width:2px
-    style T4 fill:#eef2e8,stroke:#2d6a30
-    style T5 fill:#f0ede6,stroke:#666
+    style T4 fill:#eef2e8,stroke:#2d6a30,stroke-width:2px
+    style T5 fill:#eef2e8,stroke:#2d6a30
     style T6 fill:#f0ede6,stroke:#666
   </pre>
-  <div class="caption">Figure 3.3 &mdash; Verification tier diagram. Lower tiers
-    provide the foundations that higher tiers depend on. Tier 1 (CRDT semilattice)
-    and Tier 2 (HLC ordering) form the critical trust base.</div>
+  <div class="caption">Figure 3.4 &mdash; Verification tier diagram. Lower tiers
+    provide the foundations that higher tiers depend on. Tiers 1&ndash;2
+    (CRDT semilattice and HLC ordering) form the critical trust base.</div>
 </div>
 
 <h3>Complete Theorem Inventory</h3>
@@ -1066,50 +1667,75 @@ graph BT
     <td>3</td>
   </tr>
   <tr>
-    <td colspan="2"><em>Plus supporting lemmas:</em> <code>or_set_canonicalize_idem</code>, <code>lww_equal_key_implies_equal_payload</code>, etc.</td>
-    <td>7</td>
+    <td colspan="2"><em>Supporting lemmas:</em> <code>or_set_canonicalize_idem</code>, <code>or_set_canonicalize_no_tombstoned_tags</code>, <code>or_set_canonicalize_preserves_visible_values</code>, <code>or_set_merge_canonicalized</code>, <code>or_set_merge_idem_general</code>, <code>lww_equal_key_implies_equal_payload</code>, <code>dedup_rejects_conflicting_same_key</code>, <code>lww_merge_comm_global_of_consistent</code>, <code>lww_merge_assoc_global_of_consistent</code></td>
+    <td>9</td>
   </tr>
   <tr>
     <td>2: HLC Ordering</td>
     <td>Hlc/Props</td>
-    <td><code>hlc_total_order</code>, <code>hlc_pack_preserves_order</code>, <code>compareWithSite_trans_lt</code>, etc.</td>
-    <td>14+</td>
+    <td><code>hlc_total_order</code>, <code>hlc_pack_preserves_order</code>, <code>hlc_counter_breaks_tie</code>, <code>hlc_site_tiebreak_total</code>, <code>compareWithSite_self_eq</code>, <code>compareWithSite_swap_lt/gt</code>, <code>compareWithSite_trans_lt/gt</code>, <code>hlc_now_monotonic</code>, <code>hlc_now_strict_monotonic</code>, <code>hlc_recv_monotonic</code>, <code>hlc_recv_strict_monotonic</code>, <code>recv_none_of_drift</code>, <code>recv_some_bounds</code>, <code>now_some_bounds</code>, <code>recv_wallMs_monotonic</code>, <code>max3_ge_*</code></td>
+    <td>19</td>
   </tr>
   <tr>
     <td>3: Convergence</td>
     <td>Convergence/Props</td>
-    <td><code>convergence_of_perm</code>, <code>convergence_of_comm_assoc</code>, <code>convergence_pn_counter</code>, etc.</td>
-    <td>7</td>
+    <td><code>convergence_of_perm</code>, <code>convergence_of_same_ops</code>, <code>convergence_of_comm_assoc</code>, <code>convergence_lww</code>, <code>convergence_lww_of_consistent</code>, <code>convergence_pn_counter</code>, <code>convergence_or_set</code>, <code>convergence_mv_register</code>, <code>convergence_composite</code></td>
+    <td>9</td>
   </tr>
   <tr>
-    <td>4: Compaction</td>
+    <td rowspan="5">4: Table Composition</td>
+    <td>Row semilattice</td>
+    <td><code>mergeTableRow_comm_of_valid</code>, <code>mergeTableRow_assoc_of_valid</code>, <code>mergeTableRow_idem_of_valid</code></td>
+    <td>3</td>
+  </tr>
+  <tr>
+    <td>Table lift</td>
+    <td><code>mergeTable_comm_of_valid</code>, <code>mergeTable_assoc_of_valid</code>, <code>mergeTable_idem_of_valid</code>, <code>table_merge_comm_of_row_comm</code>, <code>table_merge_assoc_of_row_assoc</code>, <code>table_merge_idem_of_row_idem</code></td>
+    <td>6</td>
+  </tr>
+  <tr>
+    <td>Visibility preservation</td>
+    <td><code>apply_counter_preserves_visibility</code>, <code>apply_set_preserves_visibility</code>, <code>apply_register_preserves_visibility</code></td>
+    <td>3</td>
+  </tr>
+  <tr>
+    <td>Column commutativity</td>
+    <td><code>row_exists_counter_commute</code>, <code>row_exists_set_commute</code>, <code>row_counter_register_commute</code></td>
+    <td>3</td>
+  </tr>
+  <tr>
+    <td>Disjoint keys</td>
+    <td><code>modify_row_at_disjoint_commute</code></td>
+    <td>1</td>
+  </tr>
+  <tr>
+    <td>5: Compaction</td>
     <td>Compaction/Props</td>
-    <td><code>compaction_preserves_state</code>, <code>compaction_idempotent</code>, per-CRDT instantiations</td>
-    <td>7</td>
+    <td><code>foldPrefixSuffix_eq_foldl</code>, <code>foldPrefixSuffix_eq_foldl_all</code>, <code>compaction_preserves_state</code>, <code>compaction_idempotent</code>, <code>pn_counter_compaction_preserves_state</code>, <code>or_set_compaction_preserves_state</code>, <code>mv_register_compaction_preserves_state</code>, <code>lww_compaction_preserves_state</code>, <code>snapshot_then_suffix_replay_eq_full_fold</code>, <code>snapshot_cutover_idempotent_without_new_suffix</code></td>
+    <td>10</td>
   </tr>
   <tr>
-    <td rowspan="3">5: Domain</td>
+    <td rowspan="3">6: Domain</td>
     <td>Tombstone/Props</td>
     <td><code>delete_wins_if_later</code>, <code>write_resurrects_if_later</code>, <code>tombstone_stable_without_new_writes</code></td>
     <td>3</td>
   </tr>
   <tr>
-    <td>Table/Props</td>
-    <td><code>table_merge_comm_of_row_comm</code>, <code>modify_row_at_disjoint_commute</code>, visibility preservation, etc.</td>
-    <td>9</td>
-  </tr>
-  <tr>
     <td>Replication/Props</td>
-    <td><code>readSince_mem_gt_since</code>, <code>mem_takeContiguousFrom_mem</code></td>
-    <td>2</td>
+    <td><code>mem_takeContiguousFrom_mem</code>, <code>readSince_mem_gt_since</code>, <code>readSince_after_watermark_only_returns_gt_watermark</code>, <code>readSince_compacted_prefix_exclusion</code></td>
+    <td>4</td>
   </tr>
   <tr>
-    <td>6: SQL</td>
     <td>Sql/Props</td>
-    <td><code>write_ops_type_sound</code>, <code>write_ops_syncable</code>, planner theorems</td>
+    <td><code>write_ops_type_sound</code>, <code>write_ops_syncable</code>, <code>no_nonsync_for_valid_crdt_writes</code>, <code>planner_partition_default_route</code>, <code>planner_partition_sound</code>, <code>planner_partition_sound_all_partitions</code>, <code>planner_filter_preservation</code>, <code>planner_filter_preservation_all_partitions</code></td>
     <td>8</td>
   </tr>
 </table>
+
+<p>
+  <strong>Total: 76+ theorems</strong> across 12 <code>Props.lean</code>
+  files in approximately 1,000 lines of proof text.
+</p>
 
 <h3>Tactic Palette</h3>
 
@@ -1141,12 +1767,28 @@ graph BT
   </tr>
   <tr>
     <td><code>calc</code></td>
-    <td>Multi-step equalities, especially in the convergence bridge proof
-      and <code>hlc_recv_monotonic</code>.</td>
+    <td>Multi-step equalities, especially in the convergence bridge proof,
+      <code>hlc_recv_monotonic</code>, and <code>foldPrefixSuffix_eq_foldl</code>.</td>
   </tr>
   <tr>
     <td><code>funext</code></td>
     <td>For table-level proofs where equality of functions requires pointwise reasoning.</td>
+  </tr>
+  <tr>
+    <td><code>rfl</code></td>
+    <td>Closes goals where both sides are definitionally equal after <code>cases</code>.
+      Used elegantly in all table operator commutativity proofs
+      (<code>cases row; rfl</code>).</td>
+  </tr>
+  <tr>
+    <td><code>by_cases</code></td>
+    <td>Pervasive in HLC proofs for case-splitting on <code>&lt;</code> comparisons.
+      Also in <code>modify_row_at_disjoint_commute</code> for key equality.</td>
+  </tr>
+  <tr>
+    <td><code>simpa</code></td>
+    <td>Combines <code>simp</code> with <code>assumption</code>, used extensively
+      for clean proof closures in convergence and compaction theorems.</td>
   </tr>
   <tr>
     <td><code>congrArg</code></td>
@@ -1156,7 +1798,7 @@ graph BT
 </table>
 
 <!-- ═══════════════════════════════════════════════════════════ -->
-<h2 id="proven-vs-sorry">3.11 &ensp; What Is Proven vs. What Uses <code>sorry</code></h2>
+<h2 id="proven-vs-sorry">3.15 &ensp; What Is Proven vs. What Uses <code>sorry</code></h2>
 
 <div class="assessment">
   <span class="box-title">Clean Bill of Health</span>
@@ -1190,24 +1832,20 @@ graph BT
       drift bounds.</li>
     <li><strong>Storage durability.</strong> Convergence assumes all operations
       survive storage. S3/Tigris durability is outside the formal model.</li>
-    <li><strong>Composite row semilattice.</strong> The table composition
-      proofs (<code>table_merge_comm_of_row_comm</code>, etc.) are
-      <em>conditional</em> on the row merge having the property. They do not
-      directly prove that <code>mergeTableRow</code> is commutative, because
-      that requires composing the LWW event-consistency condition across all
-      LWW columns. The operational invariant must be established at system
-      initialization.</li>
-    <li><strong>OR-Set idempotence precondition.</strong>
-      <code>or_set_merge_idem</code> requires the input to already be
-      canonicalized. In practice, every merge output is canonicalized,
-      so this is satisfied&mdash;but the chain from &ldquo;merge always
-      canonicalizes&rdquo; to &ldquo;idempotence always holds&rdquo; is an
-      informal argument, not a formal proof.</li>
+    <li><strong>LWW event-consistency propagation across the full table.</strong>
+      The table composition proofs require <code>ValidTableRowPair</code>
+      and <code>ValidTableRowTriple</code> as preconditions.
+      These predicates bundle LWW event-consistency for each LWW column
+      alongside OR-Set canonicalization cleanness. The runtime must maintain
+      these invariants (each write assigns a unique <code>(hlc, site)</code>
+      pair, each merge canonicalizes OR-Set output), but this invariant
+      maintenance is not itself formally verified&mdash;it is tested
+      operationally.</li>
   </ul>
 </div>
 
 <p>
-  The proof architecture is designed so that the formal core (Tiers 1&ndash;3)
+  The proof architecture is designed so that the formal core (Tiers 1&ndash;4)
   covers the properties that are hardest to get right by inspection, while
   the boundaries listed above are covered by complementary strategies:
   differential testing, integration tests, and operational monitoring.

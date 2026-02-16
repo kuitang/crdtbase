@@ -28,31 +28,74 @@ and fast-check shrinks the failing input to a minimal reproduction.
 
 | Level | What | Confidence | Location |
 |-------|------|-----------|----------|
-| Level 0 | Lean proofs (28 theorems) | Absolute (all inputs) | `lean/CrdtBase/**/Props.lean` |
+| Level 0 | Lean proofs (28+ theorems) | Absolute (all inputs) | `lean/CrdtBase/**/Props.lean` |
 | Level 1 | Differential Random Testing (DRT) | Very high (100K+ samples) | `test/drt/*.drt.test.ts` |
-| Level 1.5 | Invariant enforcement | High | `test/properties/invariants.prop.test.ts` |
-| Level 2 | Property-based tests | High (10K+ samples) | `test/properties/*.prop.test.ts` |
-| Level 3 | Model-based tests (fc.commands) | High (integration) | Described in TESTING.md |
-| Level 4 | E2E (filesystem + S3/MinIO) | Operational | `test/e2e/*.e2e.test.ts` |
+| Level 2 | Property-based tests (fast-check) | High (10K+ samples) | `test/properties/*.prop.test.ts` |
+| Level 3 | Model-based tests (schema consistency, snapshot validation) | High (integration) | `test/properties/multisite-schema.prop.test.ts`, `clientSnapshotPull.prop.test.ts` |
+| Level 4 | Stress tests (Fly.io multi-region with compaction) | High (real infra) | `test/stress/` |
+| Level 5 | E2E (filesystem + S3/MinIO, three-client chaos) | Operational | `test/e2e/*.e2e.test.ts` |
 
 DRT sits at Level 1 -- it verifies that the TypeScript implementation _matches_ the
-mathematically proven Lean specification for a large random sample of inputs.
+mathematically proven Lean specification for a large random sample of inputs. Levels 2-3
+cover system aspects beyond Lean's scope: encoding round-trips, SQL parsing, snapshot pull
+convergence, schema replication, and TTL-based retention. Level 4 stress tests run on Fly.io
+infrastructure with real multi-region replication and compaction.
+
+### Unified Architecture: sql_script_eval
+
+A key architectural decision is the unification of all DRT endpoints. The Lean oracle now
+exposes a single `sql_script_eval` endpoint that executes full SQL statement sequences
+end-to-end. All CRDT-specific DRT tests (LWW, PN-Counter, OR-Set, MV-Register) generate
+SQL scripts that exercise the target CRDT type, rather than sending raw merge structures to
+individual Lean handlers:
+
+```
+   Test generates SQL scripts
+          |
+          v
+   TypeScript: parseSql -> evaluateSqlScriptTs (statements[])
+          |
+          v                              Lean: handleSqlScriptEval
+   Both receive same AST statements  ->  loops over statements
+   Both produce outcomes[] + nextState    applying ops to rows
+          |                              tracking HLC consumption
+          v
+   Normalize both outputs
+   Compare for equality
+```
+
+The three remaining non-SQL endpoints are the replication log operations (`listSites`,
+`getHead`, `readSince`), which model pure log semantics independent of SQL evaluation.
 
 ### File Layout
 
 ```
 test/drt/
-  harness.ts                          # IPC client: spawns Lean binary, manages stdin/stdout JSON protocol
-  lww.drt.test.ts                     # DRT: LWW merge
-  pnCounter.drt.test.ts               # DRT: PN-Counter merge
-  orSet.drt.test.ts                   # DRT: OR-Set merge
-  mvRegister.drt.test.ts              # DRT: MV-Register merge
-  compaction.drt.test.ts              # DRT: compaction split-law (all 4 CRDT types)
-  sql-generate-ops.drt.test.ts        # DRT: SQL write -> CRDT ops generation
-  sql-planner.drt.test.ts             # DRT: SQL SELECT -> query plan
-  sql-eval.drt.test.ts                # DRT: full SQL AST evaluation with state
+  harness.ts                            # IPC client: spawns Lean binary, manages stdin/stdout JSON protocol
+  sql-script-utils.ts                   # 322 lines: state conversion, normalization, TS script executor
+  lww.drt.test.ts                       # DRT: LWW via SQL UPDATE/SELECT script sequences
+  pnCounter.drt.test.ts                 # DRT: PN-Counter via SQL INC/DEC/SELECT script sequences
+  orSet.drt.test.ts                     # DRT: OR-Set via SQL ADD/REMOVE/SELECT script sequences
+  mvRegister.drt.test.ts                # DRT: MV-Register via SQL UPDATE/SELECT script sequences
+  compaction.drt.test.ts                # DRT: SQL script split law (all split points)
+  sql-generate-ops.drt.test.ts          # DRT: SQL write -> CRDT ops generation via sql_script_eval
+  sql-planner.drt.test.ts              # DRT: SQL SELECT -> query plan via sql_script_eval
+  sql-eval.drt.test.ts                 # DRT: full SQL AST evaluation (single + multi-statement)
   replication-log-endpoints.drt.test.ts # DRT: S3 log listSites/getHead/readSince
 ```
+
+The 11 DRT test files exercise 10 differential targets:
+
+1. LWW merge (via SQL script pipeline)
+2. PN-Counter merge (via SQL script pipeline)
+3. OR-Set merge (via SQL script pipeline)
+4. MV-Register merge (via SQL script pipeline)
+5. SQL script split law (compaction correctness)
+6. SQL write op generation
+7. SQL SELECT query planner
+8. SQL single-statement evaluation
+9. SQL multi-statement sequence evaluation
+10. Replication log `listSites`/`getHead`/`readSince`
 
 ---
 
@@ -61,7 +104,7 @@ test/drt/
 ### Lean Binary Compilation
 
 The Lean project is at `/home/kuitang/git/crdtbase/lean/`. The lake configuration
-(`/home/kuitang/git/crdtbase/lean/lakefile.toml`, lines 18-24) defines two build targets:
+(`/home/kuitang/git/crdtbase/lean/lakefile.toml`) defines two build targets:
 
 ```toml
 [[lean_lib]]
@@ -73,75 +116,86 @@ root = "CrdtBase.DiffTest.Main"
 ```
 
 - `CrdtBase` -- the library containing all CRDT definitions, proofs, SQL semantics, and
-  replication definitions. Building this type-checks all 28 theorems.
+  replication definitions. Building this type-checks all theorems.
 - `CrdtBaseDRT` -- a standalone executable whose entry point is
   `/home/kuitang/git/crdtbase/lean/CrdtBase/DiffTest/Main.lean`. This is the test oracle.
 
-The build command is:
-
-```bash
-cd lean && lake build CrdtBase CrdtBaseDRT
-```
-
-Or via npm:
-
-```bash
-npm run lean:build
-# which expands to: cd lean && lake build CrdtBase CrdtBaseDRT
-```
-
-The resulting binary lands at `lean/.lake/build/bin/CrdtBaseDRT`.
+The build: `cd lean && lake build CrdtBase CrdtBaseDRT` (or `npm run lean:build`).
+Binary lands at `lean/.lake/build/bin/CrdtBaseDRT`.
 
 ### The Lean Oracle Protocol (stdin/stdout JSON-line IPC)
 
 The oracle is a long-running process that reads one JSON object per line from stdin and writes
-one JSON object per line to stdout. This avoids the overhead of spawning a new process per test
-case.
-
-From `/home/kuitang/git/crdtbase/lean/CrdtBase/DiffTest/Main.lean`, lines 892-909:
+one JSON object per line to stdout. From Main.lean, lines 1019-1037:
 
 ```lean
 partial def loop (stdin : IO.FS.Stream) : IO Unit := do
   let line ← stdin.getLine
-  if line.isEmpty then
-    pure ()
+  if line.isEmpty then pure ()
   else
     let trimmed := line.trimAscii
-    if trimmed.isEmpty then
-      loop stdin
+    if trimmed.isEmpty then loop stdin
     else
       match handleLine trimmed.copy with
       | Except.ok out => emitLine out
       | Except.error err =>
           emitLine <| (Json.mkObj [("error", toJson err)]).compress
       loop stdin
-
-def main : IO Unit := do
-  let stdin ← IO.getStdin
-  loop stdin
 ```
 
-The `handleLine` dispatcher (lines 862-884) routes on the `type` field:
+The `handleLine` dispatcher (lines 1003-1011) is consolidated to four endpoints:
 
 ```lean
 def handleLine (line : String) : Except String String := do
   let json ← Json.parse line
   let typ ← json.getObjValAs? String "type"
   match typ with
-  | "lww_merge"              => handleLwwMerge cmd.a cmd.b
-  | "pn_merge"               => handlePnMerge cmd.a cmd.b
-  | "or_set_merge"           => handleOrSetMerge cmd.a cmd.b
-  | "mv_merge"               => handleMvMerge cmd.a cmd.b
-  | "sql_generate_ops"       => handleSqlGenerateOps json
-  | "sql_build_select_plan"  => handleSqlBuildSelectPlan json
-  | "sql_eval"               => handleSqlEval json
+  | "sql_script_eval"        => handleSqlScriptEval json
   | "replication_list_sites" => handleReplicationListSites json
   | "replication_get_head"   => handleReplicationGetHead json
   | "replication_read_since" => handleReplicationReadSince json
   | _                        => throw s!"unsupported command: {typ}"
 ```
 
-Success responses are wrapped as `{"result": ...}`. Errors are `{"error": "message"}`.
+The previous architecture had separate endpoints for each CRDT merge type (`lww_merge`,
+`pn_merge`, `or_set_merge`, `mv_merge`), plus separate `sql_eval`, `sql_generate_ops`, and
+`sql_build_select_plan` handlers. All have been unified into `sql_script_eval`.
+
+### The sql_script_eval Endpoint
+
+The heart of the oracle (`/home/kuitang/git/crdtbase/lean/CrdtBase/DiffTest/Main.lean`,
+lines 940-973):
+
+```lean
+def handleSqlScriptEval (json : Json) : Except String String := do
+  let cmd : SqlScriptEvalCmd ← fromJson? json
+  let schema := cmd.context.schema
+  let rows ← normalizeEvalRows cmd.state.rows
+  let rec loop
+      (currentRows : List EvalRow)
+      (remainingHlc : Option (List String))
+      (statements : List Json)
+      (acc : List Json)
+      : Except String (List Json × List EvalRow) := do
+    match statements with
+    | [] => pure (acc.reverse, currentRows)
+    | statement :: tail =>
+        let (result, nextRows, consumedHlc) ← runSqlEvalStatement
+          statement schema cmd.context.site remainingHlc cmd.context.removeTags currentRows
+        let nextHlc := match remainingHlc with
+          | some values => some (values.drop consumedHlc)
+          | none => none
+        loop nextRows nextHlc tail (result :: acc)
+  let (outcomes, nextRows) ← loop rows cmd.context.hlcSequence cmd.statements []
+  -- ...returns {outcomes, nextState: {schema, rows}}
+```
+
+Key design aspects:
+- **Sequential execution:** Each statement runs against accumulated state from prior statements
+- **HLC consumption tracking:** Write statements advance the HLC cursor by `consumedHlc`
+- **Unified SELECT/write dispatch:** `runSqlEvalStatement` routes on `kind` field
+- **Input:** `SqlScriptEvalCmd` takes `statements: List Json`, `context: SqlEvalContextCmd`,
+  `state: SqlEvalStateCmd`
 
 ---
 
@@ -149,7 +203,7 @@ Success responses are wrapped as `{"result": ...}`. Errors are `{"error": "messa
 
 ### LeanDrtClient
 
-`/home/kuitang/git/crdtbase/test/drt/harness.ts` implements the IPC client.
+`/home/kuitang/git/crdtbase/test/drt/harness.ts` (109 lines) implements the IPC client.
 
 **Binary discovery** (lines 34-41):
 
@@ -164,45 +218,23 @@ static findBinary(): string | null {
 }
 ```
 
-The binary is found via `LEAN_DRT_BIN` env var (set in CI), or by falling back to the local
-build path. If neither exists, DRT tests are skipped.
+**Process spawning** (lines 14-32): The Lean process is spawned once per `describe` block
+(in `beforeAll`) and killed in `afterAll`. A FIFO queue of pending promises maps each
+request to its response line.
 
-**Process spawning** (lines 14-32):
-
-```typescript
-constructor(private readonly binPath: string) {
-  this.proc = spawn(this.binPath, [], { stdio: ['pipe', 'pipe', 'inherit'] });
-  const rl = createInterface({ input: this.proc.stdout });
-  rl.on('line', (line) => {
-    const next = this.pending.shift();
-    if (next) {
-      next.resolve(line);
-    }
-  });
-  // ...
-}
-```
-
-The Lean process is spawned once per `describe` block (in `beforeAll`) and killed in
-`afterAll`. A FIFO queue of pending promises maps each request to its response line.
-
-**Request/Response protocol** (lines 43-61):
+**Request/Response** (lines 43-62):
 
 ```typescript
 async send<T>(payload: unknown): Promise<T> {
   return new Promise((resolve, reject) => {
     this.pending.push({
       resolve: (line) => {
-        try {
-          const parsed = JSON.parse(line) as T & { error?: string };
-          if (typeof parsed.error === 'string') {
-            reject(new Error(parsed.error));
-            return;
-          }
-          resolve(parsed);
-        } catch (error) {
-          reject(error instanceof Error ? error : new Error(String(error)));
+        const parsed = JSON.parse(line) as T & { error?: string };
+        if (typeof parsed.error === 'string') {
+          reject(new Error(parsed.error));
+          return;
         }
+        resolve(parsed);
       },
       reject,
     });
@@ -211,30 +243,96 @@ async send<T>(payload: unknown): Promise<T> {
 }
 ```
 
-### Graceful Skip When Lean Is Unavailable
+**Convenience methods** (lines 64-95):
 
-Every DRT test file follows this pattern (e.g. `/home/kuitang/git/crdtbase/test/drt/lww.drt.test.ts`, lines 8-9):
+```typescript
+async sqlScriptEval<T>(statements: unknown, context: unknown, state: unknown): Promise<T> {
+  return this.send<T>({ type: 'sql_script_eval', statements, context, state });
+}
+async replicationListSites<T>(entries: unknown): Promise<T> { ... }
+async replicationGetHead<T>(entries: unknown, siteId: string): Promise<T> { ... }
+async replicationReadSince<T>(entries: unknown, siteId: string, since: number): Promise<T> { ... }
+```
+
+Every DRT test file uses the graceful skip pattern:
 
 ```typescript
 const leanBin = LeanDrtClient.findBinary();
 const drt = leanBin ? test : test.skip;
 ```
 
-If the Lean binary is not built, all DRT tests are skipped without failure.
+---
+
+## SQL Script Utilities
+
+`/home/kuitang/git/crdtbase/test/drt/sql-script-utils.ts` (322 lines) provides the shared
+infrastructure for all SQL-based DRT tests.
+
+### Wire Format Types
+
+Defines `LeanSchema`, `LeanEvalState`, and `LeanScriptEvalOutcome` types that mirror the
+Lean-side structures. The CRDT column state uses numeric type tags:
+
+| Tag | CRDT Type | Fields |
+|-----|-----------|--------|
+| 1 | LWW | `val: unknown`, `hlc: string`, `site: string` |
+| 2 | PN-Counter | `inc: Array<{site, n}>`, `dec: Array<{site, n}>` |
+| 3 | OR-Set | `elements: Array<{val, hlc, site}>`, `tombstones: Array<{hlc, site}>` |
+| 4 | MV-Register | `values: Array<{val, hlc, site}>` |
+
+### State Conversion
+
+- `toLeanSchema` (lines 204-214): converts TS nested Records to Lean's List-based format
+- `toLeanState` (lines 234-259): converts PN-Counter `Record<string, number>` to
+  `List {site, n}` for Lean
+- `fromLeanState` (lines 261-284): reverse conversion from Lean response to TS format
+
+### Normalization
+
+Extensive normalization handles non-deterministic output:
+- `normalizeJsonObject` -- recursive deep sort of all object keys
+- `normalizeColumnState` -- per-CRDT-type element/value sorting
+- `normalizeState` -- full schema + row normalization
+- `normalizeResult` -- read result row sorting
+- `normalizeScriptExecution` -- wraps everything for multi-statement sequences
+
+### TypeScript Script Executor
+
+`evaluateSqlScriptTs` (lines 286-321) mirrors the Lean `handleSqlScriptEval`:
+
+```typescript
+export function evaluateSqlScriptTs(
+  statements: SqlStatement[],
+  input: { state: SqlEvalState; context: SqlEvalContext },
+): { outcomes: SqlEvalOutcome['result'][]; nextState: SqlEvalState } {
+  let state = input.state;
+  let consumedHlc = 0;
+  const outcomes: SqlEvalOutcome['result'][] = [];
+  for (const statement of statements) {
+    const outcome = evaluateSqlAst(statement, {
+      state,
+      context: { schema: state.schema, site: input.context.site,
+                 hlcSequence: input.context.hlcSequence?.slice(consumedHlc),
+                 removeTags: input.context.removeTags },
+    });
+    outcomes.push(outcome.result);
+    if (outcome.result.kind === 'write') consumedHlc += outcome.result.ops.length;
+    state = outcome.nextState;
+  }
+  return { outcomes, nextState: state };
+}
+```
 
 ---
 
 ## Test Case Generation
 
-All random data is generated by `fast-check` (version ^3.16.0) with the `@fast-check/vitest`
-integration (version ^0.1.4). Test cases are NOT manually written or exhaustively enumerated --
-they are randomly sampled and automatically shrunk on failure.
+All random data is generated by `fast-check` with `@fast-check/vitest`. Test cases are
+randomly sampled and automatically shrunk on failure.
 
-### Core CRDT Arbitraries
+### Core Arbitraries
 
 From `/home/kuitang/git/crdtbase/test/properties/arbitraries.ts`:
-
-**HLC** (lines 12-16):
 
 ```typescript
 export const arbHlc = (): fc.Arbitrary<Hlc> =>
@@ -242,273 +340,145 @@ export const arbHlc = (): fc.Arbitrary<Hlc> =>
     wallMs: fc.nat({ max: HLC_LIMITS.wallMsMax - 1 }),  // max 2^48 - 1
     counter: fc.nat({ max: HLC_LIMITS.counterMax - 1 }), // max 2^16 - 1
   });
-```
 
-**Site ID** (lines 18-19):
-
-```typescript
 export const arbSiteId = (): fc.Arbitrary<string> =>
   fc.hexaString({ minLength: 8, maxLength: 8 });
 ```
 
-**LWW Register** (lines 29-34):
+### SQL Script Arbitraries
 
-```typescript
-export const arbLwwState = (): fc.Arbitrary<LwwRegister<...>> =>
-  fc.record({
-    val: arbScalar(),
-    hlc: arbHlc(),
-    site: arbSiteId(),
-  });
-```
+Each CRDT-focused DRT test generates SQL scripts specific to its type. The LWW test
+(`/home/kuitang/git/crdtbase/test/drt/lww.drt.test.ts`, lines 23-26) generates UPDATE
+sequences; the PN-Counter test generates INC/DEC steps; the OR-Set test generates ADD/REMOVE
+steps; the MV-Register test generates UPDATE steps with mv_register columns.
 
-**PN-Counter** (lines 42-48): uses `fc.dictionary` to generate `{site: count}` maps:
+### SQL Eval and Trace Generators
 
-```typescript
-export const arbPnCounter = (): fc.Arbitrary<PnCounter> =>
-  fc.record({
-    inc: fc.dictionary(arbSiteId(), fc.nat({ max: 1_000_000 })),
-    dec: fc.dictionary(arbSiteId(), fc.nat({ max: 1_000_000 })),
-  }).map(normalizePnCounter);
-```
-
-**OR-Set** (lines 62-74): unique elements by tag key, separate tombstones:
-
-```typescript
-export const arbOrSetState = (): fc.Arbitrary<OrSet<...>> =>
-  fc.record({
-    elements: fc.uniqueArray(arbOrSetElement(), {
-      maxLength: 40,
-      selector: (element) => tagKey(element.tag),
-    }),
-    tombstones: fc.uniqueArray(arbOrSetTag(), {
-      maxLength: 40,
-      selector: tagKey,
-    }),
-  }).map(canonicalizeOrSet);
-```
-
-**MV-Register** (lines 83-92): unique values by `(hlc, site)` key:
-
-```typescript
-export const arbMvRegister = (): fc.Arbitrary<MvRegister<...>> =>
-  fc.record({
-    values: fc.uniqueArray(arbMvValue(), {
-      maxLength: 40,
-      selector: mvEventKey,
-    }),
-  }).map(canonicalizeMvRegister);
-```
-
-### SQL Arbitraries
-
-SQL test case generators build actual SQL text plus expected results. There are three
-generator files:
-
-1. `/home/kuitang/git/crdtbase/test/properties/sql.generators.ts` -- generates SQL text
-   for parser round-trip tests and write-op DRT cases. Constructs `GeneratedWriteOpsCase`
-   with `sql`, `schema`, `site`, `hlcSequence`, `removeTags`, and `expectedOps`.
+1. `/home/kuitang/git/crdtbase/test/properties/sql.generators.ts` -- generates
+   `GeneratedWriteOpsCase` with `sql`, `schema`, `site`, `hlcSequence`, `removeTags`,
+   and `expectedOps`.
 
 2. `/home/kuitang/git/crdtbase/test/properties/sql-eval.generators.ts` -- generates
-   `GeneratedSqlEvalCase` with `sql`, `context` (site + HLC sequence), and `state` (existing
-   rows with full CRDT column states).
+   `GeneratedSqlEvalCase` (single statement) and `GeneratedSqlEvalTraceCase`
+   (multi-statement sequence).
 
-3. The SELECT planner generator produces `GeneratedSelectPlanCase` with partition routing.
-
-All SQL generators produce syntactically valid SQL strings by construction (they build the
-string from structured components, not by randomly concatenating tokens).
+All SQL generators produce syntactically valid SQL by construction.
 
 ---
 
 ## What Each DRT Test Compares
 
-### 1. LWW Merge
+### 1-4. CRDT-Specific SQL Script Tests
 
-**File:** `/home/kuitang/git/crdtbase/test/drt/lww.drt.test.ts`
+**Files:** `lww.drt.test.ts`, `pnCounter.drt.test.ts`, `orSet.drt.test.ts`,
+`mvRegister.drt.test.ts`
 
-- **Input:** Two random `LwwRegister` states
-- **Precondition:** `fc.pre(!isConflictingLwwEvent(a, b))` -- filters out cases where `(hlc, site)` match but payloads differ (those are tested separately in invariant tests)
-- **Comparison:** TypeScript `mergeLww(a, b)` equals Lean's `LwwRegister.merge` result
-- **Lean handler:** `handleLwwMerge` (Main.lean:307-314) -- validates consistency, converts JSON to `LwwRegister Json`, calls `LwwRegister.merge`, converts back
+Each generates a CRDT-specific SQL script (e.g., UPDATE for LWW, INC/DEC for PN-Counter,
+ADD/REMOVE for OR-Set, UPDATE for MV-Register), ending with a SELECT. Both TS
+`evaluateSqlScriptTs` and Lean `sql_script_eval` receive the same parsed AST statements,
+schema, site, and HLC sequence. Normalized outcomes + nextState are compared.
 
 ```typescript
-drt.prop([arbLwwState(), arbLwwState()], { numRuns: drtRuns })
-  ('merge matches Lean oracle', async (a, b) => {
-    fc.pre(!isConflictingLwwEvent(a, b));
-    const tsResult = mergeLww(a, b);
-    const leanResult = await client!.send<{ result: typeof tsResult }>({
-      type: 'lww_merge', a, b,
-    });
-    expect(tsResult).toEqual(leanResult.result);
+drt
+  .prop([arbLwwSqlCase], { numRuns: drtRuns })
+  ('LWW-focused SQL scripts match Lean and TypeScript', async (input) => {
+    const sqlStatements = input.values.map(
+      (value) => `UPDATE tasks SET title = ${renderLiteral(value)} WHERE id = 'task-1'`,
+    );
+    sqlStatements.push("SELECT title FROM tasks WHERE id = 'task-1'");
+    // ... parse, evaluate in both, normalize, compare
   }, drtTimeoutMs);
 ```
 
-### 2. PN-Counter Merge
-
-**File:** `/home/kuitang/git/crdtbase/test/drt/pnCounter.drt.test.ts`
-
-- **Input:** Two random `PnCounter` states (inc/dec maps per site)
-- **Wire format conversion:** TypeScript uses `Record<string, number>`, Lean uses `List {site, n}`. The `toWire` function (lines 17-32) converts before sending and comparison
-- **Comparison:** `toWire(tsResult)` equals `leanResult.result`
-- **Lean handler:** `handlePnMerge` (Main.lean:336-345) -- uses `PnCounter.merge` which takes max per-site count
-
-### 3. OR-Set Merge
-
-**File:** `/home/kuitang/git/crdtbase/test/drt/orSet.drt.test.ts`
-
-- **Input:** Two random OR-Set states (elements + tombstones)
-- **Precondition:** `fc.pre(!hasConflictingOrSetEvents(a, b))` -- same tag, different payload
-- **Comparison:** TypeScript `mergeOrSet(a, b)` equals Lean's `mergeOrSetJson`
-- **Lean implementation:** Merges elements by union, deduplicates by tag key, filters out tombstoned elements, sorts by canonical key
-
-### 4. MV-Register Merge
-
-**File:** `/home/kuitang/git/crdtbase/test/drt/mvRegister.drt.test.ts`
-
-- **Input:** Two random MV-Register states
-- **Precondition:** `fc.pre(!hasConflictingMvEvents(a, b))`
-- **Comparison:** TypeScript `mergeMvRegister(a, b)` equals Lean's `mergeMvJson`
-- **Lean implementation:** Union of values, deduplicated by `(hlc, site)` key, sorted
-
-### 5. Compaction Split Law
+### 5. SQL Script Split Law (Compaction)
 
 **File:** `/home/kuitang/git/crdtbase/test/drt/compaction.drt.test.ts`
 
-This is the most interesting DRT test. For each CRDT type, it verifies:
+For any sequence of SQL statements and any split point `k`:
 
-> For any list of states and any split point `k`, folding the full list equals folding the
-> prefix `[0..k)` then folding the suffix `[k..]` on top. This must hold in BOTH TypeScript
-> and Lean.
+> Executing the full list equals executing prefix `[0..k)` then suffix `[k..]` from
+> the prefix's resulting state. Must hold in BOTH TypeScript and Lean.
 
 ```typescript
-// Lines 137-161 (LWW example):
-drt.prop([fc.array(arbLwwState(), { maxLength: 12 })], { numRuns: drtRuns })
-  ('LWW: every prefix/suffix split matches direct fold and Lean', async (states) => {
-    fc.pre(!hasConflictingLwwList(states, isConflictingLwwEvent));
-    const directTs = foldTs(states, mergeLww);
-    const directLean = await foldLean(states, mergeLean);
-    expect(directTs).toEqual(directLean);
-    for (const splitIndex of splitPoints(states.length)) {
-      const splitTs = applyCompactionSplitTs(states, splitIndex, mergeLww);
-      const splitLean = await applyCompactionSplitLean(states, splitIndex, mergeLean);
-      expect(splitTs).toEqual(directTs);
-      expect(splitLean).toEqual(directLean);
-    }
-  }, drtTimeoutMs);
+for (const splitIndex of splitPoints(statements.length)) {
+  const prefix = statements.slice(0, splitIndex);
+  const suffix = statements.slice(splitIndex);
+  const tsPrefix = evaluateSqlScriptTs(prefix, { state, context });
+  const tsSuffix = evaluateSqlScriptTs(suffix, {
+    state: tsPrefix.nextState,
+    context: { ...context, hlcSequence: context.hlcSequence?.slice(consumedHlc(tsPrefix.outcomes)) },
+  });
+  expect(normalizeExecution(mergeExecutions(tsPrefix, tsSuffix))).toEqual(normalizeExecution(directTs));
+  // same for Lean
+}
 ```
 
-This test exercises ALL split points (0 through `states.length`), checking:
-1. `directTs == directLean` (basic DRT agreement)
-2. `splitTs == directTs` (TS compaction correctness)
-3. `splitLean == directLean` (Lean compaction correctness)
+The split law verification checks ALL `n+1` split points for a list of length `n`
+(lines 34-36):
 
-The same test is repeated for PN-Counter, OR-Set, and MV-Register.
+```typescript
+function splitPoints(length: number): number[] {
+  return Array.from({ length: length + 1 }, (_, index) => index);
+}
+```
+
+HLC sequence consumption is tracked across the split boundary -- the suffix receives only
+the unconsumed portion, mirroring how compaction boundaries work in production.
 
 ### 6. SQL Write Op Generation
 
 **File:** `/home/kuitang/git/crdtbase/test/drt/sql-generate-ops.drt.test.ts`
 
-- **Input:** Random SQL write statement (INSERT, UPDATE, INC, DEC, ADD, REMOVE, DELETE) + schema + site + HLC sequence
-- **Flow:** SQL text is parsed ONCE by TypeScript. The parsed AST is sent to both implementations.
-- **Comparison:** Three-way -- `tsOps == expectedOps`, `lean.result == expectedOps`, `lean.result == tsOps`
-- **Notable:** The `expectedOps` are pre-computed by the generator using the model, so this is actually a _triple_ differential test
+Three-way comparison: `tsOps == expectedOps`, `lean.result.outcomes[0].ops == expectedOps`,
+`lean.result.outcomes[0].ops == tsOps`. The `expectedOps` are pre-computed by the generator,
+making this a _triple_ differential test.
 
 ### 7. SQL SELECT Query Planner
 
 **File:** `/home/kuitang/git/crdtbase/test/drt/sql-planner.drt.test.ts`
 
-- **Input:** Random SELECT SQL + schema with optional `partitionBy`
-- **Comparison:** TypeScript `buildSelectPlan` equals Lean `buildSelectPlan` equals pre-computed `expectedPlan`
-- **Tests:** Partition routing logic (single_partition vs all_partitions), filter extraction
+Sends parsed SELECT via `sql_script_eval` with empty state. Compares TypeScript
+`buildSelectPlan` with Lean's plan (from `outcome.select`) and pre-computed `expectedPlan`.
 
-### 8. SQL Full Evaluation
+### 8-9. SQL Full Evaluation (Single + Multi-Statement)
 
 **File:** `/home/kuitang/git/crdtbase/test/drt/sql-eval.drt.test.ts`
 
-The most complex DRT test. It generates:
-- Random SQL statement (any type: SELECT, INSERT, UPDATE, DELETE, INC, DEC, ADD, REMOVE)
-- Random initial database state (rows with full CRDT column states: LWW, PN-Counter, OR-Set, MV-Register)
-- Random eval context (site ID, HLC sequence)
+Two sub-tests:
 
-The test:
-1. Parses the SQL text in TypeScript
-2. Runs `evaluateSqlAst` in TypeScript to get `(result, nextState)`
-3. Sends the parsed AST + context + state to Lean's `handleSqlEval`
-4. Normalizes both outputs (sorts keys, canonicalizes HLC hex, sorts set elements)
-5. Compares
+- **Single-statement** (lines 35-89): Random SQL + random initial state + eval context.
+  Wraps in single-element array for `sql_script_eval`.
+- **Multi-statement** (lines 91-147): Generates a trace of statements executed sequentially.
+  Exercises full pipeline with HLC consumption tracking.
 
-**Error agreement** (lines 311-336): If TypeScript throws, Lean must also throw:
+**Error agreement**: If TypeScript throws, Lean must also throw:
 
 ```typescript
 if (tsError) {
-  await expect(
-    client!.sqlEval<{ result: LeanEvalOutcome }>( ... ),
-  ).rejects.toThrow();
+  await expect(client!.sqlScriptEval<...>(...)).rejects.toThrow();
   return;
 }
 ```
 
-**Normalization** (lines 62-206): Extensive normalization is needed because:
-- JSON object key order is non-deterministic
-- PN-Counter uses `Record<string, number>` in TS but `List {site, n}` in Lean
-- OR-Set elements and tombstones may appear in different orders
-- HLC hex values need canonical form (`0x0` vs `0x00000000`)
+**Seed replay**: `DRT_NUM_RUNS=200 DRT_SEED=-1196022201 npx vitest run test/drt/sql-eval.drt.test.ts`
 
-**Seed replay** (from TESTING.md):
-
-```bash
-DRT_NUM_RUNS=200 DRT_SEED=-1196022201 npx vitest run test/drt/sql-eval.drt.test.ts
-```
-
-The `DRT_SEED` env var is read at line 22:
-
-```typescript
-const drtSeed = process.env.DRT_SEED === undefined ? undefined : Number(process.env.DRT_SEED);
-```
-
-And passed to fast-check at line 306:
-
-```typescript
-drtSeed === undefined ? { numRuns: drtRuns } : { numRuns: drtRuns, seed: drtSeed },
-```
-
-### 9. Replication Log Endpoints
+### 10. Replication Log Endpoints
 
 **File:** `/home/kuitang/git/crdtbase/test/drt/replication-log-endpoints.drt.test.ts`
 
-- **Input:** Random log entries (site-a/b/c, seq 1-30), random query site, random `since` cursor, random S3 page size
-- **Uses:** An `InMemoryS3ReaderClient` that simulates S3 pagination in-process
-- **Comparison:** Three operations against Lean's pure model vs TS's `S3ReplicatedLog`:
-  - `listSites()` -- sorted unique site IDs
-  - `getHead(siteId)` -- max sequence number for a site
-  - `readSince(siteId, since)` -- contiguous sequence numbers after `since`
+- **Input:** Random entries (site-a/b/c, seq 1-30), random query site, random `since`, random
+  S3 page size (1-4)
+- **Uses:** `InMemoryS3ReaderClient` (lines 34-106) simulating S3 pagination in-process
+- **Comparison:** `listSites()`, `getHead(siteId)`, `readSince(siteId, since)` against Lean
 
 ---
 
 ## Wire Format and Data Marshaling
 
-### PN-Counter Serialization
-
-The most interesting marshaling challenge. TypeScript uses `Record<string, number>` (JS object),
-but Lean uses `List PnEntryJson` (sorted list of `{site, n}` pairs).
-
-From `/home/kuitang/git/crdtbase/test/drt/pnCounter.drt.test.ts`, lines 17-32:
-
-```typescript
-function toWire(counter: PnCounter): PnWire {
-  const encode = (entries: Record<string, number>): PnWireEntry[] =>
-    Object.entries(entries)
-      .filter(([, n]) => n !== 0)     // skip zero entries
-      .sort(([left], [right]) => ...) // deterministic order
-      .map(([site, n]) => ({ site, n }));
-  return { inc: encode(counter.inc), dec: encode(counter.dec) };
-}
-```
-
 ### HLC Hex Canonicalization
 
-Both sides canonicalize HLC hex strings to strip leading zeros. From Lean
-(`/home/kuitang/git/crdtbase/lean/CrdtBase/Sql/Defs.lean`, lines 253-261):
+Both sides canonicalize HLC hex strings to strip leading zeros. From
+`/home/kuitang/git/crdtbase/lean/CrdtBase/Sql/Defs.lean`, lines 253-261:
 
 ```lean
 def canonicalizeHlcHex (raw : String) : String :=
@@ -519,14 +489,95 @@ def canonicalizeHlcHex (raw : String) : String :=
   s!"0x{body}"
 ```
 
-### SQL Eval State Conversion
+Used pervasively in the Lean oracle -- `EvalOrElement`, `EvalMvValue`, `EvalColumnState.lww`,
+and OR-Set tombstones all canonicalize on ingest (Main.lean, lines 111-116, 135-140,
+163-167, 174-175). Ensures `0x00ff`, `0x0ff`, `0xff`, and `0xFF` all normalize to `0xff`.
 
-The SQL eval DRT has elaborate conversion functions to/from Lean's array-of-records format.
-`toLeanSchema` converts TS's nested `Record<table, {pk, columns: Record<col, {crdt}>}>` to
-Lean's `List {table, pk, partitionBy, columns: List {name, crdt}}`.
+### PN-Counter Map/List Conversion
 
-`toLeanState` and `fromLeanState` handle the PN-Counter map vs list conversion for column
-states embedded in rows.
+TypeScript uses `Record<string, number>` (JS object); Lean uses `List PnEntryJson` (sorted
+list of `{site, n}` pairs). `toLeanState` and `fromLeanState` in `sql-script-utils.ts`
+handle the bidirectional conversion.
+
+### SQL Eval Context Wire Format
+
+The `SqlScriptEvalCmd` (Main.lean, lines 231-236):
+
+```lean
+structure SqlScriptEvalCmd where
+  type : String
+  statements : List Json
+  context : SqlEvalContextCmd    -- schema, site?, hlcSequence?, removeTags?
+  state : SqlEvalStateCmd        -- rows with full CRDT column states
+  deriving FromJson
+```
+
+---
+
+## Property-Based and Model-Based Tests
+
+### Compaction Retention
+
+**File:** `/home/kuitang/git/crdtbase/test/properties/compactionRetention.prop.test.ts`
+(100 lines)
+
+Two properties validating TTL-based pruning:
+1. Row tombstones older than `rowTombstoneTtlMs` are dropped; recent ones retained
+2. OR-Set tombstones older than `orSetTombstoneTtlMs` are pruned independently
+
+```typescript
+test.prop(
+  [fc.integer({ min: 10_000, max: 1_000_000 }), fc.integer({ min: 1, max: 10_000 })],
+  { numRuns: 40 },
+)('row tombstones older than TTL are dropped during compaction', (nowMs, ttlMs) => {
+  // ... pruneRuntimeRowsForCompaction, verify old gone / recent kept
+});
+```
+
+### Client Snapshot Pull
+
+**File:** `/home/kuitang/git/crdtbase/test/properties/clientSnapshotPull.prop.test.ts`
+(465 lines)
+
+Tests the manifest coverage gate for both Node and Browser clients. Five properties:
+
+1. **Node client compacted prefix + tail deltas** -- compacts a random prefix, then verifies
+   a fresh client loading snapshot + remaining log equals full-log replay
+2. **Browser client compacted prefix + tail deltas** -- same for BrowserCrdtClient
+3. **Node client ignores manifest missing previously synced site watermark** -- corrupt
+   manifest with missing site is rejected; client continues from prior state
+4. **Browser client ignores manifest missing previously synced site watermark** -- same
+5. **Node pull preserves pending local writes across snapshot refresh** -- local writes
+   survive a snapshot refresh during pull
+
+Uses `InMemorySnapshotStore` (with read counters) and `InMemoryReplicatedLog`.
+
+### Multi-Site Schema Replication
+
+**File:** `/home/kuitang/git/crdtbase/test/properties/multisite-schema.prop.test.ts`
+(238 lines)
+
+Tests distributed schema consistency with deterministic conflict rejection. A single
+property test with 20 runs:
+
+1. A randomly chosen schema owner creates a table
+2. A non-owner inserts a row (verifying schema propagation without local CREATE)
+3. Multiple sites concurrently add unique columns
+4. Two sites attempt conflicting `ADD COLUMN` with different CRDT types
+5. After all syncs, all three sites must have identical `information_schema.columns`
+6. The conflicting column resolves to the first definition (first-write-wins)
+7. SELECT results are identical across all sites
+
+```typescript
+test.prop([fc.integer()], { numRuns: 20 })(
+  'schema propagates without local CREATE and concurrent ADD COLUMN converges',
+  async (rawSeed) => {
+    // ... creates 3 NodeCrdtClient instances on a shared InMemoryReplicatedLog
+    // ... exercises CREATE TABLE, INSERT, ADD COLUMN, concurrent conflict
+    // ... verifies all 3 sites converge to identical schema and data
+  },
+);
+```
 
 ---
 
@@ -537,7 +588,7 @@ states embedded in rows.
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `LEAN_DRT_BIN` | `lean/.lake/build/bin/CrdtBaseDRT` | Path to oracle binary |
-| `DRT_NUM_RUNS` | 50 (basic), 25 (compaction) | Iterations per property |
+| `DRT_NUM_RUNS` | 50 (basic), 15 (compaction) | Iterations per property |
 | `DRT_TIMEOUT_MS` | 30000 (basic), 45000 (compaction) | Per-property timeout |
 | `DRT_SEED` | undefined | Replay a specific fast-check seed |
 
@@ -553,8 +604,8 @@ DRT_NUM_RUNS=1000 DRT_TIMEOUT_MS=120000 npx vitest run test/drt/*.drt.test.ts
 # Full build + all tests
 npm run test:all
 
-# Coverage run with tuned parameters
-npm run test:coverage
+# Replay a failing seed
+DRT_NUM_RUNS=200 DRT_SEED=-1196022201 npx vitest run test/drt/sql-eval.drt.test.ts
 ```
 
 ---
@@ -563,89 +614,32 @@ npm run test:coverage
 
 **File:** `/home/kuitang/git/crdtbase/.github/workflows/ci.yml`
 
-A single job that runs on `ubuntu-latest` with a 120-minute timeout:
+A single job on `ubuntu-latest` (120-minute timeout):
 
 1. **Checkout + Node 22 + npm ci**
-
-2. **Build Lean proofs and DRT oracle** (lines 37-46):
-   ```yaml
-   - name: Build Lean proofs and DRT oracle
-     uses: leanprover/lean-action@v1
-     with:
-       auto-config: false
-       build: true
-       build-args: CrdtBase CrdtBaseDRT
-       lake-package-directory: lean
-       use-github-cache: true
-       use-mathlib-cache: true
-   ```
-   This builds both the proof library AND the DRT executable. If any Lean proof contains
-   `sorry`, this step fails. Mathlib cache is used to avoid rebuilding the dependency.
-
-3. **Verify Lean DRT oracle binary** (line 50):
-   ```yaml
-   - run: test -x lean/.lake/build/bin/CrdtBaseDRT
-   ```
-
-4. **Resolve Chromium for Playwright** (for browser e2e tests)
-
-5. **Run TypeScript test suite** (lines 69-72):
-   ```yaml
-   - name: Run TypeScript test suite
-     env:
-       LEAN_DRT_BIN: lean/.lake/build/bin/CrdtBaseDRT
-     run: npm test
-   ```
-   `npm test` expands to `vitest run`, which runs ALL test files including DRT.
+2. **Build Lean proofs and DRT oracle** via `leanprover/lean-action@v1` with Mathlib cache
+3. **Verify binary** -- `test -x lean/.lake/build/bin/CrdtBaseDRT`
+4. **Resolve Chromium** for Playwright e2e tests
+5. **Run test suite** -- `npm test` with `LEAN_DRT_BIN` env var set
 
 ---
 
 ## Edge Cases and Failure Modes
 
-### Event Consistency Invariant
+### Lean-Side Op Application
 
-The LWW CRDT has a critical invariant: if two states share the same `(hlc, site)` pair, they
-MUST have the same payload. This invariant is required for commutativity and associativity
-proofs in Lean.
+The Lean oracle applies CRDT ops to a full row state via `applyOpToRows`
+(Main.lean, lines 608-715), handling all four CRDT types:
 
-DRT tests use `fc.pre()` to filter out conflicting events:
-
-```typescript
-fc.pre(!isConflictingLwwEvent(a, b));
-```
-
-Separate invariant tests (`/home/kuitang/git/crdtbase/test/properties/invariants.prop.test.ts`)
-verify that `mergeLww` throws on conflicting events (line 14-21):
-
-```typescript
-test.prop([arbHlc(), arbSiteId(), fc.tuple(arbScalar(), arbScalar())])(
-  'merge rejects conflicting payloads for same (hlc, site)',
-  (hlc, site, [leftVal, rightVal]) => {
-    fc.pre(!Object.is(leftVal, rightVal));
-    const a = { val: leftVal, hlc, site };
-    const b = { val: rightVal, hlc, site };
-    expect(() => mergeLww(a, b)).toThrow(/conflicting LWW event identity/);
-  },
-);
-```
-
-The Lean oracle also validates this (Main.lean:296-298):
-
-```lean
-def assertLwwConsistent (a b : LwwJson) : Except String Unit := do
-  if (a.hlc == b.hlc) && (a.site == b.site) && a.val != b.val then
-    throw "conflicting LWW event identity: same (hlc, site) with different payloads"
-```
-
-### OR-Set and MV-Register Tag Conflicts
-
-Same pattern -- `hasConflictingOrSetEvents` and `hasConflictingMvEvents` filter DRT inputs,
-while separate invariant tests verify rejection.
+- **LWW (typ 1):** `mergeLwwValue` validates event consistency and keeps the winner
+- **PN-Counter (typ 2):** Parses `{d, n}` and calls `setPnNat` to increment site counter
+- **OR-Set (typ 3):** Handles `add`/`rmv`; both go through `normalizeOrSetState`
+- **MV-Register (typ 4):** Appends value; `normalizeMvState` dedupes and filters dominated
 
 ### HLC Bounds
 
 The Lean `Hlc` structure carries proof obligations (from
-`/home/kuitang/git/crdtbase/lean/CrdtBase/Hlc/Defs.lean`, lines 16-21):
+`/home/kuitang/git/crdtbase/lean/CrdtBase/Hlc/Defs.lean`):
 
 ```lean
 structure Hlc where
@@ -655,7 +649,7 @@ structure Hlc where
   counter_lt : counter < counterMax -- proof that counter < 2^16
 ```
 
-The DRT oracle validates these bounds when converting from JSON (Main.lean:242-245):
+The DRT oracle validates these bounds when converting from JSON (Main.lean, lines 249-252):
 
 ```lean
 def toHlc (h : HlcJson) : Except String Hlc := do
@@ -674,13 +668,14 @@ counter: fc.nat({ max: HLC_LIMITS.counterMax - 1 }),
 ### SQL Eval Error Agreement
 
 The SQL eval DRT handles the case where TypeScript throws an error by verifying that Lean
-also throws (sql-eval.drt.test.ts, lines 311-336). This ensures both implementations reject
-the same invalid inputs (e.g., column type mismatches, missing primary keys).
+also throws (sql-eval.drt.test.ts, lines 54-68). This ensures both implementations reject
+the same invalid inputs (e.g., column type mismatches, missing primary keys, write statements
+without site context).
 
 ### Normalization for Non-Deterministic Output
 
 Both implementations may produce structurally equivalent but differently ordered output.
-The SQL eval test has approximately 150 lines of normalization code to handle:
+The `sql-script-utils.ts` file has approximately 200 lines of normalization code to handle:
 
 - JSON object key ordering
 - PN-Counter map-vs-list representation
@@ -688,57 +683,43 @@ The SQL eval test has approximately 150 lines of normalization code to handle:
 - MV-Register value ordering
 - HLC hex canonicalization (e.g., `0x00ff` vs `0xff`)
 - Read result row ordering
+- Multi-statement outcome ordering
 
 This normalization is applied symmetrically to both TS and Lean outputs before comparison.
 
-### Compaction Split Exhaustiveness
+### S3 Pagination Simulation
 
-The compaction test checks ALL `n+1` split points for a list of length `n` (lines 120-122):
-
-```typescript
-function splitPoints(length: number): number[] {
-  return Array.from({ length: length + 1 }, (_, index) => index);
-}
-```
-
-This means for a 12-element list, it checks 13 splits (including empty prefix and empty
-suffix). Combined with 25 random inputs, this gives 25 * 13 * 2 = 650 Lean oracle calls
-per CRDT type.
+The replication log DRT test includes a full `InMemoryS3ReaderClient` (106 lines) that
+simulates S3's `ListObjectsV2` pagination behavior, including:
+- Page size limiting with continuation tokens
+- Delimiter-based prefix grouping (for `listSites`)
+- `GetObjectCommand` with 404 error simulation
+- Random page sizes (1-4) to stress pagination boundary handling
 
 ---
 
 ## Lean-side Implementation Details
 
-### LWW Merge in Lean
+### State Row Operations
 
-From `/home/kuitang/git/crdtbase/lean/CrdtBase/Crdt/Lww/Defs.lean`, lines 14-18:
+The Lean oracle maintains a `List EvalRow` where each row has a table name, key, and
+list of `EvalColumn` entries. `upsertColumnState` (Main.lean, lines 516-525) replaces or
+appends a column; `upsertRow` (lines 527-537) replaces or appends a row in the list.
 
-```lean
-def merge {a : Type} (a b : LwwRegister a) : LwwRegister a :=
-  if Hlc.compareWithSite (a.hlc, a.site) (b.hlc, b.site) = .lt then b else a
-```
+### SELECT Materialization
 
-This is the _same_ logic as the TypeScript version
-(`/home/kuitang/git/crdtbase/src/core/crdt/lww.ts`, lines 23-30):
+`materializeRow` (Main.lean, lines 717-736) converts CRDT column states to user-visible JSON:
+- LWW: returns the current value
+- PN-Counter: `sum(inc) - sum(dec)` (as integer)
+- OR-Set: array of visible (non-tombstoned) element values, deduplicated
+- MV-Register: single value if one entry, array if multiple concurrent values
 
-```typescript
-export function mergeLww<T>(a: LwwRegister<T>, b: LwwRegister<T>): LwwRegister<T> {
-  assertLwwEventConsistency(a, b);
-  const cmp = compareWithSite(a.hlc, a.site, b.hlc, b.site);
-  if (cmp >= 0) return a;
-  return b;
-}
-```
-
-The DRT test verifies these produce identical results for 50+ random input pairs.
-
-### Replication Log Model in Lean
+### Replication Log Model
 
 From `/home/kuitang/git/crdtbase/lean/CrdtBase/Replication/Defs.lean`:
 
-Pure functional model with `listSites`, `getHead`, and `readSince`. The `readSince` function
-(lines 56-58) filters entries for a site, then takes only the _contiguous_ sequence starting
-from `since + 1`:
+Pure functional model. `readSince` filters entries for a site, then takes only the
+_contiguous_ sequence starting from `since + 1`:
 
 ```lean
 def readSince (entries : List LogEntry) (siteId : String) (since : Nat) : List Nat :=
@@ -746,23 +727,24 @@ def readSince (entries : List LogEntry) (siteId : String) (since : Nat) : List N
   takeContiguousFrom (since + 1) seqs
 ```
 
-This is compared against the actual S3 log implementation with an in-memory S3 mock that
-simulates pagination (page size is also random).
-
 ---
 
 ## Summary
 
-The crdtbase differential testing system is a three-layer architecture:
+The crdtbase testing system is a six-layer architecture:
 
-1. **Lean 4 proofs** guarantee mathematical correctness of CRDT merge, HLC ordering,
-   convergence, and compaction for ALL inputs
-2. **DRT tests** verify that the TypeScript production code matches the Lean specification
-   for large random samples, using a long-running Lean process as an oracle via JSON-line IPC
-3. **Property and model-based tests** cover system aspects outside Lean's scope (encoding
-   round-trips, SQL parsing, multi-site convergence simulation, bloom filters)
+1. **Lean 4 proofs** guarantee mathematical correctness for ALL inputs
+2. **DRT tests** verify TypeScript matches the Lean specification for large random samples
+3. **Property-based tests** cover encoding, SQL parsing, CRDT properties, TTL retention
+4. **Model-based tests** validate snapshot pull convergence, manifest coverage gates,
+   distributed schema replication with conflict resolution
+5. **Stress tests** exercise multi-region replication with compaction on Fly.io
+6. **E2E tests** run the full client lifecycle with filesystem, S3, and three-client chaos
 
-The system tests 10 differential targets spanning primitive CRDT merges, compaction correctness,
-SQL write-op generation, SQL query planning, full SQL evaluation with state, and replication
-log endpoint semantics. All test cases are randomly generated by `fast-check`, with automatic
-shrinking on failure and seed replay support for debugging.
+The DRT system is unified around `sql_script_eval`, which executes full SQL statement
+sequences against the Lean oracle. This means the oracle tests the SAME integrated code path
+as production -- SQL parsing, CRDT op generation, state application, HLC consumption tracking,
+and SELECT materialization. The system exercises 11 DRT test files spanning CRDT-specific SQL
+scripts, compaction split law, write op generation, query planning, single and multi-statement
+evaluation, and replication log semantics. All test cases are randomly generated by `fast-check`,
+with automatic shrinking on failure and seed replay support for debugging.

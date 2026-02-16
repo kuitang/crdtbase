@@ -6,10 +6,17 @@
   <title>Chapter 6: Compaction &mdash; CRDTBase</title>
   <link rel="stylesheet" href="style.css">
 
-  <!-- MathJax -->
+  <!-- MathJax Configuration -->
   <script>
     window.MathJax = {
-      tex: { inlineMath: [['\\(','\\)']], displayMath: [['\\[','\\]']] }
+      tex: {
+        inlineMath: [['\\(','\\)']],
+        displayMath: [['\\[','\\]']],
+        processEscapes: true
+      },
+      options: {
+        skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code']
+      }
     };
   </script>
   <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
@@ -47,8 +54,10 @@
     <li><a href="#correctness">How Compaction Preserves CRDT Correctness</a></li>
     <li><a href="#segment-output">Segment File Output</a></li>
     <li><a href="#manifest-truth">The Manifest as the Single Source of Truth</a></li>
-    <li><a href="#tombstones">OR-Set Tombstone Handling</a></li>
+    <li><a href="#tombstones">Tombstones and Garbage Collection</a></li>
+    <li><a href="#cutover-gate">Snapshot Cutover Coverage Gate</a></li>
     <li><a href="#cas-failure">What Happens on CAS Failure</a></li>
+    <li><a href="#testing">Testing Strategy</a></li>
     <li><a href="#performance">Performance Implications</a></li>
     <li><a href="#summary">Summary</a></li>
   </ol>
@@ -182,18 +191,18 @@ Compaction involves three core abstractions:
     </tr>
     <tr>
       <td><strong>Compactor</strong></td>
-      <td>The job that reads deltas, merges state, writes segments,
-        and CAS-updates the manifest</td>
+      <td>The job that reads deltas, merges state, prunes tombstones,
+        writes segments, and CAS-updates the manifest</td>
       <td><code>src/platform/node/compactor.ts</code></td>
     </tr>
   </tbody>
 </table>
 
 <p>
-The core compaction data types and segment-building logic live in
-<code>src/core/compaction.ts</code> (platform-independent). The orchestration
-that ties together log reading, segment writing, and manifest CAS lives in
-<code>src/platform/node/compactor.ts</code>.
+The core compaction data types, segment-building logic, and retention-policy
+pruning live in <code>src/core/compaction.ts</code> (platform-independent).
+The orchestration that ties together log reading, retention pruning, segment
+writing, and manifest CAS lives in <code>src/platform/node/compactor.ts</code>.
 </p>
 
 
@@ -210,7 +219,7 @@ A segment file is a MessagePack-encoded blob containing the <strong>merged CRDT
 state</strong> for all rows in one (table, partition) pair:
 </p>
 
-<span class="file-ref">src/core/compaction.ts:18&ndash;27</span>
+<span class="file-ref">src/core/compaction.ts:19&ndash;28</span>
 <pre><code>export type SegmentFile = {
   v: 1;
   table: string;
@@ -222,7 +231,7 @@ state</strong> for all rows in one (table, partition) pair:
   rows: SegmentRow[];      // sorted by primary key
 };</code></pre>
 
-<span class="file-ref">src/core/compaction.ts:13&ndash;16</span>
+<span class="file-ref">src/core/compaction.ts:14&ndash;17</span>
 <pre><code>export type SegmentRow = {
   key: SqlPrimaryKey;
   cols: Record&lt;string, SqlEvalColumnState&gt;;
@@ -242,7 +251,8 @@ state needed for future merges:
     &mdash; per-site increment and decrement tallies.</li>
   <li><strong>OR-Set (typ=3):</strong>
     <code>{ elements: [...], tombstones: [...] }</code> &mdash; all live add-tags
-    plus remove tombstones.</li>
+    plus remove tombstones (subject to TTL-based pruning; see
+    <a href="#tombstones">Section 6.9</a>).</li>
   <li><strong>MV-Register (typ=4):</strong>
     <code>{ values: [{val, hlc, site}, ...] }</code> &mdash; all concurrent values.</li>
 </ul>
@@ -254,7 +264,7 @@ The manifest is the single coordination point. It records which segments exist
 and what has been compacted:
 </p>
 
-<span class="file-ref">src/core/compaction.ts:40&ndash;46</span>
+<span class="file-ref">src/core/compaction.ts:41&ndash;47</span>
 <pre><code>export type ManifestFile = {
   v: 1;
   version: number;                          // monotonic, incremented each compaction
@@ -271,7 +281,7 @@ into the segments. Any delta with
 and need not be replayed.
 </p>
 
-<span class="file-ref">src/core/compaction.ts:29&ndash;38</span>
+<span class="file-ref">src/core/compaction.ts:30&ndash;39</span>
 <pre><code>export type ManifestSegmentRef = {
   path: string;           // e.g. "segments/tasks__default_18e4a2b3.seg.bin"
   table: string;
@@ -283,14 +293,43 @@ and need not be replayed.
   key_max: SqlPrimaryKey; // largest PK in segment
 };</code></pre>
 
-<h3>6.3.3 &ensp; Empty Manifest</h3>
+<h3>6.3.3 &ensp; CompactionRetentionPolicy</h3>
+
+<p>
+The retention policy controls TTL-based tombstone garbage collection during
+compaction:
+</p>
+
+<span class="file-ref">src/core/compaction.ts:57&ndash;61</span>
+<pre><code>export type CompactionRetentionPolicy = {
+  nowMs: number;
+  orSetTombstoneTtlMs: number;
+  rowTombstoneTtlMs: number;
+};</code></pre>
+
+<p>
+Both TTLs default to 7 days (604,800,000 ms):
+</p>
+
+<span class="file-ref">src/core/compaction.ts:54&ndash;55</span>
+<pre><code>export const DEFAULT_OR_SET_TOMBSTONE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+export const DEFAULT_ROW_TOMBSTONE_TTL_MS = 7 * 24 * 60 * 60 * 1000;</code></pre>
+
+<p>
+The defaults are chosen so that any site offline for less than 7 days will sync
+all its pending adds before tombstones are garbage-collected. After 7 days, the
+system accepts the possibility that a very-delayed add could be spuriously
+resurrected&thinsp;&mdash;&thinsp;a practical tradeoff for bounded storage growth.
+</p>
+
+<h3>6.3.4 &ensp; Empty Manifest</h3>
 
 <p>
 When no compaction has ever run, the system uses an empty manifest with
 version&nbsp;0:
 </p>
 
-<span class="file-ref">src/core/compaction.ts:393&ndash;401</span>
+<span class="file-ref">src/core/compaction.ts:413&ndash;421</span>
 <pre><code>export function makeEmptyManifest(): ManifestFile {
   return {
     v: 1,
@@ -310,8 +349,8 @@ version&nbsp;0:
 
 <p>
 The entry point is <code>compactReplicatedLog()</code> in
-<code>src/platform/node/compactor.ts:56&ndash;131</code>. The algorithm
-proceeds in four phases.
+<code>src/platform/node/compactor.ts:62&ndash;143</code>. The algorithm
+proceeds in five phases.
 </p>
 
 <!-- Diagram 2: Compaction Algorithm Flowchart -->
@@ -324,24 +363,30 @@ flowchart TD
     D -- "Yes" --> E["takeContiguousEntriesSince()<br/>stops at gap"]
     D -- "No" --> F["Apply all ops to<br/>RuntimeRowState map"]
     E --> F
-    F --> G["Step 3: Build new segments<br/>- Group rows by (table, partition)<br/>- Sort by primary key<br/>- Build bloom filter<br/>- MessagePack encode"]
-    G --> H["PUT segment files<br/>to SnapshotStore"]
-    H --> I["Step 4: Build new manifest<br/>version = prior + 1"]
-    I --> J{"CAS putManifest:<br/>current version ==<br/>expected?"}
-    J -- "Success" --> K["Return applied: true"]
-    J -- "Failure" --> L["Return applied: false<br/>(another compaction won)"]
+    F --> G["Step 3: Prune expired tombstones<br/>- Row tombstones beyond TTL<br/>- OR-Set tombstones beyond TTL"]
+    G --> H["Step 4: Build new segments<br/>- Group rows by (table, partition)<br/>- Sort by primary key<br/>- Build bloom filter<br/>- MessagePack encode"]
+    H --> I["PUT segment files<br/>to SnapshotStore"]
+    I --> J["Step 5: Build new manifest<br/>version = prior + 1"]
+    J --> K{"CAS putManifest:<br/>current version ==<br/>expected?"}
+    K -- "Success" --> L["Return applied: true"]
+    K -- "Failure" --> M["Return applied: false<br/>(another compaction won)"]
   </pre>
   <div class="caption">
-    Figure 6.2 &mdash; The four-phase compaction algorithm.
-    CAS failure at the end causes the entire compaction's work to be discarded,
-    but leaves the system in a safe state.
+    Figure 6.2 &mdash; The five-phase compaction algorithm. Tombstone pruning
+    (Step 3) is a new phase that reduces segment size by removing expired
+    tombstones before serialization. CAS failure at the end causes the entire
+    compaction's work to be discarded, but leaves the system in a safe state.
   </div>
 </div>
 
 <h3>Step 1: Read Prior State</h3>
 
-<span class="file-ref">src/platform/node/compactor.ts:59&ndash;68</span>
+<span class="file-ref">src/platform/node/compactor.ts:65&ndash;74</span>
 <pre><code>const schema = options.schema ?? (await options.snapshots.getSchema());
+if (!schema) {
+  throw new Error('compaction requires schema: provide options.schema or snapshots.getSchema()');
+}
+
 const priorManifest = (await options.snapshots.getManifest()) ?? makeEmptyManifest();
 const rows = await loadRowsFromManifest(options.snapshots, priorManifest);
 const sitesCompacted: Record&lt;string, number&gt; = { ...priorManifest.sites_compacted };
@@ -352,14 +397,14 @@ The compactor loads all existing segment files referenced by the prior manifest
 and deserializes them back into <code>RuntimeRowState</code>&thinsp;&mdash;&thinsp;the
 in-memory row representation used by the CRDT engine. This is done by
 <code>loadRowsFromManifest()</code>
-(<code>compactor.ts:19&ndash;34</code>), which iterates over each segment ref,
+(<code>compactor.ts:22&ndash;37</code>), which iterates over each segment ref,
 fetches the bytes, decodes the MessagePack, and converts segment rows into
 runtime rows via <code>segmentFileToRuntimeRows()</code>.
 </p>
 
 <h3>Step 2: Collect New Deltas from All Sites</h3>
 
-<span class="file-ref">src/platform/node/compactor.ts:71&ndash;89</span>
+<span class="file-ref">src/platform/node/compactor.ts:80&ndash;95</span>
 <pre><code>const sites = await options.log.listSites();
 sites.sort();
 
@@ -388,7 +433,7 @@ it only advances through contiguous sequence numbers
 (<code>since+1, since+2, ...</code>), stopping at any gap. Each entry's
 CRDT ops are applied in order to the <code>rows</code> map via
 <code>applyOpsToRuntimeRows()</code>
-(<code>compaction.ts:226&ndash;233</code>).
+(<code>compaction.ts:246&ndash;253</code>).
 </p>
 
 <div class="warning">
@@ -419,9 +464,47 @@ CRDT ops are applied in order to the <code>rows</code> map via
   return contiguous;
 }</code></pre>
 
-<h3>Step 3: Build New Segments</h3>
+<h3>Step 3: Prune Expired Tombstones (Retention Policy)</h3>
 
-<span class="file-ref">src/platform/node/compactor.ts:91&ndash;104</span>
+<p>
+After all new deltas are applied but before building segments, the compactor
+prunes expired tombstones via <code>pruneRuntimeRowsForCompaction()</code>:
+</p>
+
+<span class="file-ref">src/platform/node/compactor.ts:97&ndash;101</span>
+<pre><code>pruneRuntimeRowsForCompaction(rows, {
+  nowMs: (options.now ?? (() => Date.now()))(),
+  orSetTombstoneTtlMs: options.orSetTombstoneTtlMs ?? DEFAULT_OR_SET_TOMBSTONE_TTL_MS,
+  rowTombstoneTtlMs: options.rowTombstoneTtlMs ?? DEFAULT_ROW_TOMBSTONE_TTL_MS,
+});</code></pre>
+
+<p>
+The <code>pruneRuntimeRowsForCompaction()</code> function
+(<code>compaction.ts:423&ndash;464</code>) performs two kinds of cleanup:
+</p>
+
+<ol>
+  <li><strong>Row tombstone removal:</strong> If a row's <code>_exists</code>
+    column is an LWW register with value <code>false</code> and the HLC
+    wall-clock time is older than <code>nowMs - rowTombstoneTtlMs</code>, the
+    entire row is deleted from the map.</li>
+  <li><strong>OR-Set tombstone pruning:</strong> For every OR-Set column in
+    every remaining row, tombstone entries whose <code>addHlc.wallMs</code> is
+    older than <code>nowMs - orSetTombstoneTtlMs</code> are filtered out, and
+    the OR-Set is re-canonicalized via <code>canonicalizeOrSet()</code>.</li>
+</ol>
+
+<p>
+Because tombstone pruning happens <em>before</em> segment building, the
+segments produced after retention pruning are smaller than they would be
+without it&thinsp;&mdash;&thinsp;expired tombstones and deleted rows no
+longer occupy space in the serialized segment files. Full details of the
+pruning implementation are in <a href="#tombstones">Section 6.9</a>.
+</p>
+
+<h3>Step 4: Build New Segments</h3>
+
+<span class="file-ref">src/platform/node/compactor.ts:103&ndash;116</span>
 <pre><code>const builtSegments = buildSegmentsFromRows({
   schema,
   rows,
@@ -441,16 +524,16 @@ for (const built of builtSegments) {
 
 <p>
 <code>buildSegmentsFromRows()</code>
-(<code>compaction.ts:346&ndash;371</code>) performs the following:
+(<code>compaction.ts:366&ndash;391</code>) performs the following:
 </p>
 
 <ol>
   <li><strong>Group rows by (table, partition)</strong> via
     <code>groupRowsByTableAndPartition()</code>
-    (<code>compaction.ts:272&ndash;301</code>). The partition is resolved
+    (<code>compaction.ts:292&ndash;321</code>). The partition is resolved
     from the schema's <code>partitionBy</code> column.</li>
   <li><strong>For each group, build a SegmentFile</strong> via
-    <code>buildSegmentFile()</code> (<code>compaction.ts:317&ndash;344</code>):
+    <code>buildSegmentFile()</code> (<code>compaction.ts:337&ndash;364</code>):
     sort rows by primary key, convert <code>RuntimeRowState</code> to
     <code>SegmentRow</code>, build a bloom filter, and compute
     <code>hlc_max</code>.</li>
@@ -458,9 +541,9 @@ for (const built of builtSegments) {
     <code>segments/{table}_{partition}_{hlc_max_hex8}.seg.bin</code></li>
 </ol>
 
-<h3>Step 4: CAS-Update the Manifest</h3>
+<h3>Step 5: CAS-Update the Manifest</h3>
 
-<span class="file-ref">src/platform/node/compactor.ts:106&ndash;131</span>
+<span class="file-ref">src/platform/node/compactor.ts:118&ndash;143</span>
 <pre><code>const nextManifest: ManifestFile = {
   v: 1,
   version: priorManifest.version + 1,
@@ -491,6 +574,15 @@ concurrently and bumped the version, the CAS fails and this compaction's
 work is discarded.
 </p>
 
+<p>
+The <code>SnapshotCompactorOptions</code> type (<code>compactor.ts:46&ndash;53</code>)
+allows callers to customize retention behavior: <code>now</code> (defaults to
+<code>Date.now()</code>) is injectable for testing, and
+<code>orSetTombstoneTtlMs</code>/<code>rowTombstoneTtlMs</code> override the
+default 7-day TTLs. Stress tests use short TTLs (e.g. 1ms) to exercise
+pruning paths.
+</p>
+
 
 <!-- ============================================================ -->
 <!-- 5. CAS-ON-MANIFEST                                            -->
@@ -517,8 +609,8 @@ sequenceDiagram
     C2->>S: getManifest()
     S-->>C2: manifest v=3
 
-    Note over C1: Read deltas, merge state,<br/>build segments
-    Note over C2: Read deltas, merge state,<br/>build segments
+    Note over C1: Read deltas, merge state,<br/>prune tombstones,<br/>build segments
+    Note over C2: Read deltas, merge state,<br/>prune tombstones,<br/>build segments
 
     C1->>S: putSegment(seg_A)
     S-->>C1: OK
@@ -559,8 +651,10 @@ The CAS implementations vary by backend:
   <tbody>
     <tr>
       <td><code>FsSnapshotStore</code></td>
-      <td>Double-read manifest file before writing</td>
-      <td>Best-effort (race window exists between reads and writes across processes)</td>
+      <td>Filesystem lock file (<code>manifest.bin.lock</code>) +
+        version check inside lock</td>
+      <td>True mutual exclusion on single machine via
+        <code>open(path, 'wx')</code></td>
     </tr>
     <tr>
       <td><code>TigrisSnapshotStore</code></td>
@@ -575,15 +669,67 @@ The CAS implementations vary by backend:
   </tbody>
 </table>
 
+<h3>6.5.1 &ensp; Filesystem CAS with Lock File</h3>
+
+<p>
+The <code>FsSnapshotStore</code>
+(<code>src/platform/node/fsSnapshotStore.ts</code>) implements manifest CAS
+using a filesystem lock file to serialize concurrent writers. This replaced an
+earlier double-read approach that had a race window between reads and writes.
+</p>
+
+<span class="file-ref">src/platform/node/fsSnapshotStore.ts:76&ndash;88</span>
+<pre><code>async putManifest(manifest: ManifestFile, expectedVersion: number): Promise&lt;boolean&gt; {
+  assertManifestPublishable(manifest, expectedVersion);
+
+  return this.withManifestLock(async () => {
+    const priorManifest = await this.getManifest();
+    const priorVersion = priorManifest?.version ?? 0;
+    if (priorVersion !== expectedVersion) {
+      return false;
+    }
+    await this.writeBytes(this.manifestPath, encodeBin(manifest));
+    return true;
+  });
+}</code></pre>
+
+<p>
+The lock file mechanism (<code>withManifestLock()</code>,
+<code>fsSnapshotStore.ts:148&ndash;157</code>) works in three steps:
+</p>
+
+<ol>
+  <li><strong>Acquire lock:</strong> Create <code>manifest.bin.lock</code>
+    using <code>open(path, 'wx')</code>&thinsp;&mdash;&thinsp;the
+    <code>wx</code> flag fails atomically with <code>EEXIST</code> if the file
+    already exists. The PID and timestamp are written into the lock file.</li>
+  <li><strong>Execute CAS:</strong> Inside the lock, re-read the manifest,
+    compare versions, and write the new manifest if the version matches.</li>
+  <li><strong>Release lock:</strong> Close the file handle and delete the lock
+    file.</li>
+</ol>
+
 <div class="note">
-  <span class="box-title">Implementation Detail: FsSnapshotStore CAS</span>
+  <span class="box-title">Stale Lock Recovery</span>
   <p>
-    The filesystem-based CAS
-    (<code>src/platform/node/fsSnapshotStore.ts:53&ndash;71</code>)
-    double-reads the manifest file before writing to reduce&thinsp;&mdash;&thinsp;but
-    not eliminate&thinsp;&mdash;&thinsp;lost-update windows. This is acceptable
-    for single-machine development use, where concurrent compaction is rare.
-    Production deployments on Tigris use true ETag-based CAS.
+    If a process crashes while holding the lock, the lock file remains. The
+    <code>tryClearStaleManifestLock()</code> method
+    (<code>fsSnapshotStore.ts:179&ndash;211</code>) reads the PID and timestamp
+    from the lock file. If the lock is older than 30 seconds
+    (<code>staleManifestLockMs</code>) and the owning process is no longer alive
+    (<code>process.kill(pid, 0)</code> fails), the lock file is removed.
+  </p>
+</div>
+
+<div class="note">
+  <span class="box-title">Atomic File Writes</span>
+  <p>
+    All file writes in <code>FsSnapshotStore</code> use a temp-file-then-rename
+    pattern (<code>writeBytes()</code>, <code>fsSnapshotStore.ts:127&ndash;138</code>).
+    The <code>writeBytes()</code> method writes to a temp file (named with PID +
+    timestamp + random suffix), then calls <code>rename()</code> which is atomic
+    on POSIX filesystems. Readers either see the old content or the new content,
+    never a partial write.
   </p>
 </div>
 
@@ -662,7 +808,7 @@ The Lean proofs use a helper function that splits a list at an arbitrary
 point and folds both halves:
 </p>
 
-<span class="file-ref">lean/CrdtBase/Compaction/Defs.lean:13&ndash;15</span>
+<span class="file-ref">lean/CrdtBase/Compaction/Defs.lean:12&ndash;15</span>
 <pre><code>def foldPrefixSuffix {&alpha; &beta; : Type}
     (step : &beta; &rarr; &alpha; &rarr; &beta;) (init : &beta;) (ops : List &alpha;) (split : Nat) : &beta; :=
   List.foldl step (List.foldl step init (ops.take split)) (ops.drop split)</code></pre>
@@ -681,7 +827,7 @@ point and folds both halves:
   \]
   <p>
     Proved as <code>foldPrefixSuffix_eq_foldl_all</code> in
-    <code>Props.lean:28&ndash;32</code>.
+    <code>Props.lean:27&ndash;32</code>.
   </p>
 </div>
 
@@ -692,21 +838,79 @@ The Lean proofs include specializations for each CRDT type, confirming that
 the concrete merge functions satisfy the compaction law:
 </p>
 
-<span class="file-ref">lean/CrdtBase/Compaction/Props.lean:55&ndash;103</span>
-<pre><code>theorem pn_counter_compaction_preserves_state ...
-theorem or_set_compaction_preserves_state ...
-theorem mv_register_compaction_preserves_state ...
-theorem lww_compaction_preserves_state ...</code></pre>
+<span class="file-ref">lean/CrdtBase/Compaction/Props.lean:54&ndash;102</span>
+<pre><code>theorem pn_counter_compaction_preserves_state
+    (ops : List PnCounter) (split : Nat) :
+    foldPrefixSuffix PnCounter.merge pnCounterEmpty ops split =
+      List.foldl PnCounter.merge pnCounterEmpty ops
+
+theorem or_set_compaction_preserves_state {&alpha; Hlc : Type}
+    [DecidableEq &alpha;] [DecidableEq Hlc]
+    (ops : List (OrSet &alpha; Hlc)) (split : Nat) :
+    foldPrefixSuffix OrSet.merge (orSetEmpty &alpha; Hlc) ops split =
+      List.foldl OrSet.merge (orSetEmpty &alpha; Hlc) ops
+
+theorem mv_register_compaction_preserves_state {&alpha; : Type}
+    [DecidableEq &alpha;]
+    (ops : List (MvRegister &alpha;)) (split : Nat) :
+    foldPrefixSuffix MvRegister.merge (mvRegisterEmpty &alpha;) ops split =
+      List.foldl MvRegister.merge (mvRegisterEmpty &alpha;) ops
+
+theorem lww_compaction_preserves_state {&alpha; : Type}
+    (ops : List (LwwRegister &alpha;)) (split : Nat) :
+    foldPrefixSuffix lwwStep none ops split =
+      List.foldl lwwStep none ops</code></pre>
 
 <p>
-Each uses <code>foldPrefixSuffix</code> instantiated with the CRDT-specific
-merge function and empty initial state.
+Each per-CRDT proof uses <code>foldPrefixSuffix_eq_foldl</code> instantiated
+with the concrete merge function and empty initial state for that CRDT type
+(defined in <code>Defs.lean:18&ndash;29</code> as <code>pnCounterEmpty</code>,
+<code>orSetEmpty</code>, <code>mvRegisterEmpty</code>).
 </p>
 
-<h3>6.6.3 &ensp; Idempotence</h3>
+<h3>6.6.3 &ensp; Snapshot Cutover Law</h3>
+
+<p>
+The snapshot cutover law directly models the client behavior of loading
+compacted segments and then replaying trailing deltas:
+</p>
 
 <div class="theorem">
-  <span class="box-title">Theorem 6.3 &mdash; Compaction Idempotence</span>
+  <span class="box-title">Theorem 6.3 &mdash; Snapshot Cutover Law</span>
+  <p>
+    Loading a compacted prefix state and replaying suffix deltas is equivalent
+    to replaying the full stream:
+  </p>
+  \[
+    \text{List.foldl}\;f\;(\text{List.foldl}\;f\;\text{init}\;\text{compactedPrefix})\;\text{suffix}
+    \;=\;
+    \text{List.foldl}\;f\;\text{init}\;(\text{compactedPrefix} \mathbin{+\!\!+} \text{suffix})
+  \]
+</div>
+
+<span class="file-ref">lean/CrdtBase/Compaction/Props.lean:104&ndash;109</span>
+<pre><code>theorem snapshot_then_suffix_replay_eq_full_fold {&alpha; &beta; : Type}
+    (step : &beta; &rarr; &alpha; &rarr; &beta;) (init : &beta;) (compactedPrefix suffix : List &alpha;) :
+    List.foldl step (List.foldl step init compactedPrefix) suffix =
+      List.foldl step init (compactedPrefix ++ suffix) := by
+  simpa using compaction_preserves_state step init compactedPrefix suffix</code></pre>
+
+<p>
+A further corollary shows that when no new suffix deltas exist, the snapshot
+cutover is a no-op:
+</p>
+
+<span class="file-ref">lean/CrdtBase/Compaction/Props.lean:112&ndash;116</span>
+<pre><code>theorem snapshot_cutover_idempotent_without_new_suffix {&alpha; &beta; : Type}
+    (step : &beta; &rarr; &alpha; &rarr; &beta;) (init : &beta;) (compactedPrefix : List &alpha;) :
+    List.foldl step (List.foldl step init compactedPrefix) [] =
+      List.foldl step init compactedPrefix := by
+  simp</code></pre>
+
+<h3>6.6.4 &ensp; Idempotence</h3>
+
+<div class="theorem">
+  <span class="box-title">Theorem 6.4 &mdash; Compaction Idempotence</span>
   <p>
     Compacting an already-compacted state with no new deltas is a no-op:
   </p>
@@ -726,7 +930,75 @@ merge function and empty initial state.
       foldPrefixSuffix step init ops split := by
   simp [foldPrefixSuffix]</code></pre>
 
-<h3>6.6.4 &ensp; The PN-Counter Subtlety</h3>
+<h3>6.6.5 &ensp; Summary of Lean Compaction Theorems</h3>
+
+<p>
+The Lean proofs contain <strong>10 compaction theorems</strong> total:
+</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Theorem</th>
+      <th>Line</th>
+      <th>What it proves</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>foldPrefixSuffix_eq_foldl</code></td>
+      <td>10</td>
+      <td>Split compaction = full fold</td>
+    </tr>
+    <tr>
+      <td><code>foldPrefixSuffix_eq_foldl_all</code></td>
+      <td>28</td>
+      <td>Above holds for all split points</td>
+    </tr>
+    <tr>
+      <td><code>compaction_preserves_state</code></td>
+      <td>36</td>
+      <td>Canonical prefix+suffix = full fold</td>
+    </tr>
+    <tr>
+      <td><code>compaction_idempotent</code></td>
+      <td>48</td>
+      <td>Re-compacting with no new data is identity</td>
+    </tr>
+    <tr>
+      <td><code>pn_counter_compaction_preserves_state</code></td>
+      <td>55</td>
+      <td>PN-counter specialization</td>
+    </tr>
+    <tr>
+      <td><code>or_set_compaction_preserves_state</code></td>
+      <td>67</td>
+      <td>OR-Set specialization</td>
+    </tr>
+    <tr>
+      <td><code>mv_register_compaction_preserves_state</code></td>
+      <td>80</td>
+      <td>MV-register specialization</td>
+    </tr>
+    <tr>
+      <td><code>lww_compaction_preserves_state</code></td>
+      <td>93</td>
+      <td>LWW specialization</td>
+    </tr>
+    <tr>
+      <td><code>snapshot_then_suffix_replay_eq_full_fold</code></td>
+      <td>105</td>
+      <td>Snapshot cutover law</td>
+    </tr>
+    <tr>
+      <td><code>snapshot_cutover_idempotent_without_new_suffix</code></td>
+      <td>112</td>
+      <td>No-op when no new deltas</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>6.6.6 &ensp; The PN-Counter Subtlety</h3>
 
 <div class="warning">
   <span class="box-title">PN-Counter Double-Application</span>
@@ -745,13 +1017,19 @@ merge function and empty initial state.
   </p>
 </div>
 
-<span class="file-ref">src/platform/node/nodeClient.ts:385&ndash;389</span>
+<span class="file-ref">src/platform/node/nodeClient.ts:424&ndash;428</span>
 <pre><code>// Reset site cursors to compaction watermarks so uncompacted deltas
 // are replayed exactly once.
 for (const [siteId, seq] of Object.entries(manifest.sites_compacted)) {
   this.syncedSeqBySite.set(siteId, seq);
   this.syncedHlcBySite.delete(siteId);
 }</code></pre>
+
+<p>
+By resetting the per-site cursor to the compacted seq, subsequent delta pulls
+start strictly <em>after</em> what the segment covers. No double-application
+occurs.
+</p>
 
 
 <!-- ============================================================ -->
@@ -769,11 +1047,11 @@ that enable efficient query execution.
 
 <p>
 Rows within a segment are sorted by primary key
-(<code>compaction.ts:323&ndash;325</code>), enabling binary search for
+(<code>compaction.ts:343&ndash;345</code>), enabling binary search for
 point lookups:
 </p>
 
-<span class="file-ref">src/core/compaction.ts:323&ndash;325</span>
+<span class="file-ref">src/core/compaction.ts:343&ndash;345</span>
 <pre><code>const sortedRows = [...params.rows].sort((left, right) =>
   compareSqlPrimaryKeys(left.key, right.key),
 );</code></pre>
@@ -785,11 +1063,15 @@ A bloom filter is built over all primary keys in the segment, with 10 bits per
 element yielding approximately 1% false positive rate:
 </p>
 
-<span class="file-ref">src/core/compaction.ts:179&ndash;205</span>
+<span class="file-ref">src/core/compaction.ts:199&ndash;224</span>
 <pre><code>export function buildBloomFilter(
   keys: SqlPrimaryKey[],
   bitsPerElement = 10,
 ): { bloom: Uint8Array; bloomK: number } {
+  if (keys.length === 0) {
+    return { bloom: new Uint8Array(0), bloomK: 0 };
+  }
+
   const requestedBitCount = Math.max(8, Math.ceil(keys.length * bitsPerElement));
   const byteCount = Math.ceil(requestedBitCount / 8);
   const bitCount = byteCount * 8;
@@ -903,17 +1185,17 @@ written since the last compaction.
 
 
 <!-- ============================================================ -->
-<!-- 9. OR-SET TOMBSTONE HANDLING                                  -->
+<!-- 9. TOMBSTONES AND GARBAGE COLLECTION                          -->
 <!-- ============================================================ -->
 
-<h2 id="tombstones">6.9 &ensp; OR-Set Tombstone Handling During Compaction</h2>
+<h2 id="tombstones">6.9 &ensp; Tombstones and Garbage Collection</h2>
 
 <p>
-CRDTBase has two distinct tombstone mechanisms, both of which interact with
-compaction.
+CRDTBase has two distinct tombstone mechanisms, and both now support
+TTL-based garbage collection during compaction.
 </p>
 
-<h3>9.1 &ensp; OR-Set Element Tombstones</h3>
+<h3>6.9.1 &ensp; OR-Set Element Tombstones</h3>
 
 <p>
 OR-Set removes are recorded as tombstones&thinsp;&mdash;&thinsp;tags
@@ -928,34 +1210,95 @@ identifying which add operations to suppress:
 
 <p>
 During merge, any element whose add-tag appears in the tombstone set is
-filtered out. <strong>Tombstones are never garbage-collected</strong>&thinsp;&mdash;&thinsp;they
-persist in segment files to ensure that a removed element is not resurrected
-by a delayed add operation from another site.
+filtered out.
 </p>
 
+<p>
+<strong>Tombstone TTL-based pruning:</strong> During compaction, OR-Set
+tombstones whose <code>addHlc.wallMs</code> is older than
+<code>nowMs - orSetTombstoneTtlMs</code> are removed. The default TTL is
+7 days. After pruning, <code>canonicalizeOrSet()</code> re-normalizes the
+OR-Set to maintain deterministic serialization order.
+</p>
+
+<span class="file-ref">src/core/compaction.ts:445&ndash;463</span>
+<pre><code>for (const [column, state] of row.columns.entries()) {
+  if (state.typ !== 3) {
+    continue;
+  }
+  const retainedTombstones = state.state.tombstones.filter(
+    (tag) => !isHlcExpired(tag.addHlc.wallMs, orSetCutoffMs),
+  );
+  if (retainedTombstones.length === state.state.tombstones.length) {
+    continue;       // no tombstones expired -- skip re-canonicalization
+  }
+  row.columns.set(column, {
+    typ: 3,
+    state: canonicalizeOrSet({
+      elements: state.state.elements,
+      tombstones: retainedTombstones,
+    }),
+  });
+}</code></pre>
+
 <div class="warning">
-  <span class="box-title">Tombstone Retention Is Permanent</span>
+  <span class="box-title">Ghost Resurrection Risk</span>
   <p>
-    OR-Set tombstones grow monotonically. Every remove operation adds entries
-    to the tombstone set, and compaction faithfully preserves them all. In
-    workloads with frequent adds and removes on set-typed columns, segment
-    files will grow over time even if the materialized set remains small.
-    This is the cost of causal consistency without a garbage collection protocol.
+    Once an OR-Set tombstone is pruned, a very-delayed add with a matching tag
+    from an offline site could cause a "ghost resurrection" of the removed
+    element. The 7-day TTL is a practical ceiling: if a site is offline for
+    longer than 7 days, some data anomalies are accepted. This is the
+    fundamental tradeoff of tombstone garbage collection without a global
+    coordination protocol.
   </p>
 </div>
 
-<h3>9.2 &ensp; Row-Level Deletion</h3>
+<h3>6.9.2 &ensp; Row-Level Deletion</h3>
 
 <p>
 Row-level <code>DELETE</code> is implemented as an LWW register write on a
-hidden <code>_deleted</code> column set to <code>true</code>. Reads filter
-out tombstoned rows. The SPEC mentions TTL-based garbage collection of row
-tombstones (default: 7 days), but this is <strong>not yet
-implemented</strong> in the current codebase. Compaction currently retains
-all row states including deleted rows.
+hidden <code>_exists</code> column set to <code>false</code>. Reads filter
+out tombstoned rows.
 </p>
 
-<h3>9.3 &ensp; No File-Level Garbage Collection</h3>
+<p>
+<strong>Row tombstone TTL-based removal:</strong> During compaction, if a row's
+<code>_exists</code> column is an LWW register with value <code>false</code>
+and the HLC wall-clock time is older than
+<code>nowMs - rowTombstoneTtlMs</code>, the entire row is deleted from the
+in-memory map before segment building:
+</p>
+
+<span class="file-ref">src/core/compaction.ts:434&ndash;443</span>
+<pre><code>const exists = row.columns.get('_exists');
+if (
+  exists?.typ === 1 &&
+  exists.state.val === false &&
+  isHlcExpired(exists.state.hlc.wallMs, rowCutoffMs)
+) {
+  rows.delete(storageKey);
+  continue;
+}</code></pre>
+
+<p>
+After pruning, the deleted row no longer appears in any segment file, reducing
+storage and speeding up scans.
+</p>
+
+<h3>6.9.3 &ensp; Input Validation</h3>
+
+<p>
+The <code>pruneRuntimeRowsForCompaction()</code> function guards against
+accidental <code>NaN</code> or <code>Infinity</code> TTL values that could
+silently prune everything or nothing:
+</p>
+
+<span class="file-ref">src/core/compaction.ts:427&ndash;429</span>
+<pre><code>assertFiniteNonNegativeMs(policy.nowMs, 'compaction retention nowMs');
+assertFiniteNonNegativeMs(policy.orSetTombstoneTtlMs, 'OR-Set tombstone TTL');
+assertFiniteNonNegativeMs(policy.rowTombstoneTtlMs, 'row tombstone TTL');</code></pre>
+
+<h3>6.9.4 &ensp; No File-Level Garbage Collection</h3>
 
 <p>
 Old segment files and old delta files are <strong>never deleted</strong>.
@@ -968,10 +1311,78 @@ is needed.
 
 
 <!-- ============================================================ -->
-<!-- 10. CAS FAILURE                                               -->
+<!-- 10. SNAPSHOT CUTOVER COVERAGE GATE                            -->
 <!-- ============================================================ -->
 
-<h2 id="cas-failure">6.10 &ensp; What Happens on CAS Failure</h2>
+<h2 id="cutover-gate">6.10 &ensp; Snapshot Cutover Coverage Gate</h2>
+
+<h3>6.10.1 &ensp; The Problem</h3>
+
+<p>
+A correctness bug was discovered where a client could lose rows during a
+snapshot refresh. The scenario: a client has synced deltas from sites A, B,
+and C, but a compaction only included A and B (site C's deltas had not
+reached the compactor). If the client loads this manifest, it replaces its
+in-memory rows with the segment state (losing C's contributions) and resets
+sync cursors to the manifest watermarks (no watermark for C). With
+PN-Counters, the lost increments from site C are permanently gone.
+</p>
+
+<h3>6.10.2 &ensp; The Fix</h3>
+
+<p>
+Both <code>NodeCrdtClient</code> and <code>BrowserCrdtClient</code> now
+implement a <code>manifestCoversKnownSites()</code> coverage gate that runs
+before applying any manifest:
+</p>
+
+<span class="file-ref">src/platform/node/nodeClient.ts:434&ndash;444</span>
+<pre><code>private manifestCoversKnownSites(manifest: ManifestFile): boolean {
+  for (const [siteId, seq] of this.syncedSeqBySite.entries()) {
+    if (seq &lt;= 0) {
+      continue;
+    }
+    if (!(siteId in manifest.sites_compacted)) {
+      return false;
+    }
+  }
+  return true;
+}</code></pre>
+
+<p>
+The gate is checked early in <code>refreshFromSnapshotManifest()</code>:
+</p>
+
+<span class="file-ref">src/platform/node/nodeClient.ts:388&ndash;392</span>
+<pre><code>if (!this.manifestCoversKnownSites(manifest)) {
+  // Reject incomplete manifests for sites we already track; otherwise we may
+  // replace rows with a partial snapshot and skip required log replay.
+  return;
+}</code></pre>
+
+<p>
+The logic: for every site the client has already synced deltas from (i.e.,
+<code>syncedSeqBySite</code> has a positive seq), the manifest's
+<code>sites_compacted</code> must contain that site. If any tracked site is
+missing from the manifest, the manifest is silently skipped&thinsp;&mdash;&thinsp;the
+client continues using its existing state and delta-based sync until a future
+compaction produces a manifest that covers all known sites.
+</p>
+
+<h3>6.10.3 &ensp; Why Sites with seq &le; 0 Are Skipped</h3>
+
+<p>
+Sites with seq 0 are sites that the client knows about but has never
+successfully synced any deltas from. They have contributed nothing to the
+client's current state, so there is nothing to lose if the manifest omits them.
+</p>
+
+
+<!-- ============================================================ -->
+<!-- 11. CAS FAILURE                                               -->
+<!-- ============================================================ -->
+
+<h2 id="cas-failure">6.11 &ensp; What Happens on CAS Failure</h2>
 
 <p>
 When <code>putManifest()</code> returns <code>applied: false</code>, the
@@ -980,7 +1391,7 @@ and safe:
 </p>
 
 <ol>
-  <li><strong>Orphaned segments:</strong> The segment files written in Step 3
+  <li><strong>Orphaned segments:</strong> The segment files written in Step 4
     are now unreferenced by any manifest. They consume storage but are never
     downloaded by any client. These are harmless.</li>
   <li><strong>No state corruption:</strong> The manifest still points to the
@@ -991,7 +1402,7 @@ and safe:
     process with the new baseline. No special recovery logic is needed.</li>
 </ol>
 
-<span class="file-ref">src/platform/node/compactor.ts:114&ndash;123</span>
+<span class="file-ref">src/platform/node/compactor.ts:127&ndash;135</span>
 <pre><code>if (!applied) {
   const latestManifest =
     (await options.snapshots.getManifest()) ?? makeEmptyManifest();
@@ -1015,10 +1426,150 @@ and safe:
 
 
 <!-- ============================================================ -->
-<!-- 11. PERFORMANCE IMPLICATIONS                                  -->
+<!-- 12. TESTING STRATEGY                                          -->
 <!-- ============================================================ -->
 
-<h2 id="performance">6.11 &ensp; Performance Implications</h2>
+<h2 id="testing">6.12 &ensp; Testing Strategy</h2>
+
+<p>
+Compaction correctness is tested at five levels, from the most abstract
+(machine-checked proofs) to the most concrete (stress tests under load).
+</p>
+
+<h3>6.12.1 &ensp; Lean Formal Proofs (Tier 4)</h3>
+
+<p>
+Machine-checked proofs in <code>lean/CrdtBase/Compaction/</code> verify that
+compaction preserves state for all CRDT types, is idempotent, and that the
+snapshot cutover law holds. The 10 theorems (see
+<a href="#correctness">Section 6.6.5</a>) cover the abstract mathematical
+model.
+</p>
+
+<h3>6.12.2 &ensp; Differential Random Testing (DRT)</h3>
+
+<p>
+<code>test/drt/compaction.drt.test.ts</code> runs property-based tests that
+verify the TypeScript implementation agrees with the Lean oracle for the
+compaction split law. For each CRDT type (LWW, PN-Counter, OR-Set,
+MV-Register):
+</p>
+
+<ol>
+  <li>Generate a random list of CRDT states.</li>
+  <li>For every possible split point, fold the prefix, then fold the suffix
+    on top.</li>
+  <li>Verify the split result matches both the TypeScript direct fold and the
+    Lean oracle direct fold.</li>
+</ol>
+
+<h3>6.12.3 &ensp; Property-Based Tests</h3>
+
+<p>
+Several property test files cover compaction:
+</p>
+
+<p>
+<strong><code>test/properties/compaction.prop.test.ts</code></strong> tests
+the full compaction pipeline (including MessagePack encode/decode round-trip):
+</p>
+
+<ol>
+  <li><strong>Compaction preserves state:</strong> Split ops at the midpoint,
+    compact the prefix into a segment, encode/decode it, apply the suffix on
+    top, and verify the result matches applying all ops directly.</li>
+  <li><strong>Compaction is idempotent:</strong> Compact, encode, decode,
+    re-compact, and verify the segment is identical.</li>
+  <li><strong>Rows are sorted:</strong> Every segment has rows in primary key
+    order.</li>
+  <li><strong>Bloom has no false negatives:</strong> Every key in the segment
+    is found by the bloom filter.</li>
+</ol>
+
+<p>
+<strong><code>test/properties/compactionRetention.prop.test.ts</code></strong>
+validates TTL-based pruning with two property-based tests:
+</p>
+
+<ol>
+  <li><strong>Row tombstone TTL:</strong> Creates two deleted rows &mdash;
+    one older and one newer than the cutoff. After
+    <code>pruneRuntimeRowsForCompaction()</code>, the old row is gone and the
+    recent row survives.</li>
+  <li><strong>OR-Set tombstone TTL:</strong> Creates an OR-Set with two
+    tombstones straddling the cutoff. After pruning, only the newer tombstone
+    remains.</li>
+</ol>
+
+<p>
+<strong><code>test/properties/clientSnapshotPull.prop.test.ts</code></strong>
+validates the snapshot cutover coverage gate and the full snapshot-first pull
+flow:
+</p>
+
+<ol>
+  <li><strong>Node/browser snapshot + delta equivalence:</strong> Compact a
+    prefix of events, create a client that pulls from the compacted snapshot
+    plus trailing deltas, verify it matches a client that replays all deltas
+    directly.</li>
+  <li><strong>Coverage gate rejection:</strong> Forge a manifest missing a
+    known site from <code>sites_compacted</code>, verify the client rejects it
+    and retains its prior state.</li>
+  <li><strong>Pending writes preservation:</strong> Verify local unpushed
+    writes survive a snapshot refresh.</li>
+</ol>
+
+<p>
+<strong><code>test/properties/snapshotStore.prop.test.ts</code></strong>
+validates CAS atomicity and encoding:
+</p>
+
+<ol>
+  <li><strong>Manifest/segment/schema encode/decode round-trips.</strong></li>
+  <li><strong>Manifest version CAS enforcement:</strong> Seeds a filesystem
+    store to a given version, then attempts CAS with various expected
+    versions.</li>
+  <li><strong>Concurrent CAS atomicity:</strong> Two
+    <code>FsSnapshotStore</code> instances pointing at the same directory race
+    to update the manifest. Exactly one wins.</li>
+</ol>
+
+<h3>6.12.4 &ensp; End-to-End Tests</h3>
+
+<p>
+<code>test/e2e/three-clients.e2e.test.ts</code> and
+<code>test/e2e/s3-minio.e2e.test.ts</code> test the full integration:
+</p>
+
+<ol>
+  <li>Three sites write data through a shared replicated log.</li>
+  <li>All three sites sync and converge to the same state.</li>
+  <li>Compaction runs, producing segments and a manifest.</li>
+  <li>A <strong>fourth client</strong> (<code>site-d</code>) that has never
+    seen any deltas joins, pulls the manifest and segments, and verifies it
+    gets the same query results.</li>
+  <li>A second compaction with no new deltas verifies idempotence
+    (<code>opsRead === 0</code>).</li>
+</ol>
+
+<h3>6.12.5 &ensp; Stress Tests</h3>
+
+<p>
+The stress test harness integrates compaction into its concurrent write
+workload. One designated worker runs compaction <strong>every 30
+operations</strong>, exercising the interleaving of concurrent writes, delta
+replication, compaction, tombstone pruning, and snapshot-based client
+bootstrapping under load. This validates that the compaction pipeline remains
+correct when racing with live writes and that the coverage gate correctly
+rejects partial manifests during active multi-site workloads.
+</p>
+
+
+<!-- ============================================================ -->
+<!-- 13. PERFORMANCE IMPLICATIONS                                  -->
+<!-- ============================================================ -->
+
+<h2 id="performance">6.13 &ensp; Performance Implications</h2>
 
 <table>
   <thead>
@@ -1053,6 +1604,11 @@ and safe:
       <td>Coordination</td>
       <td>None</td>
       <td>CAS on manifest only</td>
+    </tr>
+    <tr>
+      <td>Tombstone growth</td>
+      <td>Unbounded</td>
+      <td>Bounded by TTL (default 7 days)</td>
     </tr>
   </tbody>
 </table>
@@ -1093,12 +1649,26 @@ The design accepts several tradeoffs in exchange for simplicity:
   </p>
 </div>
 
-<div class="warning">
-  <span class="box-title">Tradeoff 4: Tombstone Retention</span>
+<div class="note">
+  <span class="box-title">Tradeoff 4: TTL-Based Tombstone Pruning</span>
   <p>
-    OR-Set tombstones are retained forever. Row-level delete tombstones are
-    spec'd for TTL-based cleanup but not yet implemented. Both contribute to
-    segment size growth over time even as the "live" dataset stays constant.
+    OR-Set tombstones and deleted row tombstones are pruned after a
+    configurable TTL (default 7 days). This bounds storage growth but
+    introduces a correctness tradeoff: a site offline for longer than the TTL
+    may produce add operations that are spuriously resurrected because the
+    corresponding tombstone was already pruned. The 7-day default is a
+    conservative choice that accommodates typical offline durations.
+  </p>
+</div>
+
+<div class="note">
+  <span class="box-title">Tradeoff 5: Coverage Gate Conservatism</span>
+  <p>
+    The <code>manifestCoversKnownSites()</code> gate may cause a client to skip
+    valid compaction manifests if the compactor has not yet seen deltas from a
+    site the client has already synced. This is safe but can delay snapshot
+    adoption. The client will adopt the manifest on a future pull once the
+    compactor catches up.
   </p>
 </div>
 
@@ -1131,18 +1701,18 @@ a 200&times; improvement in bootstrap latency.
 
 
 <!-- ============================================================ -->
-<!-- 12. SUMMARY                                                   -->
+<!-- 14. SUMMARY                                                   -->
 <!-- ============================================================ -->
 
-<h2 id="summary">6.12 &ensp; Summary</h2>
+<h2 id="summary">6.14 &ensp; Summary</h2>
 
 <p>
 Compaction in CRDTBase is a periodic batch job that folds accumulated delta
 operations into pre-merged segment files, dramatically reducing the work
 needed for new client bootstrap and query execution. Its correctness rests on
-a formally verified property&thinsp;&mdash;&thinsp;the fold-append
-law&thinsp;&mdash;&thinsp;that holds for <em>any</em> step function and thus
-for all CRDT types in the system.
+10 formally verified theorems&thinsp;&mdash;&thinsp;the fold-append law,
+per-CRDT specializations, snapshot cutover law, and
+idempotence&thinsp;&mdash;&thinsp;that hold for all CRDT types in the system.
 </p>
 
 <p>
@@ -1151,6 +1721,15 @@ The design prioritizes simplicity and debuggability:
 
 <ul>
   <li><strong>Single-level segments</strong> with no tiered compaction.</li>
+  <li><strong>TTL-based tombstone garbage collection</strong> bounds storage
+    growth for both OR-Set element tombstones and deleted row tombstones, with
+    a configurable TTL defaulting to 7 days.</li>
+  <li><strong>Filesystem CAS locking</strong> via <code>manifest.bin.lock</code>
+    serializes concurrent writers on a single machine, with stale lock recovery
+    and atomic temp-file-then-rename writes.</li>
+  <li><strong>Snapshot cutover coverage gate</strong> prevents clients from
+    applying partial manifests that would lose contributions from tracked
+    sites.</li>
   <li><strong>No file deletion</strong>&thinsp;&mdash;&thinsp;old artifacts
     are left in place.</li>
   <li><strong>MessagePack encoding</strong> for universal inspectability.</li>
@@ -1164,7 +1743,9 @@ The design prioritizes simplicity and debuggability:
 The manifest file is the keystone: it serves simultaneously as segment
 registry, compaction watermark, and optimistic lock. Clients trust the
 manifest completely, downloading only the segments it references and replaying
-only the deltas it does not cover.
+only the deltas it does not cover. The stress test harness exercises
+compaction every 30 operations under concurrent multi-site write load,
+validating correctness under realistic conditions.
 </p>
 
 

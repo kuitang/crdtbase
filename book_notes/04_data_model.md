@@ -21,7 +21,7 @@ layer.
 The in-memory schema is a record mapping table names to table schemas:
 
 ```typescript
-// src/core/sql.ts:192-200
+// src/core/sql.ts:199-207
 export type SqlColumnCrdt = 'scalar' | 'lww' | 'pn_counter' | 'or_set' | 'mv_register';
 
 export type SqlTableSchema = {
@@ -39,7 +39,72 @@ Each table has:
   rows into segment files. If null, all rows go into partition `"_default"`.
 - **A column map** where each non-PK column has a CRDT type tag.
 
-### 1.2 DDL: CREATE TABLE
+### 1.2 The Information Schema
+
+Schema metadata is itself stored as CRDT-replicated rows in two virtual tables.
+This design ensures schema changes propagate through the same replication
+pipeline as data changes, achieving eventual consistency for DDL across replicas.
+
+```typescript
+// src/core/sql.ts:245-268
+export const INFORMATION_SCHEMA_TABLES = 'information_schema.tables';
+export const INFORMATION_SCHEMA_COLUMNS = 'information_schema.columns';
+
+const INFORMATION_SCHEMA_METADATA: Readonly<Record<string, SqlTableSchema>> = {
+  [INFORMATION_SCHEMA_TABLES]: {
+    pk: 'table_name',
+    partitionBy: null,
+    columns: {
+      table_name: { crdt: 'scalar' },
+      pk_column: { crdt: 'lww' },
+      partition_by: { crdt: 'lww' },
+    },
+  },
+  [INFORMATION_SCHEMA_COLUMNS]: {
+    pk: 'column_id',
+    partitionBy: null,
+    columns: {
+      column_id: { crdt: 'scalar' },
+      table_name: { crdt: 'lww' },
+      column_name: { crdt: 'lww' },
+      crdt_kind: { crdt: 'lww' },
+    },
+  },
+};
+```
+
+The information schema tables have the following logical DDL:
+
+```sql
+-- Conceptual DDL (not user-executable)
+CREATE TABLE information_schema.tables (
+  table_name   PRIMARY KEY,    -- user table name
+  pk_column    LWW<STRING>,    -- name of the PK column
+  partition_by LWW<STRING>     -- partition key column (or NULL)
+);
+
+CREATE TABLE information_schema.columns (
+  column_id    PRIMARY KEY,    -- composite key: "table:column"
+  table_name   LWW<STRING>,    -- owning table name
+  column_name  LWW<STRING>,    -- column name
+  crdt_kind    LWW<STRING>     -- one of: scalar, lww, pn_counter, or_set, mv_register
+);
+```
+
+The `column_id` primary key is a composite string `"table:column"`:
+
+```typescript
+// src/core/sql.ts:1137-1139
+function columnId(table: string, column: string): string {
+  return `${table}:${column}`;
+}
+```
+
+Because all information schema columns use LWW registers, concurrent DDL from
+different replicas resolves deterministically: the last-writer-wins semantics
+produce the same schema on every replica after convergence.
+
+### 1.3 DDL: CREATE TABLE
 
 The SQL parser accepts CRDT-annotated column types:
 
@@ -55,16 +120,15 @@ CREATE TABLE tasks (
 ) PARTITION BY owner_id;
 ```
 
-The parser (`src/core/sql.ts:408-423`) converts `PRIMARY KEY` to the internal
-`{ kind: 'scalar', scalar: 'STRING' }` representation. Bare scalar types on
-non-PK columns are disallowed -- you must use `LWW<T>`, `COUNTER`, `SET<T>`, or
-`REGISTER<T>`.
+The parser (`src/core/sql.ts:452-467`) converts `PRIMARY KEY` to the internal
+`{ kind: 'scalar', scalar: 'STRING' }` representation. Non-PK columns must use
+`LWW<T>`, `COUNTER`, `SET<T>`, or `REGISTER<T>`.
 
-The function `tableSchemaFromCreate` (`src/core/sql.ts:882-910`) converts the
+The function `tableSchemaFromCreate` (`src/core/sql.ts:955-983`) converts the
 parsed AST into the runtime `SqlTableSchema`:
 
 ```typescript
-// src/core/sql.ts:882-910
+// src/core/sql.ts:955-983
 export function tableSchemaFromCreate(statement: CreateTableStatement): SqlTableSchema {
   const primaryKeys = statement.columns.filter((column) => column.primaryKey);
   if (primaryKeys.length !== 1) {
@@ -88,17 +152,163 @@ export function tableSchemaFromCreate(statement: CreateTableStatement): SqlTable
 }
 ```
 
-**Design decision**: Non-PK scalar columns silently become LWW. The spec
-originally considered disallowing bare scalars entirely, but the code promotes
-them. This means the schema is self-consistent: every non-PK column is always a
-proper CRDT type internally, even if declared bare.
+**Schema-as-CRDT-ops**: When a client executes `CREATE TABLE`, the client-side
+planner (`buildClientSqlExecutionPlanFromStatement`, line 1646) does not emit a
+traditional DDL plan. Instead, it calls `planCreateTableSchemaMutation`
+(line 1231), which generates LWW ops against the information schema tables:
 
-### 1.3 Schema Evolution
+```typescript
+// src/core/sql.ts:1141-1185
+function createInformationSchemaTableOps(
+  context: CrdtOpGenerationContext,
+  table: string,
+  schema: SqlTableSchema,
+): EncodedCrdtOp[] {
+  const ops: EncodedCrdtOp[] = [
+    createRowExistsOp(context, INFORMATION_SCHEMA_TABLES, table, true),
+    {
+      ...createOp(context, INFORMATION_SCHEMA_TABLES, table),
+      kind: 'cell_lww',
+      col: 'pk_column',
+      val: schema.pk,
+    },
+    {
+      ...createOp(context, INFORMATION_SCHEMA_TABLES, table),
+      kind: 'cell_lww',
+      col: 'partition_by',
+      val: schema.partitionBy ?? null,
+    },
+  ];
+  const columnNames = Object.keys(schema.columns).sort();
+  for (const name of columnNames) {
+    const key = columnId(table, name);
+    ops.push(createRowExistsOp(context, INFORMATION_SCHEMA_COLUMNS, key, true));
+    ops.push({ ...createOp(context, INFORMATION_SCHEMA_COLUMNS, key), kind: 'cell_lww', col: 'table_name', val: table });
+    ops.push({ ...createOp(context, INFORMATION_SCHEMA_COLUMNS, key), kind: 'cell_lww', col: 'column_name', val: name });
+    ops.push({ ...createOp(context, INFORMATION_SCHEMA_COLUMNS, key), kind: 'cell_lww', col: 'crdt_kind', val: schema.columns[name]!.crdt });
+  }
+  return ops;
+}
+```
 
-From `SPEC.md`: "Schema migrations" is listed as a non-goal. The only mutation
-is `DROP TABLE`, which removes the table from the schema. Segment and delta files
-for dropped tables are never cleaned up; compaction simply ignores them. There is
-no ALTER TABLE.
+A `CREATE TABLE tasks` with 6 columns therefore generates: 3 ops for
+`information_schema.tables` (row_exists + pk_column + partition_by) plus
+4 ops per column for `information_schema.columns` (row_exists + table_name +
+column_name + crdt_kind) = 3 + 6*4 = 27 CRDT ops. These ops flow through
+the standard replication pipeline, so other replicas learn the schema through
+normal sync.
+
+**Idempotent CREATE**: If the table already exists with an identical schema,
+`planCreateTableSchemaMutation` returns zero ops (line 1241-1242). If it
+conflicts (same name, different schema), an error is thrown.
+
+### 1.4 DDL: ALTER TABLE ADD COLUMN
+
+Schema evolution is supported through `ALTER TABLE ADD COLUMN`:
+
+```sql
+ALTER TABLE tasks ADD COLUMN assignee LWW<STRING>;
+```
+
+The planner (`planAlterAddColumnSchemaMutation`, line 1249) generates column-
+scoped information schema ops:
+
+```typescript
+// src/core/sql.ts:1249-1276
+function planAlterAddColumnSchemaMutation(
+  statement: AlterTableAddColumnStatement,
+  context: CrdtOpGenerationContext,
+): EncodedCrdtOp[] {
+  // ...
+  const newCrdt = columnTypeToSchema(statement.column.type);
+  const existingColumn = tableSchema.columns[statement.column.name];
+  if (existingColumn) {
+    if (existingColumn.crdt === newCrdt) {
+      return [];   // idempotent: column already exists with matching type
+    }
+    throw new Error(/* conflict */);
+  }
+  return createInformationSchemaColumnOps(context, statement.table, statement.column.name, newCrdt);
+}
+```
+
+Like `CREATE TABLE`, this generates 4 LWW ops against `information_schema.columns`.
+The schema is **append-only**: there is no `DROP COLUMN` and no way to change a
+column's CRDT type after creation.
+
+### 1.5 DDL: DROP TABLE
+
+`DROP TABLE` is supported at the eval layer (`evaluateSqlStatementMutable`,
+line 723-728) but the client-side planner explicitly rejects it:
+
+```typescript
+// src/core/sql.ts:1667-1670
+case 'drop_table':
+  throw new Error(
+    `DROP TABLE is not allowed; schema is append-only and supports CREATE TABLE + ALTER TABLE ADD COLUMN only`,
+  );
+```
+
+This means `DROP TABLE` is available for testing infrastructure but not for
+production clients. The schema is designed to grow monotonically, ensuring that
+concurrent schema evolution always converges.
+
+### 1.6 Schema Materialization from Rows
+
+When a client loads state from disk or receives replicated ops, the schema is
+reconstituted from the information schema rows:
+
+```typescript
+// src/core/sqlEval.ts:420-507
+export function materializeSchemaFromRows(rows: Map<string, RuntimeRowState>): SqlSchema {
+  const tables = new Map<string, { pk: string | null; partitionBy: string | null; columns: Record<string, { crdt: SqlColumnCrdt }> }>();
+
+  // Pass 1: read information_schema.tables rows
+  for (const row of rows.values()) {
+    if (row.table !== INFORMATION_SCHEMA_TABLES || rowIsDeleted(row)) continue;
+    // Extract pk_column and partition_by LWW values
+    // ...
+  }
+
+  // Pass 2: read information_schema.columns rows
+  for (const row of rows.values()) {
+    if (row.table !== INFORMATION_SCHEMA_COLUMNS || rowIsDeleted(row)) continue;
+    // Extract table_name, column_name, crdt_kind LWW values
+    // ...
+  }
+
+  // Assemble only tables with a valid PK column
+  const schema: SqlSchema = {};
+  for (const [tableName, entry] of tables.entries()) {
+    if (!entry.pk) continue;
+    schema[tableName] = { pk: entry.pk, partitionBy: entry.partitionBy, columns: entry.columns };
+  }
+  return schema;
+}
+```
+
+Both `NodeCrdtClient` (line 249-255) and `BrowserCrdtClient` (line 202-208)
+call `refreshSchemaFromRows()` after every write and pull, keeping the in-memory
+schema in sync with CRDT state. The schema is also persisted to `schema.bin`
+via MessagePack for fast startup.
+
+### 1.7 Effective Schema for Query Planning
+
+When planning SELECT queries, the schema is augmented with the information schema
+metadata so users can query the catalog:
+
+```typescript
+// src/core/sql.ts:1296-1301
+export function buildEffectiveSchemaForPlanning(schema: SqlSchema): SqlSchema {
+  return {
+    ...buildInformationSchemaMetadata(),
+    ...schema,
+  };
+}
+```
+
+This allows `SELECT * FROM information_schema.tables;` and
+`SELECT * FROM information_schema.columns;` to work as expected.
 
 ---
 
@@ -109,7 +319,7 @@ no ALTER TABLE.
 The in-memory representation during query execution lives in `src/core/sqlEval.ts`:
 
 ```typescript
-// src/core/sqlEval.ts:26-36
+// src/core/sqlEval.ts:29-39
 export type RuntimeColumnState =
   | { typ: 1; state: LwwRegister<SqlValue> }
   | { typ: 2; state: PnCounter }
@@ -127,7 +337,7 @@ Rows are keyed in a `Map<string, RuntimeRowState>` using a composite storage
 key:
 
 ```typescript
-// src/core/sqlEval.ts:132-134
+// src/core/sqlEval.ts:138-140
 export function rowStorageKey(table: string, key: SqlPrimaryKey): string {
   return `${table}\u001f${String(key)}`;
 }
@@ -143,7 +353,7 @@ DELETE is implemented as a tombstone. A hidden LWW register column named
 `_exists` tracks whether a row is alive:
 
 ```typescript
-// src/core/sqlEval.ts:420-437
+// src/core/sqlEval.ts:541-558
 case 'row_exists': {
   const current = row.columns.get('_exists');
   const incoming: LwwRegister<SqlValue> = {
@@ -167,7 +377,7 @@ mean the latest-timestamped existence event wins.
 Reads filter deleted rows:
 
 ```typescript
-// src/core/sqlEval.ts:549-552
+// src/core/sqlEval.ts:670-673
 const exists = row.columns.get('_exists');
 if (exists && exists.typ === 1 && exists.state.val === false) {
   continue;
@@ -180,7 +390,7 @@ For persistence and serialization, there is a parallel "eval" format that uses
 hex-encoded HLC strings rather than structured `Hlc` objects:
 
 ```typescript
-// src/core/sqlEval.ts:43-65
+// src/core/sqlEval.ts:46-63
 export type SqlEvalColumnState =
   | { typ: 1; val: SqlValue; hlc: string; site: string }
   | { typ: 2; inc: Record<string, number>; dec: Record<string, number> }
@@ -196,8 +406,8 @@ export type SqlEvalRowState = {
 ```
 
 The conversion functions `runtimeColumnStateToEval` and `evalColumnStateToRuntime`
-(`src/core/sqlEval.ts:228-311`) bridge the two representations. The eval format
-is what gets encoded to MessagePack for persistence.
+bridge the two representations. The eval format is what gets encoded to
+MessagePack for persistence.
 
 ---
 
@@ -278,7 +488,8 @@ export function applyPnCounterDelta(
 `applyPnCounterDelta` (op application) adds. This means counter ops are NOT
 idempotent. The system relies on the replicated log's seq ordering to apply each
 op exactly once. If a delta containing counter ops is replayed, the counter
-inflates.
+inflates. The atomic state bundle (section 7.2) was introduced specifically to
+prevent this scenario.
 
 **Materialization**: `pnCounterValue = sum(inc) - sum(dec)` (`src/core/crdt/pnCounter.ts:76-81`).
 
@@ -313,7 +524,7 @@ removes tombstoned elements. The sort order uses a composite key of
 
 **REMOVE semantics**: The client must observe the current add-tags for the value
 it wants to remove. The `resolveSetRemoveTagsFromRows` function
-(`src/core/sqlEval.ts:388-406`) looks up current elements matching the value and
+(`src/core/sqlEval.ts:509-527`) looks up current elements matching the value and
 returns their tags. If no tags are found (the element was never observed locally),
 REMOVE produces zero ops -- it is a no-op, not an error.
 
@@ -325,14 +536,46 @@ export type MvRegisterValue<T> = { val: T; hlc: Hlc; site: string };
 export type MvRegister<T> = { values: Array<MvRegisterValue<T>> };
 ```
 
-**Merge**: Concatenate, deduplicate by event identity `(hlc, site)`, sort:
+**Merge**: Concatenate, deduplicate by event identity `(hlc, site)`, prune
+dominated values, and sort:
 
 ```typescript
-// src/core/crdt/mvRegister.ts:84-88
-export function mergeMvRegister<T>(a: MvRegister<T>, b: MvRegister<T>): MvRegister<T> {
-  return canonicalizeMvRegister({ values: [...a.values, ...b.values] });
+// src/core/crdt/mvRegister.ts:94-100
+export function canonicalizeMvRegister<T>(state: MvRegister<T>): MvRegister<T> {
+  assertMvEventConsistency(state.values);
+  const deduped = dedupeByEvent(state.values);
+  const undominated = pruneDominatedBySameSite(deduped);
+  const values = undominated.sort((left, right) => compareKeys(entrySortKey(left), entrySortKey(right)));
+  return { values };
 }
 ```
+
+**Dominated-value pruning** (P2-2 fix): The `pruneDominatedBySameSite` function
+(`src/core/crdt/mvRegister.ts:77-92`) finds the maximum HLC for each site, then
+discards any value from that site with a lower HLC:
+
+```typescript
+// src/core/crdt/mvRegister.ts:77-92
+function pruneDominatedBySameSite<T>(values: Array<MvRegisterValue<T>>): Array<MvRegisterValue<T>> {
+  const maxBySite = new Map<string, Hlc>();
+  for (const entry of values) {
+    const currentMax = maxBySite.get(entry.site);
+    if (!currentMax || compareHlc(entry.hlc, currentMax) > 0) {
+      maxBySite.set(entry.site, entry.hlc);
+    }
+  }
+  return values.filter((entry) => {
+    const max = maxBySite.get(entry.site);
+    if (!max) return true;
+    return compareHlc(entry.hlc, max) === 0;
+  });
+}
+```
+
+This ensures only the latest value from each site survives. True conflicts --
+concurrent writes from different sites -- are preserved, while superseded writes
+from the same site are discarded. This bounds the register size to O(number of
+concurrent sites) rather than O(total writes).
 
 **Materialization**: If a single value, return it directly. If multiple, return
 an array -- the application must resolve the conflict:
@@ -347,14 +590,6 @@ case 4:
   break;
 ```
 
-**Note on pruning**: The spec mentions "discard any where another value has
-strictly higher HLC from the same site." However, the actual implementation
-(`canonicalizeMvRegister`) simply keeps ALL values after deduplication. It does
-not prune dominated values. This means the MV-Register only grows; concurrent
-writes accumulate forever. This is technically correct (keeping extra values
-never loses information), but it means the register can grow unboundedly if many
-concurrent writes happen from different sites.
-
 ---
 
 ## 4. Timestamps and Causal Ordering
@@ -364,11 +599,9 @@ concurrent writes happen from different sites.
 The HLC is a packed 64-bit bigint:
 
 ```typescript
-// src/core/hlc.ts:14-19
+// src/core/hlc.ts:58-61
 export function packHlc(hlc: Hlc): bigint {
-  if (hlc.wallMs >= WALL_MS_MAX || hlc.counter >= COUNTER_MAX) {
-    throw new Error('HLC out of bounds');
-  }
+  assertHlcInBounds(hlc);
   return (BigInt(hlc.wallMs) << 16n) | BigInt(hlc.counter);
 }
 ```
@@ -379,10 +612,110 @@ export function packHlc(hlc: Hlc): bigint {
 This gives 2^48 milliseconds (~8,900 years from epoch) for wall time and up to
 65,535 logical events within the same millisecond.
 
-### 4.2 HLC Comparison with Site Tiebreaking
+### 4.2 Functional Clock API
+
+The HLC module (`src/core/hlc.ts`) exposes a fully functional API, refactored
+from earlier class-based designs:
 
 ```typescript
-// src/core/hlc.ts:28-33
+// src/core/hlc.ts:165-188
+export type HlcClock = {
+  driftLimitMs: number;
+  nowWallMs(): number;
+  next(previous: Hlc | null): Hlc;
+  recv(local: Hlc | null, remote: Hlc): Hlc;
+};
+
+export function createHlcClock(options: {
+  nowWallMs?: () => number;
+  driftLimitMs?: number;
+} = {}): HlcClock {
+  const nowWallMs = options.nowWallMs ?? createMonotonicWallClock();
+  const driftLimitMs = normalizeDriftLimitMs(options.driftLimitMs ?? HLC_DRIFT_LIMIT_MS);
+  return {
+    driftLimitMs,
+    nowWallMs,
+    next(previous: Hlc | null): Hlc {
+      return nextMonotonicHlc(previous, nowWallMs(), driftLimitMs);
+    },
+    recv(local: Hlc | null, remote: Hlc): Hlc {
+      return recvMonotonicHlc(local, remote, nowWallMs(), driftLimitMs);
+    },
+  };
+}
+```
+
+The `HlcClock` object bundles the wall-clock source with drift limits, providing
+two operations:
+- **`next(previous)`**: Generate the next local HLC, strictly greater than
+  `previous`.
+- **`recv(local, remote)`**: Merge a remote HLC with the local clock state,
+  advancing the local clock to max(local, remote, wall) while preserving
+  monotonicity.
+
+### 4.3 Monotonic Wall Clock Synthesis
+
+Raw `Date.now()` is not monotonic (NTP adjustments, system suspend). The
+`createMonotonicWallClock` function (`src/core/hlc.ts:135-163`) synthesizes a
+monotonic source by combining `Date.now()` with `performance.now()`:
+
+```typescript
+// src/core/hlc.ts:135-163
+export function createMonotonicWallClock(input: {
+  dateNow?: () => number;
+  performance?: MonotonicPerformance | null;
+} = {}): () => number {
+  // ...
+  let offsetMs = normalizeMs(dateNow(), 'wall') - normalizeMs(performanceClock.now(), 'monotonic');
+  let last = 0;
+  return () => {
+    const monotonicNow = normalizeMs(performanceClock.now(), 'monotonic');
+    const wallNow = normalizeMs(dateNow(), 'wall');
+    const monotonicWallNow = offsetMs + monotonicNow;
+    if (wallNow > monotonicWallNow) {
+      offsetMs = wallNow - monotonicNow;
+    }
+    last = Math.max(last, offsetMs + monotonicNow, wallNow);
+    return last;
+  };
+}
+```
+
+The design: anchor `performance.now()` (monotonic but relative) to `Date.now()`
+(absolute but potentially non-monotonic). If `Date.now()` jumps forward
+(NTP correction), re-anchor. The `last` variable ensures strict monotonicity.
+
+### 4.4 Drift Rejection
+
+Remote HLCs are validated against a configurable drift limit (default: 60
+seconds):
+
+```typescript
+// src/core/hlc.ts:77-90
+export function assertHlcDrift(
+  hlc: Hlc,
+  nowMs: number,
+  driftLimitMs: number = HLC_DRIFT_LIMIT_MS,
+): void {
+  const now = normalizeMs(nowMs, 'wall');
+  const driftLimit = normalizeDriftLimitMs(driftLimitMs);
+  assertHlcInBounds(hlc);
+  if (hlc.wallMs > now + driftLimit) {
+    throw new Error(
+      `HLC drift violation: wall clock ${hlc.wallMs}ms exceeds local wall clock ${now}ms by more than ${driftLimit}ms`,
+    );
+  }
+}
+```
+
+Both `nextMonotonicHlc` (line 92) and `recvMonotonicHlc` (line 110) call
+`assertHlcDrift`, ensuring that a compromised or misconfigured replica cannot
+push the global clock arbitrarily far into the future.
+
+### 4.5 HLC Comparison with Site Tiebreaking
+
+```typescript
+// src/core/hlc.ts:70-75
 export function compareWithSite(a: Hlc, aSite: string, b: Hlc, bSite: string): number {
   const hlcCmp = compareHlc(a, b);
   if (hlcCmp !== 0) return hlcCmp;
@@ -395,36 +728,32 @@ The total order is: **(wallMs, counter, siteId)** with lexicographic site
 comparison. Since site IDs are UUIDv4 hex strings (32 chars), the comparison
 is deterministic across all replicas.
 
-### 4.3 HLC Monotonicity Enforcement
+### 4.6 Persisted HLC Fence
 
-The `PersistedHlcFence` class (`src/core/hlc.ts:41-64`) enforces that each new
-local HLC is strictly greater than the previous. Both `NodeCrdtClient` and
-`BrowserCrdtClient` use `nextMonotonicHlc`:
+The `PersistedHlcFence` class (`src/core/hlc.ts:196-219`) provides strict
+monotonicity enforcement across process restarts:
 
 ```typescript
-// src/platform/node/nodeClient.ts:54-61
-function nextMonotonicHlc(previous: Hlc | null, nowMs: number): Hlc {
-  const wallMs = previous === null ? nowMs : Math.max(nowMs, previous.wallMs);
-  const counter = previous !== null && wallMs === previous.wallMs ? previous.counter + 1 : 0;
-  if (wallMs >= HLC_LIMITS.wallMsMax || counter >= HLC_LIMITS.counterMax) {
-    throw new Error('unable to allocate monotonic HLC within bounds');
-  }
-  return { wallMs, counter };
+// src/core/hlc.ts:196-219
+export class PersistedHlcFence {
+  private highWater: Hlc | null;
+
+  constructor(initial: Hlc | null = null) { this.highWater = initial; }
+
+  loadPersisted(highWater: Hlc | null): void { this.highWater = highWater; }
+  assertNext(candidate: Hlc): void { assertHlcStrictlyIncreases(this.highWater, candidate); }
+  commit(candidate: Hlc): void { this.assertNext(candidate); this.highWater = candidate; }
+  snapshot(): Hlc | null { return this.highWater; }
 }
 ```
 
-The Node client persists `lastLocalHlc` to disk in `state.bin`, so it survives
-restarts. The browser client does NOT persist it (it is in-memory only), which
-means a page refresh could regress the counter if writes happen within the same
-millisecond -- a potential correctness gap noted in the spec.
-
-### 4.4 HLC Hex Encoding
+### 4.7 HLC Hex Encoding
 
 Because MessagePack's integer type is signed 64-bit and cannot represent the
 full HLC range unambiguously across languages, HLCs are stored as hex strings:
 
 ```typescript
-// src/core/sqlEval.ts:136-146
+// src/core/sqlEval.ts:142-152
 export function encodeHlcHex(hlc: Hlc): string {
   return `0x${packHlc(hlc).toString(16)}`;
 }
@@ -446,7 +775,7 @@ export function decodeHlcHex(encoded: string): Hlc {
 Every SQL write produces one or more `EncodedCrdtOp` values:
 
 ```typescript
-// src/core/sql.ts:141-190
+// src/core/sql.ts:148-197
 type BaseCrdtOp = { tbl: string; key: SqlPrimaryKey; hlc: string; site: string };
 
 export type RowExistsOp = BaseCrdtOp & { kind: 'row_exists'; exists: boolean };
@@ -463,7 +792,7 @@ self-describing.
 
 ### 5.2 SQL-to-Ops Compilation
 
-The `generateCrdtOps` function (`src/core/sql.ts:1225-1253`) dispatches by
+The `generateCrdtOps` function (`src/core/sql.ts:1534-1563`) dispatches by
 statement kind. Every write statement first emits a `row_exists` op, then
 per-column ops:
 
@@ -476,6 +805,8 @@ per-column ops:
 | `ADD v TO t.c WHERE pk = k` | `row_exists(true)`, `cell_or_set_add(val=v)` |
 | `REMOVE v FROM t.c WHERE pk = k` | If tags found: `row_exists(true)`, `cell_or_set_remove(tags=...)`. If no tags: zero ops (no-op). |
 | `DELETE FROM t WHERE pk = k` | `row_exists(false)` only |
+| `CREATE TABLE t (...)` | LWW ops against `information_schema.tables` and `information_schema.columns` |
+| `ALTER TABLE t ADD COLUMN c TYPE` | LWW ops against `information_schema.columns` |
 
 **Each column op gets a fresh HLC** via `context.nextHlc()`. So an INSERT
 touching 5 columns produces 6 HLC ticks (one for row_exists, five for columns).
@@ -492,9 +823,33 @@ This is a deliberate design choice. No INSERT-or-error behavior exists.
 ### 5.4 UPDATE Cannot Target Counters or Sets
 
 The SQL compiler rejects `UPDATE tasks SET points = 5 WHERE ...` if `points` is
-a counter (`src/core/sql.ts:1083`). You must use `INC`/`DEC`. Similarly, sets
+a counter (`src/core/sql.ts:1392`). You must use `INC`/`DEC`. Similarly, sets
 require `ADD`/`REMOVE`. This prevents accidentally generating a non-CRDT
 read-modify-write.
+
+### 5.5 Information Schema Write Protection
+
+Direct user writes to information schema tables are blocked:
+
+```typescript
+// src/core/sql.ts:1100-1109
+function isInformationSchemaTable(table: string): boolean {
+  return table.startsWith('information_schema.');
+}
+
+function assertUserTableWrite(table: string, statementKind: SqlStatement['kind']): void {
+  if (isInformationSchemaTable(table)) {
+    throw new Error(
+      `${statementKind.toUpperCase()} cannot target '${table}'; information_schema is append-only metadata`,
+    );
+  }
+}
+```
+
+Only the schema mutation planner (`planCreateTableSchemaMutation`,
+`planAlterAddColumnSchemaMutation`) can generate ops targeting the information
+schema. This ensures schema integrity while allowing the metadata to replicate
+as normal CRDT state.
 
 ---
 
@@ -502,7 +857,7 @@ read-modify-write.
 
 ### 6.1 Applying Ops to In-Memory State
 
-The central function `applyCrdtOpToRows` (`src/core/sqlEval.ts:408-533`) applies
+The central function `applyCrdtOpToRows` (`src/core/sqlEval.ts:529-654`) applies
 a single op to the in-memory row map. It:
 
 1. Looks up the row by `rowStorageKey(op.tbl, op.key)`, creating one if absent.
@@ -519,8 +874,8 @@ a single op to the in-memory row map. It:
 
 ### 6.2 Materialization
 
-`materializeRow` (`src/core/sqlEval.ts:351-386`) converts CRDT state to plain
-JavaScript values for query results:
+`materializeRow` converts CRDT state to plain JavaScript values for query
+results:
 
 | CRDT Type | Materialized As |
 |---|---|
@@ -554,58 +909,103 @@ export function decodeBin<T>(bytes: Uint8Array): T {
 **Design tradeoff**: ~10-20% size overhead vs a custom binary format, but every
 file is dumpable as JSON for debugging.
 
-### 7.2 Node Client Local Files
+### 7.2 Node Client Atomic State Bundle
 
-The `NodeCrdtClient` (`src/platform/node/nodeClient.ts`) persists four files in
-its `dataDir`:
-
-| File | Type | Contents |
-|---|---|---|
-| `schema.bin` | MessagePack `SqlSchema` | Table definitions |
-| `state.bin` | MessagePack `StateFile` | All row CRDT state + last local HLC |
-| `pending.bin` | MessagePack `PendingFile` | Ops not yet pushed to replicated log |
-| `sync.bin` | MessagePack `SyncFileV2` | Per-site sync cursor (`seq` + `hlc`) |
-
-The state file format:
+The `NodeCrdtClient` (`src/platform/node/nodeClient.ts`) uses an atomic state
+bundle for crash-safe persistence:
 
 ```typescript
-// src/platform/node/nodeClient.ts:28-32
-type StateFile = {
+// src/platform/node/nodeClient.ts:56-61
+type AtomicStateBundleFile = {
   v: 1;
-  rows: SqlEvalRowState[];
-  lastLocalHlc: string | null;
+  state: StateFile;
+  pending: PendingFile;
+  sync: SyncFileV2;
 };
 ```
 
-**Every write persists immediately** -- `persistStateFiles()` is called after
-every `exec()` and after every `push()`/`pull()` cycle. This writes all three
-files (`state.bin`, `pending.bin`, `sync.bin`) in parallel:
+All state is committed in a single atomic write:
 
 ```typescript
-// src/platform/node/nodeClient.ts:301-331
+// src/platform/node/nodeClient.ts:310-351
 private async persistStateFiles(): Promise<void> {
-  // ...
+  const stateFile: StateFile = { v: 1, rows: runtimeRowsToEval(this.rows), lastLocalHlc: ... };
+  const pendingFile: PendingFile = { v: 1, pendingOps: this.pendingOps };
+  const syncFile: SyncFileV2 = { v: 2, syncedBySite: ... };
+
+  const atomicBundle: AtomicStateBundleFile = {
+    v: 1,
+    state: stateFile,
+    pending: pendingFile,
+    sync: syncFile,
+  };
+
+  // Commit the authoritative local state as one atomically-renamed bundle.
+  await this.writeFileAtomically(this.atomicStateBundlePath, encodeBin(atomicBundle));
+
+  // Legacy split files remain for backwards compatibility and tooling.
   await Promise.all([
-    writeFile(this.statePath, encodeBin(stateFile)),
-    writeFile(this.pendingPath, encodeBin(pendingFile)),
-    writeFile(this.syncPath, encodeBin(syncFile)),
+    this.writeFileAtomically(this.schemaPath, encodeBin(this.schema)),
+    this.writeFileAtomically(this.statePath, encodeBin(stateFile)),
+    this.writeFileAtomically(this.pendingPath, encodeBin(pendingFile)),
+    this.writeFileAtomically(this.syncPath, encodeBin(syncFile)),
   ]);
 }
 ```
 
-**Note**: There is no atomic transaction across these three files. A crash
-between writing `state.bin` and `pending.bin` could leave them inconsistent.
-However, since CRDT merges are idempotent (for LWW, OR-Set, MV-Register) or
-append-only (for counters), the worst case is replaying a counter op, which would
-inflate the counter. The spec acknowledges this as a known trade-off for the
-learning project.
+The `writeFileAtomically` method uses the temp-file + rename pattern:
+
+```typescript
+// src/platform/node/nodeClient.ts:367-377
+private async writeFileAtomically(path: string, bytes: Uint8Array): Promise<void> {
+  const tempPath = `${path}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(tempPath, bytes);
+  try {
+    await rename(tempPath, path);
+  } catch (error) {
+    await rm(tempPath, { force: true });
+    throw error;
+  }
+}
+```
+
+On POSIX systems, `rename(2)` is atomic: the target file is either the old
+version or the new version, never a partial write. The unique temp path
+(`pid + timestamp + random`) prevents collisions between concurrent processes.
+
+**Why this matters**: Before this fix (P0-1/P0-2), the three files
+(`state.bin`, `pending.bin`, `sync.bin`) were written with `Promise.all`. A
+crash between writes could leave `state.bin` updated but `sync.bin` stale,
+causing PN-counter ops to be replayed on restart and silently inflating counter
+values. The atomic bundle ensures all three pieces of state are consistent:
+either the entire new state is visible, or the entire old state is.
+
+On startup, the client prefers the atomic bundle over legacy split files:
+
+```typescript
+// src/platform/node/nodeClient.ts:272-274
+const state = atomicBundle?.state ?? legacyState;
+const pending = atomicBundle?.pending ?? legacyPending;
+const sync = atomicBundle?.sync ?? legacySync;
+```
+
+Local files layout:
+
+| File | Type | Contents |
+|---|---|---|
+| `state_bundle.bin` | MessagePack `AtomicStateBundleFile` | All state, pending ops, sync cursors (authoritative) |
+| `schema.bin` | MessagePack `SqlSchema` | Table definitions (also materialized from info schema rows) |
+| `state.bin` | MessagePack `StateFile` | All row CRDT state + last local HLC (legacy) |
+| `pending.bin` | MessagePack `PendingFile` | Ops not yet pushed to replicated log (legacy) |
+| `sync.bin` | MessagePack `SyncFileV2` | Per-site sync cursor (legacy) |
 
 ### 7.3 Sync Cursor Persistence
 
 The sync file tracks how far each site has been replicated:
 
 ```typescript
-// src/platform/node/nodeClient.ts:38-47
+// src/platform/node/nodeClient.ts:40-49
 type SyncFileV2 = {
   v: 2;
   syncedBySite: Record<string, {
@@ -620,7 +1020,7 @@ re-reads the entry at the cursor position and compares its HLC against the
 stored one. A mismatch indicates the remote log was reset or rewritten:
 
 ```typescript
-// src/platform/node/nodeClient.ts:201-206
+// src/platform/node/nodeClient.ts:191-196
 const expectedHlc = this.syncedHlcBySite.get(siteId);
 if (expectedHlc !== undefined && atCursor.hlc !== expectedHlc) {
   throw new Error(
@@ -631,9 +1031,104 @@ if (expectedHlc !== undefined && atCursor.hlc !== expectedHlc) {
 
 ---
 
-## 8. Replicated Log
+## 8. Browser Client
 
-### 8.1 The Interface
+The `BrowserCrdtClient` (`src/platform/browser/browserClient.ts`) is a lighter
+variant of the Node client, optimized for in-browser use:
+
+- **In-memory state**: Row state, pending ops, and sync cursors are held in
+  memory only. A page refresh loses them.
+- **HLC persistence via localStorage** (P1-1 fix): The local HLC high-water
+  mark IS persisted, preventing clock regression across page reloads.
+- **Snapshot store integration**: Supports segment hydration from the
+  `SnapshotStore` interface, identical to the Node client.
+
+### 8.1 HLC Persistence
+
+```typescript
+// src/platform/browser/browserClient.ts:31-34
+export type BrowserHlcStorage = {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+};
+```
+
+The storage is keyed per site ID:
+
+```typescript
+// src/platform/browser/browserClient.ts:36-37
+const BROWSER_HLC_KEY_PREFIX = 'crdtbase.browser.hlc.';
+```
+
+At construction time, the client resolves localStorage (or a provided override):
+
+```typescript
+// src/platform/browser/browserClient.ts:38-45
+function resolveDefaultBrowserHlcStorage(): BrowserHlcStorage | null {
+  try {
+    const storage = (globalThis as { localStorage?: BrowserHlcStorage }).localStorage;
+    return storage ?? null;
+  } catch {
+    return null;
+  }
+}
+```
+
+Every local HLC tick persists immediately:
+
+```typescript
+// src/platform/browser/browserClient.ts:194-199
+private nextLocalHlcHex(): string {
+  const next = this.hlcClock.next(this.lastLocalHlc);
+  this.lastLocalHlc = next;
+  const encoded = encodeHlcHex(next);
+  this.persistLocalHlc(encoded);
+  return encoded;
+}
+```
+
+And on `open()`, the persisted value is restored:
+
+```typescript
+// src/platform/browser/browserClient.ts:256-265
+private loadPersistedLocalHlc(): void {
+  if (!this.storage) return;
+  const encoded = this.storage.getItem(this.hlcStorageKey);
+  if (!encoded) return;
+  this.lastLocalHlc = decodeHlcHex(encoded);
+}
+```
+
+This prevents the critical scenario where a page refresh within the same
+millisecond could reuse an `(wallMs, counter)` pair, violating the HLC strict
+monotonicity invariant and potentially producing conflicting events that cause
+`assertLwwEventConsistency` to throw on other replicas.
+
+### 8.2 Snapshot Coverage Gate
+
+Both Node and Browser clients implement the `manifestCoversKnownSites` check:
+
+```typescript
+// src/platform/browser/browserClient.ts:321-330
+private manifestCoversKnownSites(manifest: ManifestFile): boolean {
+  for (const [siteId, seq] of this.syncedSeqBySite.entries()) {
+    if (seq <= 0) continue;
+    if (!(siteId in manifest.sites_compacted)) return false;
+  }
+  return true;
+}
+```
+
+This is called before applying a new snapshot manifest. If the manifest does not
+include compaction watermarks for all sites the client has previously synced
+with, the manifest is rejected. Without this gate, switching to a partial
+snapshot could cause rows to be dropped and required log replay to be skipped.
+
+---
+
+## 9. Replicated Log
+
+### 9.1 The Interface
 
 ```typescript
 // src/core/replication.ts:1-19
@@ -657,7 +1152,7 @@ export interface ReplicatedLog {
 **Key invariant**: `seq` is monotonically increasing per site. `append()`
 assigns the next seq. `readSince()` returns entries with `seq > since`.
 
-### 8.2 Contiguous Prefix Safety
+### 9.2 Contiguous Prefix Safety
 
 The `takeContiguousEntriesSince` function (`src/core/replication.ts:28-46`)
 protects against cursor skips under eventually consistent storage (S3):
@@ -683,7 +1178,7 @@ export function takeContiguousEntriesSince(
 If the listing returns seqs `[3, 5]` (missing 4), only seq 3 is returned. This
 prevents the cursor from advancing past a gap, which would permanently skip ops.
 
-### 8.3 HTTP Server Implementation
+### 9.3 HTTP Server Implementation
 
 The `FileReplicatedLogServer` (`src/backend/fileLogServer.ts`) stores log entries
 as individual files on the filesystem:
@@ -695,30 +1190,7 @@ as individual files on the filesystem:
 {rootDir}/snapshots/{segments}/...       -- segment files
 ```
 
-**Routes**:
-
-| Method | Path | Description |
-|---|---|---|
-| `POST` | `/logs/:siteId` | Append entry, assigns next seq, writes to disk |
-| `GET` | `/logs/:siteId?since=N` | Read entries with seq > N |
-| `GET` | `/logs` | List all site IDs |
-| `GET` | `/logs/:siteId/head` | Latest seq for a site |
-| `GET` | `/manifest` | Get manifest bytes (404 if none) |
-| `PUT` | `/manifest?expect_version=N` | CAS-conditional manifest write (412 on mismatch) |
-| `GET` | `/schema` | Get schema bytes |
-| `PUT` | `/schema` | Upload schema |
-| `GET` | `/segments/:path` | Get segment file |
-| `PUT` | `/segments/:path` | Upload segment file |
-
-The `append` handler (`src/backend/fileLogServer.ts:271-298`) does: read current
-head from disk, compute `seq = head + 1`, write file. No locking -- concurrent
-appends from the same site could race, though in practice each site is a single
-process.
-
-Request bodies for log operations are JSON (not MessagePack). Manifest and
-segment bodies are raw binary (MessagePack-encoded).
-
-### 8.4 S3 Implementation
+### 9.4 S3 Implementation
 
 The `S3ReplicatedLog` (`src/backend/s3ReplicatedLog.ts`) maps the log interface
 onto S3 objects:
@@ -728,54 +1200,13 @@ deltas/{siteId}/{seq:010}.delta.bin
 ```
 
 Append uses `IfNoneMatch: '*'` for optimistic concurrency -- if the object
-already exists (another process appended first), it retries up to 5 times:
-
-```typescript
-// src/backend/s3ReplicatedLog.ts:104-133
-async append(entry: AppendLogEntry): Promise<LogPosition> {
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    const head = await this.getHead(entry.siteId);
-    const nextSeq = head + 1;
-    try {
-      await this.client.send(new PutObjectCommand({
-        Bucket: this.bucket,
-        Key: objectKey,
-        Body: encodeBin({ siteId, hlc, seq: nextSeq, ops } satisfies LogEntry),
-        IfNoneMatch: '*',
-      }));
-      return nextSeq;
-    } catch (error) {
-      if (isRetryableAppendError(error)) continue;
-      throw error;
-    }
-  }
-}
-```
-
-The `TigrisReplicatedLog` (`src/backend/tigrisReplicatedLog.ts`) is a thin
-wrapper that configures the S3 client with Tigris credentials:
-
-```typescript
-// src/backend/tigrisReplicatedLog.ts:12-26
-export function createTigrisReplicatedLog(options: TigrisReplicatedLogOptions): S3ReplicatedLog {
-  return new S3ReplicatedLog({
-    bucket: options.bucket,
-    prefix: options.prefix ?? 'deltas',
-    clientConfig: {
-      endpoint: options.endpoint,
-      region: options.region ?? 'auto',
-      forcePathStyle: false,
-      credentials: { accessKeyId: ..., secretAccessKey: ... },
-    },
-  });
-}
-```
+already exists (another process appended first), it retries up to 5 times.
 
 ---
 
-## 9. Snapshot Store and Compaction
+## 10. Snapshot Store and Compaction
 
-### 9.1 The SnapshotStore Interface
+### 10.1 The SnapshotStore Interface
 
 ```typescript
 // src/core/snapshotStore.ts:7-14
@@ -793,13 +1224,13 @@ export interface SnapshotStore {
 `expectedVersion`. If the current manifest version does not match, the write
 fails.
 
-### 9.2 Segment Files
+### 10.2 Segment Files
 
 A segment contains the merged CRDT state for a set of rows in one table
 partition:
 
 ```typescript
-// src/core/compaction.ts:13-27
+// src/core/compaction.ts:19-28
 export type SegmentFile = {
   v: 1;
   table: string;
@@ -810,17 +1241,12 @@ export type SegmentFile = {
   bloom_k: number;
   rows: SegmentRow[];
 };
-
-export type SegmentRow = {
-  key: SqlPrimaryKey;
-  cols: Record<string, SqlEvalColumnState>;
-};
 ```
 
 Rows are sorted by primary key. The bloom filter enables fast point lookups:
 
 ```typescript
-// src/core/compaction.ts:179-224
+// src/core/compaction.ts:199-225
 export function buildBloomFilter(
   keys: SqlPrimaryKey[], bitsPerElement = 10,
 ): { bloom: Uint8Array; bloomK: number } {
@@ -831,17 +1257,10 @@ export function buildBloomFilter(
 
 **File naming**: `segments/{table}_{partition}_{hlcMax8}.seg.bin`
 
-```typescript
-// src/core/compaction.ts:313-315
-export function defaultSegmentPath(table: string, partition: string, hlcMax: string): string {
-  return `segments/${sanitizePathToken(table)}_${sanitizePathToken(partition)}_${compactionHlcSuffix(hlcMax)}.seg.bin`;
-}
-```
-
-### 9.3 Manifest File
+### 10.3 Manifest File
 
 ```typescript
-// src/core/compaction.ts:29-46
+// src/core/compaction.ts:41-47
 export type ManifestFile = {
   v: 1;
   version: number;                        // monotonic, incremented on compaction
@@ -849,49 +1268,102 @@ export type ManifestFile = {
   segments: ManifestSegmentRef[];
   sites_compacted: Record<string, number>; // siteId -> last compacted seq
 };
+```
 
-export type ManifestSegmentRef = {
-  path: string;
-  table: string;
-  partition: string;
-  row_count: number;
-  size_bytes: number;
-  hlc_max: string;
-  key_min: SqlPrimaryKey;
-  key_max: SqlPrimaryKey;
+### 10.4 Compaction Retention Policy
+
+Compaction now applies a configurable retention policy to prune expired
+tombstones:
+
+```typescript
+// src/core/compaction.ts:54-61
+export const DEFAULT_OR_SET_TOMBSTONE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+export const DEFAULT_ROW_TOMBSTONE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+export type CompactionRetentionPolicy = {
+  nowMs: number;
+  orSetTombstoneTtlMs: number;
+  rowTombstoneTtlMs: number;
 };
 ```
 
-### 9.4 Compaction Process
+The `pruneRuntimeRowsForCompaction` function (`src/core/compaction.ts:423-464`)
+applies two pruning passes:
 
-The compactor (`src/platform/node/compactor.ts:56-131`):
+**Row tombstone pruning**: If a row's `_exists` LWW register is `false` and its
+HLC wall clock is older than the row tombstone cutoff, the entire row is deleted
+from the in-memory map:
+
+```typescript
+// src/core/compaction.ts:434-443
+const exists = row.columns.get('_exists');
+if (
+  exists?.typ === 1 &&
+  exists.state.val === false &&
+  isHlcExpired(exists.state.hlc.wallMs, rowCutoffMs)
+) {
+  rows.delete(storageKey);
+  continue;
+}
+```
+
+**OR-Set tombstone pruning**: For each OR-Set column, tombstones whose HLC is
+older than the OR-Set tombstone cutoff are filtered out, and the set is
+re-canonicalized:
+
+```typescript
+// src/core/compaction.ts:445-463
+for (const [column, state] of row.columns.entries()) {
+  if (state.typ !== 3) continue;
+  const retainedTombstones = state.state.tombstones.filter(
+    (tag) => !isHlcExpired(tag.addHlc.wallMs, orSetCutoffMs),
+  );
+  if (retainedTombstones.length === state.state.tombstones.length) continue;
+  row.columns.set(column, {
+    typ: 3,
+    state: canonicalizeOrSet({
+      elements: state.state.elements,
+      tombstones: retainedTombstones,
+    }),
+  });
+}
+```
+
+**Default TTL**: 7 days for both OR-Set tombstones and row tombstones. This
+balances storage growth against the risk that a long-offline replica might miss
+a tombstone and re-introduce a deleted element. A 7-day window is chosen to
+cover typical offline periods.
+
+### 10.5 Compaction Process
+
+The compactor (`src/platform/node/compactor.ts`):
 
 1. Reads the current manifest (or creates an empty one).
 2. Loads all existing segment files into a merged in-memory row map.
 3. For each site, reads log entries since the last compacted seq.
 4. Applies all new ops to the merged row map.
-5. Re-partitions rows by table and partition key.
-6. Builds new segment files (sorted rows, bloom filter, hlc_max).
-7. Writes segments to the snapshot store.
-8. Builds a new manifest with `version = old + 1`.
-9. CAS-writes the manifest. If CAS fails, discards work (orphaned segments are
+5. Applies the retention policy (prune expired tombstones).
+6. Re-partitions rows by table and partition key.
+7. Builds new segment files (sorted rows, bloom filter, hlc_max).
+8. Writes segments to the snapshot store.
+9. Builds a new manifest with `version = old + 1`.
+10. CAS-writes the manifest. If CAS fails, discards work (orphaned segments are
    harmless).
 
-```typescript
-// src/platform/node/compactor.ts:113-114
-const applied = await options.snapshots.putManifest(nextManifest, priorManifest.version);
-```
+### 10.6 Client Segment Hydration
 
-### 9.5 Client Segment Hydration
-
-When `NodeCrdtClient.pull()` runs, it checks for a newer manifest:
+When `NodeCrdtClient.pull()` or `BrowserCrdtClient.pull()` runs, it checks for
+a newer manifest:
 
 ```typescript
-// src/platform/node/nodeClient.ts:346-393
+// src/platform/node/nodeClient.ts:379-432
 private async refreshFromSnapshotManifest(): Promise<void> {
-  // ...
+  if (!this.snapshots) return;
   const manifest = await this.snapshots.getManifest();
   if (manifest === null || manifest.version <= this.localSnapshotManifestVersion) return;
+  if (!this.manifestCoversKnownSites(manifest)) return;  // coverage gate
+
+  const rows = new Map<string, RuntimeRowState>();
   // Download all segments, merge into fresh row map
   // Re-apply pending (unpushed) ops for read-your-writes
   // Reset sync cursors to compaction watermarks
@@ -901,38 +1373,6 @@ private async refreshFromSnapshotManifest(): Promise<void> {
 The critical step is resetting sync cursors to `manifest.sites_compacted` so
 that uncompacted deltas (those with seq > compacted) are replayed. Compacted
 deltas are already incorporated in the segments.
-
----
-
-## 10. The Tigris S3 Snapshot Store
-
-The `TigrisSnapshotStore` (`src/backend/tigrisSnapshotStore.ts`) implements CAS
-using S3 ETags:
-
-```typescript
-// src/backend/tigrisSnapshotStore.ts:132-175
-async putManifest(manifest: ManifestFile, expectedVersion: number): Promise<boolean> {
-  const current = await this.readObject(manifestKey);
-  // ...
-  if (current === null) {
-    putInput.IfNoneMatch = '*';   // object must not exist
-  } else if (currentEtag !== null) {
-    putInput.IfMatch = currentEtag; // object must match this ETag
-  }
-  try {
-    await this.client.send(new PutObjectCommand(putInput));
-    return true;
-  } catch (error) {
-    if (isCasConflictError(error)) return false;
-    throw error;
-  }
-}
-```
-
-This provides compare-and-swap semantics even on eventually consistent S3 by
-routing through Tigris's global leader (via `X-Tigris-Consistent: true` headers
-as documented in the spec, though the actual header is not in the code -- the
-ETag-based CAS provides the necessary serialization).
 
 ---
 
@@ -963,23 +1403,32 @@ abbrev TableState (kappa alpha beta gamma Hlc : Type) := kappa -> TableRowState 
 
 From `lean/CrdtBase/Crdt/Table/Props.lean`:
 
-- **Table merge commutativity**: If row merge is commutative, table merge is
-  commutative (`table_merge_comm_of_row_comm`).
-- **Table merge associativity**: If row merge is associative, table merge is
-  associative (`table_merge_assoc_of_row_assoc`).
-- **Table merge idempotence**: If row merge is idempotent, table merge is
-  idempotent (`table_merge_idem_of_row_idem`).
+- **Table merge commutativity**: `mergeTable_comm_of_valid` -- table merge is
+  commutative under event consistency.
+- **Table merge associativity**: `mergeTable_assoc_of_valid` -- table merge is
+  associative under event consistency.
+- **Table merge idempotence**: `mergeTable_idem_of_valid` -- table merge is
+  idempotent under event consistency.
+- **Row-level semilattice**: `mergeTableRow_comm_of_valid`,
+  `mergeTableRow_assoc_of_valid`, `mergeTableRow_idem_of_valid` -- proven
+  directly under `ValidTableRowPair`/`Triple` predicates (P1-2 fix).
 - **Visibility preservation**: Counter, set, and register updates do not change
   row visibility (`apply_counter_preserves_visibility`,
   `apply_set_preserves_visibility`, `apply_register_preserves_visibility`).
 - **Cross-column commutativity**: Row-existence updates commute with counter
-  updates, set updates. Counter and register updates commute
-  (`row_exists_counter_commute`, `row_exists_set_commute`,
-  `row_counter_register_commute`).
+  updates, set updates. Counter and register updates commute.
 - **Disjoint-key commutativity**: Updates at different keys commute at the
   whole-table level (`modify_row_at_disjoint_commute`).
 
-### 11.3 Convergence Framework
+### 11.3 OR-Set Idempotence Chain
+
+From `lean/CrdtBase/Crdt/OrSet/Props.lean` (P1-3 fix):
+
+- **`or_set_merge_canonicalized`**: Merge output is always in canonical form.
+- **`or_set_merge_idem_general`**: Composed precondition-free idempotence
+  from canonicalization.
+
+### 11.4 Convergence Framework
 
 ```lean
 -- lean/CrdtBase/Convergence/Defs.lean:10-16
@@ -994,7 +1443,7 @@ This sets up the framework for proving strong eventual consistency: if two
 replicas receive the same set of operations (in any order), they converge to the
 same state.
 
-### 11.4 SQL Compilation Verification
+### 11.5 SQL Compilation Verification
 
 The Lean oracle (`lean/CrdtBase/Sql/Defs.lean`) independently implements
 `generateCrdtOps` and `buildSelectPlan`. Differential random testing (DRT)
@@ -1007,24 +1456,9 @@ Lean version validates:
 
 ---
 
-## 12. Browser Client
+## 12. Correctness Analysis
 
-The `BrowserCrdtClient` (`src/platform/browser/browserClient.ts`) is a simpler
-variant of the Node client:
-
-- No local file persistence (all state is in-memory).
-- No snapshot store integration (no segment hydration).
-- Same push/pull sync protocol via the `ReplicatedLog` interface.
-- Same SQL parsing, op generation, and CRDT merge logic.
-
-This means browser state is lost on page refresh. The spec notes OPFS
-(`OpfsStorageAdapter`) as a planned but not-yet-implemented persistence layer.
-
----
-
-## 13. Correctness Analysis
-
-### 13.1 What Makes the Model Correct
+### 12.1 What Makes the Model Correct
 
 1. **Total order on events**: `(hlc, site)` provides a total order on all write
    events across all replicas. LWW merge uses this order deterministically.
@@ -1045,39 +1479,82 @@ This means browser state is lost on page refresh. The spec notes OPFS
    application by tracking per-site seq cursors and advancing them only on
    contiguous entries.
 
-6. **CAS on manifest**: The single point of coordination. Compaction is
+6. **Atomic local persistence**: The atomic state bundle ensures that counter
+   state, pending ops, and sync cursors are always consistent after a crash.
+
+7. **CAS on manifest**: The single point of coordination. Compaction is
    optimistic: compute new state, try to CAS the manifest. If another compaction
    ran concurrently, lose and retry.
 
-### 13.2 Potential Gaps
+8. **Schema as CRDT state**: Schema metadata flows through the same replication
+   pipeline as data, ensuring all replicas converge to the same schema without
+   requiring separate coordination.
 
-1. **MV-Register never prunes**: The implementation keeps all values forever.
-   The spec says to "discard any where another value has strictly higher HLC from
-   the same site," but `canonicalizeMvRegister` only deduplicates by event
-   identity. Over time, an MV-Register column with many concurrent writes would
-   accumulate unbounded values.
+9. **Snapshot coverage gate**: Clients reject manifests that do not cover all
+   known sites, preventing partial snapshots from causing data loss.
 
-2. **No atomic local persistence**: The three local files (`state.bin`,
-   `pending.bin`, `sync.bin`) are written in parallel with `Promise.all`. A crash
-   between writes could leave them inconsistent. The impact is bounded by CRDT
-   properties (duplicate op application is safe for all types except counters).
+### 12.2 P0 Issues (All FIXED)
 
-3. **Browser client HLC persistence**: The browser client does not persist
-   `lastLocalHlc`. A refresh within the same millisecond could reuse a counter
-   value, violating the HLC strict monotonicity invariant.
+**P0-1: PN-Counter double-application on crash recovery** -- FIXED. The
+`NodeCrdtClient` now commits all local state via an atomic `state_bundle.bin`
+write (temp-file + `rename`). Startup prefers the atomic bundle over legacy
+split files. Counter ops can no longer be replayed due to stale sync cursors.
 
-4. **No tombstone TTL**: The spec mentions "compaction retains tombstones until a
-   configurable TTL (default: 7 days), after which they are dropped." The current
-   compaction code does not implement this TTL -- tombstoned rows and OR-Set
-   tombstones accumulate forever.
+**P0-2: Non-atomic local persistence** -- FIXED. The `writeFileAtomically`
+method uses the temp-file + `rename(2)` pattern, which is atomic on POSIX
+filesystems. The atomic bundle ensures cross-file consistency.
 
-5. **Non-atomic `putManifest` on filesystem**: `FsSnapshotStore.putManifest`
-   does a read-then-write (not atomic rename). Two concurrent compactors could
-   race. The spec notes this is acceptable for the learning project scope.
+**P0-3: FsSnapshotStore CAS not truly atomic** -- FIXED. `FsSnapshotStore.putManifest`
+now uses a filesystem lock (`manifest.bin.lock`) to serialize concurrent CAS
+writers, and manifest writes use temp-file + atomic `rename`.
+
+### 12.3 P1 Issues (All FIXED)
+
+**P1-1: Browser client does not persist HLC high-water mark** -- FIXED.
+`BrowserCrdtClient` now persists a per-site local HLC high-water mark via
+`localStorage` (overridable via `BrowserCrdtClientOptions.storage`), restoring
+it at `open()` time.
+
+**P1-2: Composite row semilattice not directly proved** -- FIXED. Added
+`ValidTableRowPair`/`Triple` predicates and proved `mergeTableRow_comm_of_valid`,
+`mergeTableRow_assoc_of_valid`, `mergeTableRow_idem_of_valid` directly under
+event-consistency, then lifted to whole-table theorems.
+
+**P1-3: OR-Set idempotence precondition not formally chained** -- FIXED. Added
+`or_set_merge_canonicalized` and composed it into `or_set_merge_idem_general`
+for precondition-free idempotence.
+
+### 12.4 P2 Issues (4/8 FIXED)
+
+| ID | Issue | Status |
+|---|---|---|
+| P2-1 | OR-Set tombstone growth unbounded | FIXED: TTL-based pruning (7d default) |
+| P2-2 | MV-Register never prunes dominated values | FIXED: `pruneDominatedBySameSite` in canonicalize |
+| P2-3 | Row-level tombstone TTL not implemented | FIXED: Same retention policy path |
+| P2-4 | TS/Lean equivalence only bridged by testing | MITIGATED: DRT expanded and unified |
+| P2-5 | Network layer not formally modeled | Open |
+| P2-6 | HLC real-time accuracy not modeled | FIXED: Runtime guardrails (drift rejection, monotonic wall clock) |
+| P2-7 | No orphaned segment cleanup | Open |
+| P2-8 | No old delta file cleanup | Open |
+
+### 12.5 Remaining Gaps
+
+1. **Network layer assumptions**: Convergence proofs assume eventual delivery.
+   S3 durability (99.999999999%) provides practical assurance but is not
+   formally modeled.
+
+2. **Orphaned segments**: Failed CAS-on-manifest leaves unreferenced segments
+   in storage. No garbage collector exists.
+
+3. **Old delta files**: After compaction folds deltas into segments, the delta
+   files remain in storage indefinitely.
+
+4. **Browser state volatility**: All row state, pending ops, and sync cursors
+   are lost on page refresh. Only the HLC is persisted.
 
 ---
 
-## 14. Summary of Data Flow
+## 13. Summary of Data Flow
 
 ```
 User SQL Statement
@@ -1086,19 +1563,33 @@ User SQL Statement
   parseSql() -> SqlStatement AST
        |
        v
-  buildSqlExecutionPlanFromStatement()
+  buildClientSqlExecutionPlanFromStatement()
        |
-       +-- DDL -> schema mutation (in-memory + persist schema.bin)
+       +-- CREATE TABLE -> planCreateTableSchemaMutation()
+       |     |              -> LWW ops against information_schema.tables/columns
+       |     v
+       |   EncodedCrdtOp[] -> standard write path
+       |
+       +-- ALTER TABLE ADD COLUMN -> planAlterAddColumnSchemaMutation()
+       |     |                       -> LWW ops against information_schema.columns
+       |     v
+       |   EncodedCrdtOp[] -> standard write path
        |
        +-- SELECT -> buildSelectPlan() -> runSelectPlan() -> materialized rows
        |
-       +-- Write -> generateCrdtOps() -> EncodedCrdtOp[]
+       +-- Write (INSERT/UPDATE/INC/DEC/ADD/REMOVE/DELETE)
+                         |
+                         v
+                  generateCrdtOps() -> EncodedCrdtOp[]
                          |
                          v
                   applyCrdtOpToRows() -> in-memory RuntimeRowState update
                          |
                          v
-                  pendingOps buffer (persist to pending.bin)
+                  pendingOps buffer
+                         |
+                         v (on persistStateFiles)
+                  state_bundle.bin (atomic temp + rename)
                          |
                          v (on push)
                   ReplicatedLog.append() -> LogEntry with seq
@@ -1106,7 +1597,13 @@ User SQL Statement
                          v (on pull by other replicas)
                   readSince() -> applyCrdtOpToRows() -> convergent state
                          |
+                         v (refreshSchemaFromRows)
+                  materializeSchemaFromRows() -> SqlSchema update
+                         |
                          v (on compaction)
+                  pruneRuntimeRowsForCompaction() -> TTL-based tombstone pruning
+                         |
+                         v
                   buildSegmentsFromRows() -> SegmentFile (MessagePack)
                          |
                          v
@@ -1114,7 +1611,11 @@ User SQL Statement
 ```
 
 The design cleanly separates concerns: SQL compilation produces CRDT ops, which
-are self-describing and schema-independent. The ops flow through an append-only
-log. Compaction is a background process that merges ops into sorted segment files
-without affecting the live read/write path. Clients can always read locally
-(offline-first) and sync when connectivity permits.
+are self-describing and schema-independent. Schema metadata itself is stored as
+CRDT state in the information schema tables, so it replicates through the same
+pipeline as data. The ops flow through an append-only log. Compaction is a
+background process that merges ops into sorted segment files with TTL-based
+tombstone pruning, without affecting the live read/write path. Clients can always
+read locally (offline-first) and sync when connectivity permits. Both Node and
+Browser clients enforce HLC monotonicity across restarts and reject partial
+snapshot manifests to preserve data integrity.

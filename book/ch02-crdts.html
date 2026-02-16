@@ -6,19 +6,22 @@
   <title>Chapter 2: CRDT Implementation &mdash; CRDTBase</title>
   <link rel="stylesheet" href="style.css">
 
-  <!-- MathJax configuration and loading -->
+  <!-- MathJax Configuration -->
   <script>
     window.MathJax = {
       tex: {
         inlineMath: [['\\(', '\\)']],
         displayMath: [['\\[', '\\]']],
+        processEscapes: true
       },
-      svg: { fontCache: 'global' }
+      options: {
+        skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code']
+      }
     };
   </script>
   <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
 
-  <!-- Mermaid diagram rendering -->
+  <!-- Mermaid -->
   <script type="module">
     import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
     mermaid.initialize({startOnLoad:true, theme:'neutral'});
@@ -44,10 +47,23 @@
     <li><a href="#hlc-ordering">Ordering Primitive: The Hybrid Logical Clock</a></li>
     <li><a href="#lww-register">LWW Register</a></li>
     <li><a href="#pn-counter">PN-Counter</a></li>
-    <li><a href="#or-set">OR-Set (Observed-Remove Set)</a></li>
-    <li><a href="#mv-register">MV-Register (Multi-Value Register)</a></li>
+    <li><a href="#or-set">OR-Set (Observed-Remove Set)</a>
+      <ol>
+        <li><a href="#or-set-idem-chain">Idempotence Chain</a></li>
+      </ol>
+    </li>
+    <li><a href="#mv-register">MV-Register (Multi-Value Register)</a>
+      <ol>
+        <li><a href="#mv-canonicalization">Same-Site Pruning and Canonicalization</a></li>
+      </ol>
+    </li>
     <li><a href="#type-tags">CRDT Type Tags and the SQL Interface</a></li>
-    <li><a href="#table-composition">Table-Level Composition</a></li>
+    <li><a href="#table-composition">Table-Level Composition</a>
+      <ol>
+        <li><a href="#table-validity">Validity Predicates</a></li>
+        <li><a href="#table-operator-composition">Operator Composition</a></li>
+      </ol>
+    </li>
     <li><a href="#ts-lean-correspondence">TypeScript and Lean Correspondence</a></li>
   </ol>
 </div>
@@ -178,7 +194,7 @@ graph BT
   values, the lexicographically greater site ID wins:
 </p>
 
-<span class="file-ref">src/core/hlc.ts:28&ndash;33</span>
+<span class="file-ref">src/core/hlc.ts:70&ndash;75</span>
 <pre><code>export function compareWithSite(a: Hlc, aSite: string, b: Hlc, bSite: string): number {
   const hlcCmp = compareHlc(a, b);
   if (hlcCmp !== 0) return hlcCmp;
@@ -294,6 +310,10 @@ def merge {&alpha; : Type} (a b : LwwRegister &alpha;) : LwwRegister &alpha; :=
   </p>
 </div>
 
+<span class="file-ref">lean/CrdtBase/Crdt/Lww/Props.lean:11&ndash;12</span>
+<pre><code>def LwwConsistentPair {&alpha; : Type} (a b : LwwRegister &alpha;) : Prop :=
+  Hlc.compareWithSite (a.hlc, a.site) (b.hlc, b.site) = Ordering.eq &rarr; a = b</code></pre>
+
 <div class="theorem">
   <span class="box-title">Theorem 2.2 &mdash; LWW Semilattice Properties</span>
   <p>Under the event-consistency invariant \(\mathit{LwwConsistentPair}(a, b)\):</p>
@@ -303,11 +323,11 @@ def merge {&alpha; : Type} (a b : LwwRegister &alpha;) : LwwRegister &alpha; :=
     <li>\(\mathrm{merge}(a, a) = a\) &ensp; (<code>lww_merge_idem</code>, Props.lean:85)</li>
   </ol>
   <p>
-    The commutativity proof case-splits on the three-way comparison
+    The commutativity proof (lines 30&ndash;48) case-splits on the three-way comparison
     (<code>.lt</code>, <code>.eq</code>, <code>.gt</code>), using the swap
     lemmas <code>compareWithSite_swap_lt</code> and
     <code>compareWithSite_swap_gt</code> from the HLC module. The associativity
-    proof exhausts all nine combinations of pairwise comparisons, pruning
+    proof (lines 51&ndash;83) exhausts all nine combinations of pairwise comparisons, pruning
     impossible cases via transitivity.
   </p>
 </div>
@@ -406,7 +426,7 @@ export type PnCounter = {
   inc : String &rarr; Nat
   dec : String &rarr; Nat</code></pre>
 
-<span class="file-ref">lean/CrdtBase/Crdt/PnCounter/Defs.lean:28&ndash;31</span>
+<span class="file-ref">lean/CrdtBase/Crdt/PnCounter/Defs.lean:29&ndash;31</span>
 <pre><code>def merge (a b : PnCounter) : PnCounter :=
   { inc := fun site =&gt; max (a.inc site) (b.inc site)
     dec := fun site =&gt; max (a.dec site) (b.dec site) }</code></pre>
@@ -415,9 +435,9 @@ export type PnCounter = {
   <span class="box-title">Theorem 2.3 &mdash; PN-Counter Semilattice Properties</span>
   <p>All three properties hold unconditionally (no preconditions):</p>
   <ol>
-    <li><code>pn_counter_merge_comm</code> &mdash; follows from <code>Nat.max_comm</code></li>
-    <li><code>pn_counter_merge_assoc</code> &mdash; follows from <code>Nat.max_assoc</code></li>
-    <li><code>pn_counter_merge_idem</code> &mdash; follows from <code>max(n, n) = n</code></li>
+    <li><code>pn_counter_merge_comm</code> (Props.lean:8) &mdash; follows from <code>Nat.max_comm</code></li>
+    <li><code>pn_counter_merge_assoc</code> (Props.lean:13) &mdash; follows from <code>Nat.max_assoc</code></li>
+    <li><code>pn_counter_merge_idem</code> (Props.lean:18) &mdash; follows from <code>max(n, n) = n</code></li>
   </ol>
   <p>
     Each proof is a single line of tactic: <code>ext site &lt;;&gt; simp [PnCounter.merge, Nat.max_comm]</code>.
@@ -576,7 +596,7 @@ structure OrSet (&alpha; : Type) (Hlc : Type) where
   elements   : Finset (OrSetElem &alpha; Hlc)
   tombstones : Finset (OrSetTag Hlc)</code></pre>
 
-<span class="file-ref">lean/CrdtBase/Crdt/OrSet/Defs.lean:34&ndash;47</span>
+<span class="file-ref">lean/CrdtBase/Crdt/OrSet/Defs.lean:35&ndash;47</span>
 <pre><code>def OrSet.canonicalize (s : OrSet &alpha; Hlc) : OrSet &alpha; Hlc :=
   { elements := s.elements.filter (fun e =&gt; e.tag &notin; s.tombstones)
     tombstones := s.tombstones }
@@ -603,6 +623,81 @@ def OrSet.merge (a b : OrSet &alpha; Hlc) : OrSet &alpha; Hlc :=
     all OR-Sets are stored in canonical form, so <code>hClean</code> always holds.
     Commutativity and associativity hold unconditionally.
   </p>
+</div>
+
+<!-- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -->
+<h3 id="or-set-idem-chain">2.6.1 &ensp; Idempotence Chain</h3>
+
+<p>
+  The cleanness precondition on <code>or_set_merge_idem</code> raises a
+  practical question: can callers always satisfy it? Two additional theorems,
+  proved in <code>OrSet/Props.lean</code>, close the gap by establishing that
+  merge output is always clean, and therefore always satisfies idempotence
+  without any external precondition.
+</p>
+
+<div class="theorem">
+  <span class="box-title">Theorem 2.4a &mdash; Merge Output Is Always Canonicalized</span>
+  <p>
+    For any two OR-Sets \(a\) and \(b\), every element in
+    \(\mathrm{merge}(a, b)\) has its tag absent from the tombstone set:
+  </p>
+  \[
+    \forall x \in \mathrm{merge}(a, b).\mathit{elements},\;
+    x.\mathit{tag} \notin \mathrm{merge}(a, b).\mathit{tombstones}
+  \]
+</div>
+
+<span class="file-ref">lean/CrdtBase/Crdt/OrSet/Props.lean:62&ndash;67</span>
+<pre><code>theorem or_set_merge_canonicalized {&alpha; Hlc : Type} [DecidableEq &alpha;] [DecidableEq Hlc]
+    (a b : OrSet &alpha; Hlc) :
+    &forall; x &isin; (OrSet.merge a b).elements, x.tag &notin; (OrSet.merge a b).tombstones := by
+  intro x hx
+  simp [OrSet.merge] at hx &vdash;
+  exact hx.2</code></pre>
+
+<p>
+  The proof is short: it unfolds the definition of merge (which applies
+  <code>canonicalize</code>) and observes that the <code>Finset.filter</code>
+  in canonicalization ensures that every surviving element has its tag
+  not in the tombstone set.
+</p>
+
+<div class="theorem">
+  <span class="box-title">Theorem 2.4b &mdash; Precondition-Free Idempotence</span>
+  <p>
+    For any two OR-Sets \(a\) and \(b\):
+    \(\mathrm{merge}(\mathrm{merge}(a, b),\; \mathrm{merge}(a, b)) = \mathrm{merge}(a, b)\).
+  </p>
+</div>
+
+<span class="file-ref">lean/CrdtBase/Crdt/OrSet/Props.lean:71&ndash;74</span>
+<pre><code>theorem or_set_merge_idem_general {&alpha; Hlc : Type} [DecidableEq &alpha;] [DecidableEq Hlc]
+    (a b : OrSet &alpha; Hlc) :
+    OrSet.merge (OrSet.merge a b) (OrSet.merge a b) = OrSet.merge a b := by
+  exact or_set_merge_idem (OrSet.merge a b) (or_set_merge_canonicalized a b)</code></pre>
+
+<p>
+  The proof chains the two results: <code>or_set_merge_canonicalized</code>
+  establishes the cleanness precondition for the merge output, and
+  <code>or_set_merge_idem</code> uses it. This eliminates the need for callers
+  to track whether their OR-Set state is canonical&mdash;any merge output is
+  guaranteed to satisfy the idempotence precondition. In the table composition
+  layer (Section 2.9), this chain is critical: the <code>ValidTableRowPair</code>
+  predicate includes OR-Set cleanness, which is automatically satisfied by any
+  state that has passed through merge.
+</p>
+
+<div class="diagram-container">
+  <pre class="mermaid">
+flowchart LR
+  A["or_set_merge(a, b)"] -->|"always clean"| B["or_set_merge_canonicalized"]
+  B -->|"satisfies hClean"| C["or_set_merge_idem"]
+  C --> D["or_set_merge_idem_general<br/>(precondition-free)"]
+  </pre>
+  <div class="caption">Figure 2.4 &mdash; The idempotence chain. Merge output is always canonicalized
+    (Theorem 2.4a), which discharges the cleanness precondition of the basic idempotence
+    theorem, giving precondition-free idempotence (Theorem 2.4b).</div>
 </div>
 
 <!-- ============================================================ -->
@@ -646,26 +741,113 @@ export type MvRegister&lt;T&gt; = {
   values: Array&lt;MvRegisterValue&lt;T&gt;&gt;;
 };</code></pre>
 
-<span class="file-ref">src/core/crdt/mvRegister.ts:84&ndash;88</span>
+<span class="file-ref">src/core/crdt/mvRegister.ts:102&ndash;106</span>
 <pre><code>export function mergeMvRegister&lt;T&gt;(a: MvRegister&lt;T&gt;, b: MvRegister&lt;T&gt;): MvRegister&lt;T&gt; {
   return canonicalizeMvRegister({
     values: [...a.values, ...b.values],
   });
 }</code></pre>
 
+<!-- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -->
+<h3 id="mv-canonicalization">2.7.1 &ensp; Same-Site Pruning and Canonicalization</h3>
+
 <p>
-  Canonicalization deduplicates by event key \((\mathit{hlc}, \mathit{site})\)
-  and sorts for deterministic ordering:
+  Unlike the Lean model (which uses pure <code>Finset</code> union), the
+  TypeScript MV-Register applies a three-stage canonicalization pipeline that
+  includes a critical pruning step: <code>pruneDominatedBySameSite</code>.
+  This function removes values where a newer HLC from the same site exists,
+  bounding the accumulation of stale concurrent values.
 </p>
 
-<span class="file-ref">src/core/crdt/mvRegister.ts:77&ndash;82</span>
+<div class="definition">
+  <span class="box-title">Definition 2.7 &mdash; Same-Site Dominance</span>
+  <p>
+    A value \((v_i, h_i, s_i)\) is <em>dominated</em> by another value
+    \((v_j, h_j, s_j)\) if \(s_i = s_j\) and \(h_i \lt h_j\). A dominated
+    value is not truly concurrent&mdash;it has been causally superseded by
+    a later write from the same site. If site A writes \(v_1\) at \(t=10\)
+    then \(v_2\) at \(t=20\), only \(v_2\) should appear in the register.
+  </p>
+</div>
+
+<span class="file-ref">src/core/crdt/mvRegister.ts:77&ndash;92</span>
+<pre><code>function pruneDominatedBySameSite&lt;T&gt;(values: Array&lt;MvRegisterValue&lt;T&gt;&gt;): Array&lt;MvRegisterValue&lt;T&gt;&gt; {
+  const maxBySite = new Map&lt;string, Hlc&gt;();
+  for (const entry of values) {
+    const currentMax = maxBySite.get(entry.site);
+    if (!currentMax || compareHlc(entry.hlc, currentMax) > 0) {
+      maxBySite.set(entry.site, entry.hlc);
+    }
+  }
+  return values.filter((entry) => {
+    const max = maxBySite.get(entry.site);
+    if (!max) {
+      return true;
+    }
+    return compareHlc(entry.hlc, max) === 0;
+  });
+}</code></pre>
+
+<p>
+  The algorithm performs two passes. First, it builds a map from each site ID
+  to its maximum HLC. Second, it filters the value list, retaining only values
+  whose HLC matches the maximum for their site. This is \(O(n)\) in the number
+  of values.
+</p>
+
+<p>
+  The full canonicalization pipeline chains three steps:
+</p>
+
+<span class="file-ref">src/core/crdt/mvRegister.ts:94&ndash;100</span>
 <pre><code>export function canonicalizeMvRegister&lt;T&gt;(state: MvRegister&lt;T&gt;): MvRegister&lt;T&gt; {
   assertMvEventConsistency(state.values);
   const deduped = dedupeByEvent(state.values);
-  const values = deduped.sort((left, right) =>
+  const undominated = pruneDominatedBySameSite(deduped);
+  const values = undominated.sort((left, right) =>
     compareKeys(entrySortKey(left), entrySortKey(right)));
   return { values };
 }</code></pre>
+
+<ol>
+  <li><strong>Assert consistency</strong> &mdash; reject conflicting payloads for the
+    same \((\mathit{hlc}, \mathit{site})\) event key.</li>
+  <li><strong>Deduplicate by event</strong> &mdash; collapse identical event keys to
+    a single entry (safe because consistency is already checked).</li>
+  <li><strong>Prune dominated</strong> &mdash; for each site, keep only the value
+    with the newest HLC; older entries from the same site are superseded.</li>
+</ol>
+
+<div class="diagram-container">
+  <pre class="mermaid">
+flowchart LR
+  subgraph "canonicalizeMvRegister"
+    Assert["assertMvEventConsistency"]
+    Dedup["dedupeByEvent"]
+    Prune["pruneDominatedBySameSite"]
+    Sort["sort by entrySortKey"]
+  end
+  Input["raw values"] --> Assert --> Dedup --> Prune --> Sort --> Output["canonical values"]
+  </pre>
+  <div class="caption">Figure 2.5 &mdash; MV-Register canonicalization pipeline. The pruning step
+    removes values causally superseded by a newer write from the same site,
+    ensuring that only truly concurrent values survive.</div>
+</div>
+
+<div class="note">
+  <span class="box-title">Implementation Note &mdash; Pruning Is a Runtime Optimization</span>
+  <p>
+    The Lean MV-Register model does not include the
+    <code>pruneDominatedBySameSite</code> step. The Lean
+    <code>MvRegister.merge</code> is pure <code>Finset</code> union, which
+    preserves all values unconditionally. The same-site pruning is a
+    <em>runtime optimization</em> in TypeScript that reduces the number of
+    concurrent values surfaced to the application. The DRT harness accounts
+    for this difference by normalizing both outputs before comparison:
+    the TypeScript output has stale same-site values pruned, while the Lean
+    output retains them but the comparison filters them out.
+  </p>
+</div>
 
 <h3>Lean Specification</h3>
 
@@ -679,7 +861,7 @@ export type MvRegister&lt;T&gt; = {
 structure MvRegister (&alpha; : Type) where
   values : Finset (MvValue &alpha;)</code></pre>
 
-<span class="file-ref">lean/CrdtBase/Crdt/MvRegister/Defs.lean:29&ndash;31</span>
+<span class="file-ref">lean/CrdtBase/Crdt/MvRegister/Defs.lean:30&ndash;31</span>
 <pre><code>def merge {&alpha; : Type} [DecidableEq &alpha;] (a b : MvRegister &alpha;) : MvRegister &alpha; :=
   { values := a.values &cup; b.values }</code></pre>
 
@@ -764,7 +946,7 @@ structure MvRegister (&alpha; : Type) where
       </tr>
     </tbody>
   </table>
-  <div class="caption">Figure 2.4 &mdash; CRDT type tag mapping between SQL syntax, TypeScript runtime,
+  <div class="caption">Figure 2.6 &mdash; CRDT type tag mapping between SQL syntax, TypeScript runtime,
     and Lean specification. The tag number is the discriminant used in encoded operations.</div>
 </div>
 
@@ -781,18 +963,35 @@ structure MvRegister (&alpha; : Type) where
 <h2 id="table-composition">2.9 &ensp; Table-Level Composition</h2>
 
 <p>
-  CRDTBase composes these four CRDT types into a table model. Each row contains
-  a visibility flag (LWW over Bool), plus one column of each CRDT type. Row
-  merge is componentwise; table merge is pointwise over keys.
+  A database table is not a single CRDT&mdash;it is a <em>composition</em> of
+  many CRDTs. Each row contains a visibility flag (LWW over Bool) plus one
+  column of each CRDT type. The key design question is: does the composition
+  of semilattices yield a semilattice? The answer is yes, and CRDTBase proves
+  it in Lean at three levels: individual columns, composite rows, and
+  whole tables.
 </p>
 
-<span class="file-ref">lean/CrdtBase/Crdt/Table/Defs.lean:11&ndash;17</span>
+<h3>Row Structure</h3>
+
+<p>
+  The Lean table model defines a composite row state that bundles all four CRDT
+  column types alongside the row-visibility flag:
+</p>
+
+<span class="file-ref">lean/CrdtBase/Crdt/Table/Defs.lean:11&ndash;16</span>
 <pre><code>structure TableRowState (&alpha; &beta; &gamma; Hlc : Type) where
   alive : LwwRegister Bool
   lwwCol : LwwRegister &alpha;
   counterCol : PnCounter
   setCol : OrSet &beta; Hlc
   registerCol : MvRegister &gamma;</code></pre>
+
+<h3>Row Merge</h3>
+
+<p>
+  Row merge is componentwise&mdash;each column is merged using its own CRDT
+  merge function, independently of every other column:
+</p>
 
 <span class="file-ref">lean/CrdtBase/Crdt/Table/Defs.lean:19&ndash;27</span>
 <pre><code>def mergeTableRow (a b : TableRowState &alpha; &beta; &gamma; Hlc) : TableRowState &alpha; &beta; &gamma; Hlc :=
@@ -804,16 +1003,29 @@ structure MvRegister (&alpha; : Type) where
     registerCol := MvRegister.merge a.registerCol b.registerCol
   }</code></pre>
 
+<h3>Table Merge</h3>
+
+<p>
+  Table-level merge is pointwise over primary keys. Each key's row is merged
+  independently:
+</p>
+
 <span class="file-ref">lean/CrdtBase/Crdt/Table/Defs.lean:33&ndash;35</span>
 <pre><code>def mergeTable (a b : TableState &kappa; &alpha; &beta; &gamma; Hlc) : TableState &kappa; &alpha; &beta; &gamma; Hlc :=
   fun key =&gt; mergeTableRow (a key) (b key)</code></pre>
 
+<h3>Generic Lifting Theorems</h3>
+
+<p>
+  The first layer of table proofs establishes that if row merge satisfies a
+  semilattice property, then table merge does too. These are one-liners:
+  <code>funext key</code> reduces whole-table equality to per-key row equality.
+</p>
+
 <div class="theorem">
-  <span class="box-title">Theorem 2.6 &mdash; Compositional Convergence</span>
+  <span class="box-title">Theorem 2.6 &mdash; Compositional Lifting</span>
   <p>
-    The semilattice properties <em>lift</em> from individual CRDT columns to
-    whole rows and whole tables. The Lean proofs
-    (<code>Table/Props.lean</code>) establish:
+    The Lean proofs (<code>Table/Props.lean</code>, lines 17&ndash;39) establish:
   </p>
   <ul>
     <li><code>table_merge_comm_of_row_comm</code> &mdash; table commutativity from row commutativity</li>
@@ -821,13 +1033,154 @@ structure MvRegister (&alpha; : Type) where
     <li><code>table_merge_idem_of_row_idem</code> &mdash; table idempotency from row idempotency</li>
   </ul>
   <p>
-    Additionally, cross-column commutativity is proved: counter updates
-    commute with row-existence changes, OR-Set updates commute with
-    row-existence changes, and counter updates commute with MV-Register
-    updates&mdash;because each operation modifies a disjoint field of the
-    row structure.
+    These are generic: they apply to <em>any</em> row merge function, not just the
+    specific composition of LWW, PN-Counter, OR-Set, and MV-Register. This
+    separates the structural lifting argument from the CRDT-specific details.
   </p>
 </div>
+
+<!-- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -->
+<h3 id="table-validity">2.9.1 &ensp; Validity Predicates</h3>
+
+<p>
+  Not all column CRDTs have unconditional semilattice properties. LWW merge
+  requires event-consistency (\(\mathrm{LwwConsistentPair}\)), and OR-Set
+  idempotence requires cleanness. The <code>ValidTableRowPair</code> predicate
+  bundles these requirements at the row level:
+</p>
+
+<span class="file-ref">lean/CrdtBase/Crdt/Table/Props.lean:58&ndash;62</span>
+<pre><code>structure ValidTableRowPair (a b : TableRowState &alpha; &beta; &gamma; Hlc) : Prop where
+  alive_consistent   : LwwConsistentPair a.alive b.alive
+  lwwCol_consistent  : LwwConsistentPair a.lwwCol b.lwwCol
+  setCol_a_clean     : &forall; x &isin; a.setCol.elements, x.tag &notin; a.setCol.tombstones
+  setCol_b_clean     : &forall; x &isin; b.setCol.elements, x.tag &notin; b.setCol.tombstones</code></pre>
+
+<p>
+  This predicate captures two system-level invariants:
+</p>
+
+<ol>
+  <li><strong>LWW event-consistency:</strong> each \((\mathit{hlc}, \mathit{site})\) pair
+    uniquely determines the LWW payload, for both the <code>alive</code> and
+    <code>lwwCol</code> columns.</li>
+  <li><strong>OR-Set canonicalization:</strong> no element tag appears in the
+    tombstone set. This is automatically satisfied after any merge operation,
+    as proved by <code>or_set_merge_canonicalized</code> (Theorem 2.4a).</li>
+</ol>
+
+<p>
+  For three-way associativity, a separate <code>ValidTableRowTriple</code>
+  predicate (lines 79&ndash;83) requires pairwise LWW consistency between
+  \((a,b)\) and \((b,c)\):
+</p>
+
+<span class="file-ref">lean/CrdtBase/Crdt/Table/Props.lean:79&ndash;83</span>
+<pre><code>structure ValidTableRowTriple (a b c : TableRowState &alpha; &beta; &gamma; Hlc) : Prop where
+  alive_ab : LwwConsistentPair a.alive b.alive
+  alive_bc : LwwConsistentPair b.alive c.alive
+  lww_ab   : LwwConsistentPair a.lwwCol b.lwwCol
+  lww_bc   : LwwConsistentPair b.lwwCol c.lwwCol</code></pre>
+
+<div class="theorem">
+  <span class="box-title">Theorem 2.7 &mdash; Instantiated Row-Level Properties</span>
+  <p>Under the appropriate validity predicates:</p>
+  <ol>
+    <li><code>mergeTableRow_comm_of_valid</code> (Props.lean:66) &mdash;
+      row commutativity under <code>ValidTableRowPair</code></li>
+    <li><code>mergeTableRow_assoc_of_valid</code> (Props.lean:86) &mdash;
+      row associativity under <code>ValidTableRowTriple</code></li>
+    <li><code>mergeTableRow_idem_of_valid</code> (Props.lean:105) &mdash;
+      row idempotence under OR-Set cleanness</li>
+  </ol>
+  <p>
+    Each proof case-splits on the five columns of <code>TableRowState</code>
+    and applies the per-type theorem (<code>lww_merge_comm_of_consistent</code>,
+    <code>pn_counter_merge_comm</code>, <code>or_set_merge_comm</code>,
+    <code>mv_register_merge_comm</code>) to the corresponding field. The
+    PN-Counter and MV-Register terms require no preconditions; the LWW terms
+    extract their preconditions from the validity predicate; and the OR-Set
+    idempotence term uses the cleanness hypothesis.
+  </p>
+</div>
+
+<p>
+  Whole-table versions of each theorem are proved by lifting through
+  <code>ValidTableState</code> (line 121), <code>ValidTableStateTriple</code>
+  (line 133), and <code>ValidTableStateIdem</code> (line 145). These are
+  quantified over all keys: for example,
+  <code>ValidTableState a b</code> requires
+  <code>ValidTableRowPair (a key) (b key)</code> for every key \(\kappa\).
+</p>
+
+<!-- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -->
+<h3 id="table-operator-composition">2.9.2 &ensp; Operator Composition</h3>
+
+<p>
+  The table model also defines field-specific row operations
+  (<code>applyRowExists</code>, <code>applyLwwCell</code>,
+  <code>applyCounterCell</code>, <code>applySetCell</code>,
+  <code>applyRegisterCell</code>) and proves cross-column commutativity
+  and visibility preservation.
+</p>
+
+<div class="theorem">
+  <span class="box-title">Theorem 2.8 &mdash; Visibility Preservation</span>
+  <p>
+    Column updates to non-<code>alive</code> columns do not change row
+    visibility:
+  </p>
+  <ul>
+    <li><code>apply_counter_preserves_visibility</code> (Props.lean:163)</li>
+    <li><code>apply_set_preserves_visibility</code> (Props.lean:171)</li>
+    <li><code>apply_register_preserves_visibility</code> (Props.lean:180)</li>
+  </ul>
+</div>
+
+<div class="theorem">
+  <span class="box-title">Theorem 2.9 &mdash; Cross-Column Commutativity</span>
+  <p>
+    Updates to independent columns always commute, because each operation
+    modifies a disjoint field of the row structure:
+  </p>
+  <ul>
+    <li><code>row_exists_counter_commute</code> (Props.lean:189) &mdash;
+      row-existence and counter updates</li>
+    <li><code>row_exists_set_commute</code> (Props.lean:199) &mdash;
+      row-existence and OR-Set updates</li>
+    <li><code>row_counter_register_commute</code> (Props.lean:210) &mdash;
+      counter and MV-Register updates</li>
+  </ul>
+  <p>
+    All six proofs are discharged by <code>cases row; rfl</code>&mdash;the
+    structure decomposition makes independence obvious to the type checker.
+  </p>
+</div>
+
+<div class="theorem">
+  <span class="box-title">Theorem 2.10 &mdash; Disjoint-Key Commutativity</span>
+  <p>
+    Updates at different primary keys always commute at the whole-table level,
+    regardless of the column CRDT type:
+  </p>
+</div>
+
+<span class="file-ref">lean/CrdtBase/Crdt/Table/Props.lean:225&ndash;248</span>
+<pre><code>theorem modify_row_at_disjoint_commute
+    (table : TableState &kappa; &alpha; &beta; &gamma; Hlc)
+    (k1 k2 : &kappa;) (hNe : k1 &ne; k2)
+    (f g : TableRowState &alpha; &beta; &gamma; Hlc &rarr; TableRowState &alpha; &beta; &gamma; Hlc)
+    : modifyRowAt (modifyRowAt table k1 f) k2 g =
+      modifyRowAt (modifyRowAt table k2 g) k1 f</code></pre>
+
+<p>
+  The proof works by <code>funext</code> then case-splitting on whether the
+  current key equals \(k_1\), \(k_2\), or neither. The disjoint-key condition
+  \(k_1 \ne k_2\) is essential: it ensures that modifying one key cannot
+  affect the other key's row state. Combined with the per-column commutativity
+  theorems, this establishes that CRDTBase operations commute across both
+  columns and rows.
+</p>
 
 <!-- ============================================================ -->
 <h2 id="ts-lean-correspondence">2.10 &ensp; TypeScript and Lean Correspondence</h2>
@@ -855,6 +1208,7 @@ graph LR
     LN_PN["Crdt/PnCounter/Defs.lean"]
     LN_OR["Crdt/OrSet/Defs.lean"]
     LN_MV["Crdt/MvRegister/Defs.lean"]
+    LN_TBL["Crdt/Table/Defs.lean"]
   end
 
   subgraph "Lean 4 (Proofs)"
@@ -863,6 +1217,7 @@ graph LR
     LN_PN_P["Crdt/PnCounter/Props.lean"]
     LN_OR_P["Crdt/OrSet/Props.lean"]
     LN_MV_P["Crdt/MvRegister/Props.lean"]
+    LN_TBL_P["Crdt/Table/Props.lean"]
   end
 
   TS_HLC <-.-> LN_HLC
@@ -876,10 +1231,12 @@ graph LR
   LN_PN --> LN_PN_P
   LN_OR --> LN_OR_P
   LN_MV --> LN_MV_P
+  LN_TBL --> LN_TBL_P
   </pre>
-  <div class="caption">Figure 2.5 &mdash; Structural correspondence between TypeScript runtime,
+  <div class="caption">Figure 2.7 &mdash; Structural correspondence between TypeScript runtime,
     Lean definitions, and Lean proofs. Dashed arrows indicate semantic equivalence
-    validated by differential random testing. Solid arrows show proof dependencies.</div>
+    validated by differential random testing. Solid arrows show proof dependencies.
+    The Table module has no TypeScript counterpart&mdash;it exists purely in the proof layer.</div>
 </div>
 
 <p>
@@ -926,6 +1283,11 @@ graph LR
       <td>Propositional hypothesis (<code>LwwConsistentPair</code>)</td>
     </tr>
     <tr>
+      <td>MV-Register pruning</td>
+      <td><code>pruneDominatedBySameSite</code> in canonicalization</td>
+      <td>Not modeled (pure <code>Finset</code> union)</td>
+    </tr>
+    <tr>
       <td>Binary encoding</td>
       <td>MessagePack via <code>@msgpack/msgpack</code></td>
       <td>Not modeled (out of proof scope)</td>
@@ -968,6 +1330,13 @@ graph LR
       <td><code>hClean</code> (idem only)</td>
     </tr>
     <tr>
+      <td>OR-Set (general)</td>
+      <td>&mdash;</td>
+      <td>&mdash;</td>
+      <td><code>or_set_merge_idem_general</code></td>
+      <td>None (via chain)</td>
+    </tr>
+    <tr>
       <td>MV-Register</td>
       <td><code>mv_register_merge_comm</code></td>
       <td><code>mv_register_merge_assoc</code></td>
@@ -977,11 +1346,106 @@ graph LR
   </tbody>
 </table>
 
+<h3>Table Composition Proof Inventory</h3>
+
+<table>
+  <thead>
+    <tr>
+      <th>Theorem</th>
+      <th>Location</th>
+      <th>Property</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>table_merge_comm_of_row_comm</code></td>
+      <td>Table/Props.lean:17</td>
+      <td>Generic table commutativity from row commutativity</td>
+    </tr>
+    <tr>
+      <td><code>table_merge_assoc_of_row_assoc</code></td>
+      <td>Table/Props.lean:25</td>
+      <td>Generic table associativity from row associativity</td>
+    </tr>
+    <tr>
+      <td><code>table_merge_idem_of_row_idem</code></td>
+      <td>Table/Props.lean:34</td>
+      <td>Generic table idempotency from row idempotency</td>
+    </tr>
+    <tr>
+      <td><code>mergeTableRow_comm_of_valid</code></td>
+      <td>Table/Props.lean:66</td>
+      <td>Instantiated row commutativity</td>
+    </tr>
+    <tr>
+      <td><code>mergeTableRow_assoc_of_valid</code></td>
+      <td>Table/Props.lean:86</td>
+      <td>Instantiated row associativity</td>
+    </tr>
+    <tr>
+      <td><code>mergeTableRow_idem_of_valid</code></td>
+      <td>Table/Props.lean:105</td>
+      <td>Instantiated row idempotence</td>
+    </tr>
+    <tr>
+      <td><code>mergeTable_comm_of_valid</code></td>
+      <td>Table/Props.lean:125</td>
+      <td>Whole-table commutativity</td>
+    </tr>
+    <tr>
+      <td><code>mergeTable_assoc_of_valid</code></td>
+      <td>Table/Props.lean:137</td>
+      <td>Whole-table associativity</td>
+    </tr>
+    <tr>
+      <td><code>mergeTable_idem_of_valid</code></td>
+      <td>Table/Props.lean:149</td>
+      <td>Whole-table idempotence</td>
+    </tr>
+    <tr>
+      <td><code>apply_counter_preserves_visibility</code></td>
+      <td>Table/Props.lean:163</td>
+      <td>Counter updates preserve alive flag</td>
+    </tr>
+    <tr>
+      <td><code>apply_set_preserves_visibility</code></td>
+      <td>Table/Props.lean:171</td>
+      <td>OR-Set updates preserve alive flag</td>
+    </tr>
+    <tr>
+      <td><code>apply_register_preserves_visibility</code></td>
+      <td>Table/Props.lean:180</td>
+      <td>MV-Register updates preserve alive flag</td>
+    </tr>
+    <tr>
+      <td><code>row_exists_counter_commute</code></td>
+      <td>Table/Props.lean:189</td>
+      <td>Row-existence and counter commute</td>
+    </tr>
+    <tr>
+      <td><code>row_exists_set_commute</code></td>
+      <td>Table/Props.lean:199</td>
+      <td>Row-existence and OR-Set commute</td>
+    </tr>
+    <tr>
+      <td><code>row_counter_register_commute</code></td>
+      <td>Table/Props.lean:210</td>
+      <td>Counter and MV-Register commute</td>
+    </tr>
+    <tr>
+      <td><code>modify_row_at_disjoint_commute</code></td>
+      <td>Table/Props.lean:225</td>
+      <td>Disjoint-key updates commute</td>
+    </tr>
+  </tbody>
+</table>
+
 <p>
-  Together, these 12 semilattice theorems form the foundation of CRDTBase&rsquo;s
-  convergence guarantee. They are composed upward through the table model
-  (Chapter 3) and validated empirically through differential random testing
-  (Chapter 4).
+  Together, the 12 per-type semilattice theorems, the 2 idempotence chain
+  theorems, and the 16 table composition theorems form the foundation of
+  CRDTBase&rsquo;s convergence guarantee. They are composed upward through the
+  convergence framework (Chapter 3) and validated empirically through
+  differential random testing (Chapter 4).
 </p>
 
 <hr>

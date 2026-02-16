@@ -25,25 +25,25 @@
   <h2>Contents</h2>
   <ol>
     <li><a href="ch01-architecture.html"><strong>Architecture Overview</strong></a>
-      <br><em>System decomposition, data flow, and the key design decisions that make a CRDT database work on top of S3-compatible object storage.</em>
+      <br><em>Schema system, HLC clock API refactoring, atomic persistence. System decomposition, data flow, and the key design decisions that make a CRDT database work on top of S3-compatible object storage.</em>
     </li>
     <li><a href="ch02-crdts.html"><strong>CRDT Implementation</strong></a>
-      <br><em>LWW Registers, PN-Counters, OR-Sets, and MV-Registers in TypeScript &mdash; the merge functions that guarantee convergence.</em>
+      <br><em>LWW Registers, PN-Counters, OR-Sets, and MV-Registers in TypeScript. MV-Register canonicalization, OR-Set idempotence chain, and the merge functions that guarantee convergence.</em>
     </li>
     <li><a href="ch03-lean-proofs.html"><strong>Lean Proofs</strong></a>
-      <br><em>Formal verification of CRDT semilattice properties in Lean 4. How the proofs work, elegant examples, and what they guarantee.</em>
+      <br><em>Formal verification of CRDT semilattice properties in Lean 4. Table composition proofs, replication watermark proofs, and 70+ theorems covering how the proofs work, elegant examples, and what they guarantee.</em>
     </li>
     <li><a href="ch04-differential-testing.html"><strong>Differential Testing</strong></a>
-      <br><em>The Lean oracle, fast-check generators, and the pipeline that checks 100K+ random inputs to ensure TypeScript matches the verified spec.</em>
+      <br><em>The Lean oracle with sql_script_eval endpoint, 10+ DRT targets, client snapshot pull testing, fast-check generators, and the pipeline that checks 100K+ random inputs to ensure TypeScript matches the verified spec.</em>
     </li>
     <li><a href="ch05-data-model.html"><strong>Data Model &amp; Correctness</strong></a>
-      <br><em>Tables, rows, columns, HLC timestamps, and the SQL dialect. How CRDT semantics compose into a queryable database and whether the model holds up.</em>
+      <br><em>Tables, rows, columns, HLC timestamps, and the SQL dialect with information_schema, DDL (CREATE/ALTER/DROP TABLE), and compaction retention. How CRDT semantics compose into a queryable database and whether the model holds up.</em>
     </li>
     <li><a href="ch06-compaction.html"><strong>Compaction</strong></a>
-      <br><em>Reducing unbounded delta accumulation into bounded segment files, and why the CAS-on-manifest design makes this safe.</em>
+      <br><em>Reducing unbounded delta accumulation into bounded segment files with TTL-based tombstone GC, filesystem CAS locking, and snapshot coverage gate. Why the CAS-on-manifest design makes this safe.</em>
     </li>
     <li><a href="ch07-e2e-flow.html"><strong>End-to-End: Three Clients Across the Globe</strong></a>
-      <br><em>A concrete walkthrough of concurrent writes from IAD, LHR, and NRT, tracing how Tigris geo-replication and CRDT merges achieve convergence.</em>
+      <br><em>A concrete walkthrough of concurrent writes from IAD, LHR, and NRT with stress test including compaction integration, timing results, and all P0/P1 fixes. Tracing how Tigris geo-replication and CRDT merges achieve convergence.</em>
     </li>
   </ol>
 </div>
