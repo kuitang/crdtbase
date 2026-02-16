@@ -1,0 +1,1767 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 1: Architecture Overview &mdash; CRDTBase</title>
+  <link rel="stylesheet" href="style.css">
+
+  <!-- MathJax Configuration -->
+  <script>
+    window.MathJax = {
+      tex: {
+        inlineMath: [['\\(', '\\)']],
+        displayMath: [['\\[', '\\]']],
+        processEscapes: true
+      },
+      options: {
+        skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code']
+      }
+    };
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+
+  <!-- Mermaid -->
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({startOnLoad:true, theme:'neutral'});
+  </script>
+</head>
+<body>
+
+<nav class="chapter-nav">
+  <a class="prev" href="index.html">Table of Contents</a>
+  <span>Chapter 1</span>
+  <a class="next" href="ch02-crdts.html">Chapter 2: CRDT Implementation</a>
+</nav>
+
+<h1>
+  <span class="chapter-num">Chapter 1</span>
+  Architecture Overview
+</h1>
+
+<!-- ================================================================ -->
+<!-- TABLE OF CONTENTS                                                 -->
+<!-- ================================================================ -->
+
+<div class="toc">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#what-is-crdtbase">What Is CRDTBase?</a></li>
+    <li><a href="#design-goals">Design Goals and Non-Goals</a></li>
+    <li><a href="#system-decomposition">System Decomposition</a></li>
+    <li><a href="#key-interfaces">Key Interfaces</a></li>
+    <li><a href="#hlc">The Hybrid Logical Clock</a></li>
+    <li><a href="#write-path">Data Flow: The Write Path</a></li>
+    <li><a href="#read-path">Data Flow: The Read Path</a></li>
+    <li><a href="#compaction-path">Data Flow: Compaction</a></li>
+    <li><a href="#formal-verification">The Formal Verification Layer</a></li>
+    <li><a href="#summary">Summary</a></li>
+  </ol>
+</div>
+
+<!-- ================================================================ -->
+<!-- 1. WHAT IS CRDTBASE                                               -->
+<!-- ================================================================ -->
+
+<h2 id="what-is-crdtbase">1. What Is CRDTBase?</h2>
+
+<p>
+  CRDTBase is a <em>CRDT-native relational database</em> designed for
+  offline-first, multi-region applications. It presents a SQL interface
+  to the programmer&mdash;tables, rows, columns, inserts, updates,
+  selects&mdash;but beneath that surface, every non-primary-key column
+  is backed by a conflict-free replicated data type (CRDT). When
+  replicas diverge due to concurrent writes or network partitions, the
+  CRDT merge semantics guarantee deterministic convergence without any
+  coordination protocol.
+</p>
+
+<p>
+  The system is implemented in TypeScript for runtime execution and in
+  Lean&nbsp;4 for formal verification. The Lean model serves as both the
+  mathematical specification and a test oracle: differential random
+  testing (DRT) generates thousands of random inputs and checks that the
+  TypeScript implementation agrees with the Lean oracle on every output.
+  Lean proofs then establish, once and for all, that the CRDT merge
+  functions satisfy the semilattice laws (commutativity, associativity,
+  idempotence) that guarantee convergence.
+</p>
+
+<div class="definition">
+  <span class="box-title">Definition 1.1 &mdash; Strong Eventual Consistency (SEC)</span>
+  <p>
+    A replicated system satisfies SEC if, whenever two replicas have
+    received the same set of operations (in any order), they are in
+    identical states. Formally, for a merge function
+    \(m : \Sigma \times \Sigma \to \Sigma\) and a set of operations
+    \(\{o_1, \ldots, o_n\}\), if \(m\) is commutative, associative, and
+    idempotent, then for any two permutations \(\pi, \sigma\) of
+    \(\{1, \ldots, n\}\):
+  </p>
+  \[
+    m(m(\cdots m(s_0, o_{\pi(1)}), \ldots), o_{\pi(n)})
+    \;=\;
+    m(m(\cdots m(s_0, o_{\sigma(1)}), \ldots), o_{\sigma(n)})
+  \]
+</div>
+
+<p>
+  CRDTBase achieves SEC by construction. Each column CRDT is proved to
+  satisfy the semilattice laws in Lean. The convergence framework
+  (<code>lean/CrdtBase/Convergence/Props.lean</code>) then lifts these
+  per-type properties to whole-table and whole-database convergence.
+</p>
+
+
+<!-- ================================================================ -->
+<!-- 2. DESIGN GOALS                                                   -->
+<!-- ================================================================ -->
+
+<h2 id="design-goals">2. Design Goals and Non-Goals</h2>
+
+<h3>Goals</h3>
+<ol>
+  <li><strong>Offline-first:</strong> Every replica can read and write
+    locally with zero network dependency. Sync happens when connectivity
+    permits.</li>
+  <li><strong>Multi-region:</strong> Replicas span continents. The
+    system is tested with Fly.io machines in Virginia (iad), London
+    (lhr), and Sydney (syd) against Tigris geo-replicated object
+    storage.</li>
+  <li><strong>SQL surface:</strong> Programmers interact through
+    <code>CREATE TABLE</code>, <code>ALTER TABLE ADD COLUMN</code>,
+    <code>INSERT</code>,
+    <code>UPDATE</code>, <code>SELECT</code>, <code>DELETE</code>, plus
+    CRDT-specific extensions (<code>INC</code>, <code>DEC</code>,
+    <code>ADD</code>, <code>REMOVE</code>).</li>
+  <li><strong>Formally verified core:</strong> All CRDT merge
+    functions, the HLC ordering, convergence theorems, compaction
+    correctness, table composition, replication safety, and SQL
+    compilation soundness are proved in Lean&nbsp;4.</li>
+  <li><strong>Platform-independent core:</strong> The CRDT logic,
+    SQL compiler, and merge functions have no platform dependencies.
+    Platform adapters (Node.js, browser) and storage backends (filesystem,
+    HTTP, S3/Tigris) are plugged in at the edges.</li>
+</ol>
+
+<h3>Non-goals</h3>
+<ul>
+  <li>Multi-row transactions</li>
+  <li>Foreign keys or referential integrity</li>
+  <li>Sub-millisecond latency (the system targets eventual consistency
+    with convergence measured in seconds, not microseconds)</li>
+</ul>
+
+<div class="note">
+  <span class="box-title">Note &mdash; Schema Evolution</span>
+  <p>
+    CRDTBase supports <code>CREATE TABLE</code> and
+    <code>ALTER TABLE ADD COLUMN</code>. Schema metadata is stored as
+    CRDT-replicated rows in <code>information_schema</code> tables,
+    so DDL changes propagate through the same replication pipeline as
+    data. The schema is append-only: <code>DROP COLUMN</code> and CRDT
+    type changes are not supported, but adding tables and columns works
+    across all replicas without coordination.
+  </p>
+</div>
+
+
+<!-- ================================================================ -->
+<!-- 3. SYSTEM DECOMPOSITION                                           -->
+<!-- ================================================================ -->
+
+<h2 id="system-decomposition">3. System Decomposition</h2>
+
+<p>
+  The codebase is organized into three architectural tiers: a
+  platform-independent <em>core</em>, a set of <em>platform
+  adapters</em>, and a set of <em>storage backends</em>. The Lean
+  verification layer sits alongside the core, mirroring its definitions
+  and proving their properties.
+</p>
+
+<div class="diagram-container">
+  <pre class="mermaid">
+graph TB
+    subgraph User["User Layer"]
+        SQL["SQL Statements<br/>(CREATE TABLE, ALTER TABLE,<br/>INSERT, SELECT, UPDATE, ...)"]
+    end
+
+    subgraph Core["Core Layer &mdash; src/core/"]
+        direction TB
+        Parser["SQL Parser<br/><code>sql.ts</code>"]
+        Planner["Execution Planner<br/><code>sql.ts</code>"]
+        Schema["Schema Module<br/><code>sql.ts (information_schema)</code>"]
+        OpGen["CRDT Op Generator<br/><code>sql.ts</code>"]
+        Eval["Op Applicator &amp; Materializer<br/><code>sqlEval.ts</code>"]
+        HLC["Hybrid Logical Clock<br/><code>hlc.ts</code>"]
+
+        subgraph CRDTs["CRDT Implementations"]
+            LWW["LWW Register<br/><code>crdt/lww.ts</code>"]
+            PN["PN-Counter<br/><code>crdt/pnCounter.ts</code>"]
+            OR["OR-Set<br/><code>crdt/orSet.ts</code>"]
+            MV["MV-Register<br/><code>crdt/mvRegister.ts</code>"]
+        end
+
+        Rep["Replication Protocol<br/><code>replication.ts</code>"]
+        Snap["Snapshot Store Interface<br/><code>snapshotStore.ts</code>"]
+        Comp["Compaction<br/><code>compaction.ts</code>"]
+        Enc["Encoding<br/><code>encoding.ts</code>"]
+    end
+
+    subgraph Platform["Platform Adapters"]
+        Node["NodeCrdtClient<br/><code>platform/node/</code>"]
+        Browser["BrowserCrdtClient<br/><code>platform/browser/</code>"]
+    end
+
+    subgraph Backends["Storage Backends &mdash; src/backend/"]
+        FileLog["File Log Server<br/><code>fileLogServer.ts</code>"]
+        S3Log["S3 Replicated Log<br/><code>s3ReplicatedLog.ts</code>"]
+        TigrisLog["Tigris Log<br/><code>tigrisReplicatedLog.ts</code>"]
+        TigrisSnap["Tigris Snapshot Store<br/><code>tigrisSnapshotStore.ts</code>"]
+        FsSnap["FS Snapshot Store<br/><code>fsSnapshotStore.ts</code>"]
+    end
+
+    subgraph Lean["Lean 4 Verification"]
+        LeanHLC["HLC Defs + Props"]
+        LeanCRDT["CRDT Defs + Props"]
+        LeanTable["Table Composition Proofs"]
+        LeanConv["Convergence Proofs"]
+        LeanSQL["SQL Model + Proofs"]
+        LeanRep["Replication Proofs"]
+        DRT["Differential Random Testing"]
+    end
+
+    SQL --> Parser --> Planner --> OpGen --> Eval
+    Planner --> Schema
+    Eval --> CRDTs
+    OpGen --> HLC
+    Eval --> Rep
+    Eval --> Snap
+    Comp --> Snap
+    Comp --> Rep
+    Eval --> Enc
+
+    Node --> Core
+    Browser --> Core
+    Node --> Backends
+    Browser --> S3Log
+
+    LeanHLC -.->|mirrors| HLC
+    LeanCRDT -.->|mirrors| CRDTs
+    LeanTable -.->|mirrors| Eval
+    LeanSQL -.->|mirrors| Parser
+    LeanRep -.->|mirrors| Rep
+    DRT -.->|tests| Core
+  </pre>
+  <div class="caption">
+    Figure 1.1 &mdash; Layered architecture of CRDTBase. Solid arrows indicate
+    runtime dependency; dashed arrows indicate the verification
+    correspondence between Lean and TypeScript. The Schema module under
+    Core manages DDL through CRDT-replicated <code>information_schema</code>
+    tables.
+  </div>
+</div>
+
+<h3>3.1 The Core Layer</h3>
+
+<p>
+  Everything under <code>src/core/</code> is platform-independent
+  TypeScript. It imports no Node.js, browser, or cloud APIs. The core
+  contains:
+</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Module</th>
+      <th>File</th>
+      <th>Responsibility</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>SQL Parser &amp; Planner</td>
+      <td><code>src/core/sql.ts</code></td>
+      <td>Parses SQL text into an AST, compiles write statements into
+        <code>EncodedCrdtOp</code> arrays, builds <code>SELECT</code>
+        query plans.</td>
+    </tr>
+    <tr>
+      <td>Schema Module</td>
+      <td><code>src/core/sql.ts</code></td>
+      <td>Manages <code>information_schema.tables</code> and
+        <code>information_schema.columns</code> as CRDT-backed virtual
+        tables. Translates <code>CREATE TABLE</code> and
+        <code>ALTER TABLE ADD COLUMN</code> into LWW ops against these
+        tables.</td>
+    </tr>
+    <tr>
+      <td>Op Applicator</td>
+      <td><code>src/core/sqlEval.ts</code></td>
+      <td>Applies CRDT ops to in-memory row state; materializes CRDT
+        state into plain values for query results.</td>
+    </tr>
+    <tr>
+      <td>HLC</td>
+      <td><code>src/core/hlc.ts</code></td>
+      <td>Hybrid Logical Clock type, packing, comparison, monotonic
+        wall-clock synthesis, drift rejection, and the persisted
+        monotonicity fence.</td>
+    </tr>
+    <tr>
+      <td>CRDT Types</td>
+      <td><code>src/core/crdt/*.ts</code></td>
+      <td>Four CRDT implementations: LWW Register, PN-Counter, OR-Set,
+        MV-Register.</td>
+    </tr>
+    <tr>
+      <td>Replication</td>
+      <td><code>src/core/replication.ts</code></td>
+      <td>The <code>ReplicatedLog</code> interface and contiguous-prefix
+        cursor safety.</td>
+    </tr>
+    <tr>
+      <td>Snapshot Store</td>
+      <td><code>src/core/snapshotStore.ts</code></td>
+      <td>The <code>SnapshotStore</code> interface for manifest, segment,
+        and schema persistence.</td>
+    </tr>
+    <tr>
+      <td>Compaction</td>
+      <td><code>src/core/compaction.ts</code></td>
+      <td>Segment file format, manifest format, bloom filter
+        construction, row partitioning, TTL-based tombstone pruning.</td>
+    </tr>
+    <tr>
+      <td>Encoding</td>
+      <td><code>src/core/encoding.ts</code></td>
+      <td>MessagePack encode/decode wrapper.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>3.2 Platform Adapters</h3>
+
+<p>
+  Platform adapters bind the core to a specific runtime environment.
+  Each adapter is a concrete client class that wires together a
+  <code>ReplicatedLog</code> implementation and a
+  <code>SnapshotStore</code> implementation with the core SQL engine.
+</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Adapter</th>
+      <th>File</th>
+      <th>Persistence</th>
+      <th>Snapshot Support</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>NodeCrdtClient</code></td>
+      <td><code>src/platform/node/nodeClient.ts</code></td>
+      <td>Atomic state bundle (<code>state_bundle.bin</code>) via
+        temp-file + <code>rename(2)</code>. Contains all row state,
+        pending ops, and sync cursors in a single atomic write.</td>
+      <td>Yes &mdash; downloads and hydrates segment files</td>
+    </tr>
+    <tr>
+      <td><code>BrowserCrdtClient</code></td>
+      <td><code>src/platform/browser/browserClient.ts</code></td>
+      <td>In-memory for rows, pending ops, and sync cursors.
+        HLC high-water mark persisted via <code>localStorage</code>.</td>
+      <td>Yes &mdash; supports segment hydration via
+        <code>SnapshotStore</code></td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>3.3 Storage Backends</h3>
+
+<p>
+  Backends implement the <code>ReplicatedLog</code> and
+  <code>SnapshotStore</code> interfaces against concrete storage
+  systems. The two interfaces are independent: a deployment can mix
+  backends (e.g., S3 for the log, filesystem for snapshots during
+  development).
+</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Backend</th>
+      <th>File</th>
+      <th>Implements</th>
+      <th>Transport</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>File Log Server</td>
+      <td><code>src/backend/fileLogServer.ts</code></td>
+      <td><code>ReplicatedLog</code> + <code>SnapshotStore</code></td>
+      <td>HTTP (Express)</td>
+    </tr>
+    <tr>
+      <td>S3 Replicated Log</td>
+      <td><code>src/backend/s3ReplicatedLog.ts</code></td>
+      <td><code>ReplicatedLog</code></td>
+      <td>S3 API (AWS SDK)</td>
+    </tr>
+    <tr>
+      <td>Tigris Replicated Log</td>
+      <td><code>src/backend/tigrisReplicatedLog.ts</code></td>
+      <td><code>ReplicatedLog</code></td>
+      <td>S3 API via Tigris endpoint</td>
+    </tr>
+    <tr>
+      <td>Tigris Snapshot Store</td>
+      <td><code>src/backend/tigrisSnapshotStore.ts</code></td>
+      <td><code>SnapshotStore</code></td>
+      <td>S3 API via Tigris endpoint</td>
+    </tr>
+    <tr>
+      <td>FS Snapshot Store</td>
+      <td><code>src/platform/node/fsSnapshotStore.ts</code></td>
+      <td><code>SnapshotStore</code></td>
+      <td>Local filesystem</td>
+    </tr>
+  </tbody>
+</table>
+
+
+<!-- ================================================================ -->
+<!-- 4. KEY INTERFACES                                                 -->
+<!-- ================================================================ -->
+
+<h2 id="key-interfaces">4. Key Interfaces</h2>
+
+<p>
+  Three interfaces define the boundaries between the core and its
+  environment. Understanding them is essential to understanding how the
+  system is assembled.
+</p>
+
+<div class="diagram-container">
+  <pre class="mermaid">
+classDiagram
+    class ReplicatedLog {
+        &lt;&lt;interface&gt;&gt;
+        +append(entry: AppendLogEntry) Promise~LogPosition~
+        +readSince(siteId: string, since: LogPosition) Promise~LogEntry[]~
+        +listSites() Promise~string[]~
+        +getHead(siteId: string) Promise~LogPosition~
+        +getSnapshotStore?() SnapshotStore | null
+    }
+
+    class SnapshotStore {
+        &lt;&lt;interface&gt;&gt;
+        +getManifest() Promise~ManifestFile | null~
+        +putManifest(manifest, expectedVersion) Promise~boolean~
+        +getSegment(path: string) Promise~Uint8Array | null~
+        +putSegment(path: string, data: Uint8Array) Promise~void~
+        +getSchema() Promise~SqlSchema | null~
+        +putSchema(schema: SqlSchema) Promise~void~
+    }
+
+    class NodeCrdtClient {
+        -rows: Map
+        -pendingOps: EncodedCrdtOp[]
+        -syncedSeqBySite: Map
+        +exec(sql: string) Promise~void~
+        +query(sql: string) Promise~rows~
+        +push() Promise~void~
+        +pull() Promise~void~
+    }
+
+    class FileLogServer {
+        +POST /logs/:siteId
+        +GET /logs/:siteId?since=N
+        +GET /logs
+        +PUT /manifest
+    }
+
+    class S3ReplicatedLog {
+        -bucket: string
+        -prefix: string
+        -client: S3Client
+    }
+
+    class TigrisSnapshotStore {
+        -bucket: string
+        -prefix: string
+        -client: S3Client
+    }
+
+    class FsSnapshotStore {
+        -rootDir: string
+    }
+
+    ReplicatedLog <|.. FileLogServer
+    ReplicatedLog <|.. S3ReplicatedLog
+    SnapshotStore <|.. TigrisSnapshotStore
+    SnapshotStore <|.. FsSnapshotStore
+
+    NodeCrdtClient --> ReplicatedLog : uses
+    NodeCrdtClient --> SnapshotStore : uses
+  </pre>
+  <div class="caption">
+    Figure 1.2 &mdash; Interface relationships. <code>NodeCrdtClient</code>
+    depends only on the abstract interfaces; concrete backends are
+    injected at construction time.
+  </div>
+</div>
+
+<h3>4.1 ReplicatedLog</h3>
+
+<p>
+  The <code>ReplicatedLog</code> is the sole mechanism for inter-replica
+  communication. It models a collection of per-site append-only logs,
+  where each log entry carries a sequence number, an HLC timestamp, and
+  a batch of CRDT operations.
+</p>
+
+<span class="file-ref">src/core/replication.ts:1&ndash;21</span>
+<pre><code>export type LogPosition = number;
+
+export type LogEntry = {
+  siteId: string;
+  hlc: string;       // hex-encoded packed HLC
+  seq: LogPosition;  // per-site monotonic sequence number
+  ops: EncodedCrdtOp[];
+};
+
+export type AppendLogEntry = Omit&lt;LogEntry, 'seq'&gt;;
+
+export interface ReplicatedLog {
+  append(entry: AppendLogEntry): Promise&lt;LogPosition&gt;;
+  readSince(siteId: string, since: LogPosition): Promise&lt;LogEntry[]&gt;;
+  listSites(): Promise&lt;string[]&gt;;
+  getHead(siteId: string): Promise&lt;LogPosition&gt;;
+  getSnapshotStore?(): SnapshotStore | null;
+}</code></pre>
+
+<div class="note">
+  <span class="box-title">Note &mdash; Per-Site Linearizability</span>
+  <p>
+    The log guarantees linearizable append within each site (no two
+    entries for the same site share a sequence number), but provides only
+    eventual consistency across sites. The S3 implementation achieves
+    per-site linearizability via <code>IfNoneMatch: '*'</code>
+    conditional PUTs: if two processes race to write the same sequence
+    number for the same site, only one succeeds.
+  </p>
+</div>
+
+<h3>4.2 SnapshotStore</h3>
+
+<p>
+  The <code>SnapshotStore</code> manages the compacted state of the
+  database. It stores segment files (merged CRDT state for a set of rows
+  in one table partition), a manifest that indexes them, and the
+  replicated schema.
+</p>
+
+<span class="file-ref">src/core/snapshotStore.ts:7&ndash;14</span>
+<pre><code>export interface SnapshotStore {
+  getManifest(): Promise&lt;ManifestFile | null&gt;;
+  putManifest(manifest: ManifestFile, expectedVersion: number): Promise&lt;boolean&gt;;
+  getSegment(path: string): Promise&lt;Uint8Array | null&gt;;
+  putSegment(path: string, data: Uint8Array): Promise&lt;void&gt;;
+  getSchema(): Promise&lt;SqlSchema | null&gt;;
+  putSchema(schema: SqlSchema): Promise&lt;void&gt;;
+}</code></pre>
+
+<p>
+  The <code>getSchema()</code> and <code>putSchema()</code> methods
+  persist the materialized <code>SqlSchema</code> alongside the
+  compacted segment data. This allows new clients to bootstrap with both
+  the schema and the row state from the snapshot store, without needing
+  to re-derive the schema from <code>information_schema</code> rows.
+</p>
+
+<div class="definition">
+  <span class="box-title">Definition 1.2 &mdash; Compare-and-Swap (CAS) Manifest</span>
+  <p>
+    The <code>putManifest</code> method is the <em>single point of
+    coordination</em> in the entire system. It accepts an
+    <code>expectedVersion</code> parameter: the write succeeds only if
+    the current manifest version matches the expected value. If another
+    compactor has updated the manifest concurrently, the call returns
+    <code>false</code> and the caller discards its work. This prevents
+    concurrent compaction jobs from corrupting each other while requiring
+    no distributed lock.
+  </p>
+</div>
+
+<h3>4.3 The Client Interface</h3>
+
+<p>
+  Both <code>NodeCrdtClient</code> and <code>BrowserCrdtClient</code>
+  present the same logical interface to application code:
+</p>
+
+<ul>
+  <li><code>exec(sql)</code> &mdash; Parse and execute a write statement.
+    Ops are applied to local state immediately and buffered for push.</li>
+  <li><code>query(sql)</code> &mdash; Execute a <code>SELECT</code>
+    statement against local materialized state.</li>
+  <li><code>push()</code> &mdash; Flush buffered ops to the replicated
+    log.</li>
+  <li><code>pull()</code> &mdash; Fetch and merge remote ops from the
+    replicated log.</li>
+</ul>
+
+
+<!-- ================================================================ -->
+<!-- 5. THE HYBRID LOGICAL CLOCK                                       -->
+<!-- ================================================================ -->
+
+<h2 id="hlc">5. The Hybrid Logical Clock</h2>
+
+<p>
+  The Hybrid Logical Clock (HLC) is the foundational ordering primitive
+  in CRDTBase. Every CRDT merge decision&mdash;which LWW register value
+  wins, which OR-Set add-tag is newer&mdash;ultimately reduces to
+  comparing HLC timestamps. The HLC combines a physical wall-clock
+  component with a logical counter to provide a total order on events
+  that (a)&nbsp;respects causality within a single site and
+  (b)&nbsp;approximates wall-clock time across sites.
+</p>
+
+<h3>5.1 Structure</h3>
+
+<p>
+  An HLC is a pair \((\mathit{wallMs}, \mathit{counter})\) where
+  \(\mathit{wallMs}\) is a 48-bit millisecond wall-clock timestamp and
+  \(\mathit{counter}\) is a 16-bit logical counter.
+</p>
+
+<span class="file-ref">src/core/hlc.ts:1&ndash;4</span>
+<pre><code>export type Hlc = {
+  wallMs: number;
+  counter: number;
+};</code></pre>
+
+<p>
+  Bounds constants and the configurable drift limit are defined at module
+  scope:
+</p>
+
+<span class="file-ref">src/core/hlc.ts:6&ndash;14</span>
+<pre><code>const WALL_MS_MAX = 2 ** 48;
+const COUNTER_MAX = 2 ** 16;
+export const HLC_DRIFT_LIMIT_MS = 60_000;
+
+export const HLC_LIMITS = {
+  wallMsMax: WALL_MS_MAX,
+  counterMax: COUNTER_MAX,
+  driftLimitMs: HLC_DRIFT_LIMIT_MS,
+};</code></pre>
+
+<h3>5.2 Bit Packing</h3>
+
+<p>
+  For efficient comparison, the HLC is packed into a single 64-bit
+  integer by shifting the wall-clock component left by 16 bits and
+  OR-ing in the counter. This produces a value where lexicographic
+  comparison of the packed integer is equivalent to comparing
+  \((\mathit{wallMs}, \mathit{counter})\) tuples.
+</p>
+
+<div class="diagram-container">
+  <pre class="mermaid">
+block-beta
+    columns 8
+    block:header:8
+        h1["Bit 63"]
+        h2["..."]
+        h3["Bit 16"]
+        h4["Bit 15"]
+        h5["..."]
+        h6["Bit 0"]
+    end
+    block:fields:8
+        wall["wallMs (48 bits)"]:6
+        counter["counter (16 bits)"]:2
+    end
+  </pre>
+  <div class="caption">
+    Figure 1.3 &mdash; HLC bit packing. The 48-bit wall-clock
+    occupies the high bits; the 16-bit counter occupies the low bits.
+    This layout ensures that higher wall-clock times always compare
+    greater, with the counter breaking ties within the same millisecond.
+  </div>
+</div>
+
+<p>
+  The packing is defined as:
+</p>
+
+\[
+  \mathrm{pack}(\mathit{wallMs}, \mathit{counter})
+  \;=\;
+  \mathit{wallMs} \cdot 2^{16} + \mathit{counter}
+\]
+
+<p>
+  with the constraints \(0 \le \mathit{wallMs} < 2^{48}\) and
+  \(0 \le \mathit{counter} < 2^{16}\). The 48-bit wall-clock range
+  covers approximately 8,900&nbsp;years from the Unix epoch, and the
+  16-bit counter allows up to 65,535 distinct events within a single
+  millisecond.
+</p>
+
+<span class="file-ref">src/core/hlc.ts:58&ndash;61</span>
+<pre><code>export function packHlc(hlc: Hlc): bigint {
+  assertHlcInBounds(hlc);
+  return (BigInt(hlc.wallMs) &lt;&lt; 16n) | BigInt(hlc.counter);
+}</code></pre>
+
+<h3>5.3 Comparison: Total Order on Events</h3>
+
+<p>
+  Two HLCs are compared by their packed values. For LWW registers,
+  ties&mdash;events with identical \((\mathit{wallMs},
+  \mathit{counter})\)&mdash;are broken by lexicographic comparison of
+  site IDs. This extended comparison
+  \((\mathit{wallMs}, \mathit{counter}, \mathit{siteId})\) constitutes
+  a <em>total order</em> on all events in the system: no two events from
+  distinct sites can be equal, because their site IDs differ.
+</p>
+
+<span class="file-ref">src/core/hlc.ts:70&ndash;75</span>
+<pre><code>export function compareWithSite(
+  a: Hlc, aSite: string, b: Hlc, bSite: string
+): number {
+  const hlcCmp = compareHlc(a, b);
+  if (hlcCmp !== 0) return hlcCmp;
+  if (aSite === bSite) return 0;
+  return aSite > bSite ? 1 : -1;
+}</code></pre>
+
+<div class="theorem">
+  <span class="box-title">Theorem 1.1 &mdash; HLC Total Order (Lean)</span>
+  <p>
+    The packed HLC comparison defines a total order. Formally, in
+    <code>lean/CrdtBase/Hlc/Props.lean:84&ndash;86</code>:
+  </p>
+  <p>
+    <code>hlc_total_order</code>: For any two HLC values \(a\) and
+    \(b\), exactly one of \(\mathrm{pack}(a) < \mathrm{pack}(b)\),
+    \(\mathrm{pack}(a) = \mathrm{pack}(b)\), or
+    \(\mathrm{pack}(a) > \mathrm{pack}(b)\) holds.
+  </p>
+  <p>
+    Additionally, <code>hlc_pack_preserves_order</code>
+    (<code>lean/CrdtBase/Hlc/Props.lean:89&ndash;105</code>)
+    proves that a higher wall-clock always yields a higher packed value, and
+    <code>hlc_counter_breaks_tie</code>
+    (<code>lean/CrdtBase/Hlc/Props.lean:108&ndash;122</code>)
+    proves that equal wall clocks are ordered exactly by their counters.
+  </p>
+</div>
+
+<h3>5.4 The Functional Clock API</h3>
+
+<p>
+  The HLC module exposes a factory-function design with standalone
+  monotonic primitives. The <code>createHlcClock()</code> factory
+  returns an <code>HlcClock</code> object that bundles a monotonic
+  wall-clock source with a configurable drift limit and two core
+  operations: <code>next()</code> for local events and
+  <code>recv()</code> for merging remote timestamps.
+</p>
+
+<span class="file-ref">src/core/hlc.ts:165&ndash;188</span>
+<pre><code>export type HlcClock = {
+  driftLimitMs: number;
+  nowWallMs(): number;
+  next(previous: Hlc | null): Hlc;
+  recv(local: Hlc | null, remote: Hlc): Hlc;
+};
+
+export function createHlcClock(options: {
+  nowWallMs?: () => number;
+  driftLimitMs?: number;
+} = {}): HlcClock {
+  const nowWallMs = options.nowWallMs ?? createMonotonicWallClock();
+  const driftLimitMs = normalizeDriftLimitMs(
+    options.driftLimitMs ?? HLC_DRIFT_LIMIT_MS
+  );
+  return {
+    driftLimitMs,
+    nowWallMs,
+    next(previous: Hlc | null): Hlc {
+      return nextMonotonicHlc(previous, nowWallMs(), driftLimitMs);
+    },
+    recv(local: Hlc | null, remote: Hlc): Hlc {
+      return recvMonotonicHlc(local, remote, nowWallMs(), driftLimitMs);
+    },
+  };
+}</code></pre>
+
+<p>
+  The two standalone functions implement the HLC protocol:
+</p>
+
+<ul>
+  <li><code>nextMonotonicHlc(previous, nowMs, driftLimitMs)</code>
+    (lines 92&ndash;108) &mdash; Advances the local clock for a local
+    event. Sets <code>wallMs = max(now, previous.wallMs)</code> and
+    increments the counter when the wall clock does not advance.</li>
+  <li><code>recvMonotonicHlc(local, remote, nowMs, driftLimitMs)</code>
+    (lines 110&ndash;133) &mdash; Merges a remote HLC with the local
+    state. Sets <code>wallMs = max(local.wallMs, remote.wallMs, now)</code>
+    and computes the counter from whichever input(s) contributed the
+    winning wall-clock value.</li>
+</ul>
+
+<h3>5.5 Monotonic Wall Clock Synthesis</h3>
+
+<p>
+  Raw <code>Date.now()</code> is not monotonic: NTP adjustments and
+  system suspend can cause it to jump backward. The
+  <code>createMonotonicWallClock()</code> function (lines 135&ndash;163)
+  synthesizes a monotonic source by combining <code>Date.now()</code>
+  with <code>performance.now()</code>:
+</p>
+
+<span class="file-ref">src/core/hlc.ts:135&ndash;163</span>
+<pre><code>export function createMonotonicWallClock(input: {
+  dateNow?: () => number;
+  performance?: MonotonicPerformance | null;
+} = {}): () => number {
+  const dateNow = input.dateNow ?? (() => Date.now());
+  const performanceClock = resolvePerformanceClock(input.performance);
+
+  if (performanceClock === null) {
+    let last = 0;
+    return () => {
+      const wallNow = normalizeMs(dateNow(), 'wall');
+      last = Math.max(last, wallNow);
+      return last;
+    };
+  }
+
+  let offsetMs = normalizeMs(dateNow(), 'wall')
+    - normalizeMs(performanceClock.now(), 'monotonic');
+  let last = 0;
+  return () => {
+    const monotonicNow = normalizeMs(performanceClock.now(), 'monotonic');
+    const wallNow = normalizeMs(dateNow(), 'wall');
+    const monotonicWallNow = offsetMs + monotonicNow;
+    if (wallNow > monotonicWallNow) {
+      offsetMs = wallNow - monotonicNow;
+    }
+    last = Math.max(last, offsetMs + monotonicNow, wallNow);
+    return last;
+  };
+}</code></pre>
+
+<p>
+  The design anchors <code>performance.now()</code> (monotonic but
+  relative) to <code>Date.now()</code> (absolute but potentially
+  non-monotonic). If <code>Date.now()</code> jumps forward
+  (NTP correction), the offset is re-anchored. The <code>last</code>
+  variable ensures strict monotonicity.
+</p>
+
+<h3>5.6 Drift Rejection</h3>
+
+<p>
+  The <code>assertHlcDrift()</code> function (lines 77&ndash;90) rejects
+  HLCs that exceed a configurable drift limit (default 60&nbsp;seconds)
+  against the local wall clock. Both <code>nextMonotonicHlc()</code> and
+  <code>recvMonotonicHlc()</code> call this function, ensuring that a
+  compromised or misconfigured replica cannot push the global clock
+  arbitrarily far into the future.
+</p>
+
+<span class="file-ref">src/core/hlc.ts:77&ndash;90</span>
+<pre><code>export function assertHlcDrift(
+  hlc: Hlc,
+  nowMs: number,
+  driftLimitMs: number = HLC_DRIFT_LIMIT_MS,
+): void {
+  const now = normalizeMs(nowMs, 'wall');
+  const driftLimit = normalizeDriftLimitMs(driftLimitMs);
+  assertHlcInBounds(hlc);
+  if (hlc.wallMs > now + driftLimit) {
+    throw new Error(
+      `HLC drift violation: wall clock ${hlc.wallMs}ms exceeds ` +
+      `local wall clock ${now}ms by more than ${driftLimit}ms`,
+    );
+  }
+}</code></pre>
+
+<h3>5.7 Monotonicity Enforcement</h3>
+
+<p>
+  Every site must emit strictly increasing HLCs. The
+  <code>PersistedHlcFence</code> class enforces this invariant: it
+  tracks a high-water mark, and any attempt to commit a non-increasing
+  HLC throws an error.
+</p>
+
+<span class="file-ref">src/core/hlc.ts:196&ndash;219</span>
+<pre><code>export class PersistedHlcFence {
+  private highWater: Hlc | null;
+
+  constructor(initial: Hlc | null = null) {
+    this.highWater = initial;
+  }
+
+  loadPersisted(highWater: Hlc | null): void {
+    this.highWater = highWater;
+  }
+
+  assertNext(candidate: Hlc): void {
+    assertHlcStrictlyIncreases(this.highWater, candidate);
+  }
+
+  commit(candidate: Hlc): void {
+    this.assertNext(candidate);
+    this.highWater = candidate;
+  }
+
+  snapshot(): Hlc | null {
+    return this.highWater;
+  }
+}</code></pre>
+
+<p>
+  The four methods form a CAS-like protocol:
+</p>
+<ol>
+  <li><code>loadPersisted()</code> &mdash; Restore high-water from
+    durable storage on startup.</li>
+  <li><code>assertNext()</code> &mdash; Check a candidate without
+    advancing state (for dry-run validation).</li>
+  <li><code>commit()</code> &mdash; Atomically assert and advance the
+    high-water mark.</li>
+  <li><code>snapshot()</code> &mdash; Read current high-water for
+    durable persistence.</li>
+</ol>
+
+<p>
+  The <code>NodeCrdtClient</code> persists the high-water mark inside
+  the atomic <code>state_bundle.bin</code> so that it survives process
+  restarts. When the client starts, it loads the persisted HLC and uses
+  it as the fence for all subsequent writes. This prevents two events
+  from different process lifetimes from sharing the same HLC, which
+  would violate the LWW event-consistency invariant.
+</p>
+
+<div class="note">
+  <span class="box-title">Note &mdash; Browser HLC Persistence via localStorage</span>
+  <p>
+    The <code>BrowserCrdtClient</code> persists its HLC high-water mark
+    in <code>localStorage</code>, keyed by site ID
+    (<code>crdtbase.browser.hlc.{siteId}</code>). Every local HLC tick
+    is written to storage immediately, and the persisted value is
+    restored at <code>open()</code> time. This prevents the critical
+    scenario where a page refresh within the same millisecond could
+    reuse an <code>(wallMs, counter)</code> pair, violating strict
+    monotonicity. The storage backend is injectable via
+    <code>BrowserCrdtClientOptions.storage</code> for testing or
+    non-browser environments.
+  </p>
+</div>
+
+<h3>5.8 HLC in Lean</h3>
+
+<p>
+  The Lean HLC is a <em>dependent type</em>: the structure carries
+  proof obligations that the wall-clock and counter are within bounds.
+  An out-of-bounds HLC cannot be constructed at all, eliminating an
+  entire class of runtime errors by construction.
+</p>
+
+<span class="file-ref">lean/CrdtBase/Hlc/Defs.lean:16&ndash;21</span>
+<pre><code>structure Hlc where
+  wallMs : Nat
+  counter : Nat
+  wallMs_lt : wallMs &lt; wallMsMax
+  counter_lt : counter &lt; counterMax
+  deriving Repr, DecidableEq</code></pre>
+
+<p>
+  Where the TypeScript implementation checks bounds at runtime and
+  throws, the Lean model enforces them at type-checking time. The
+  packing function uses multiplication rather than bit shift
+  (semantically equivalent for natural numbers):
+</p>
+
+\[
+  \mathrm{pack}_{\text{Lean}}(h)
+  \;=\;
+  h.\mathit{wallMs} \cdot \mathit{counterMax} + h.\mathit{counter}
+\]
+
+<div class="theorem">
+  <span class="box-title">Theorem 1.2 &mdash; HLC Monotonicity (Lean)</span>
+  <p>
+    Two key monotonicity theorems are proved in
+    <code>lean/CrdtBase/Hlc/Props.lean</code>:
+  </p>
+  <ol>
+    <li><code>hlc_now_monotonic</code> (lines 293&ndash;340): The
+      <code>now()</code> function always returns an HLC with a strictly
+      greater packed value than the previous emission.</li>
+    <li><code>hlc_recv_monotonic</code> (lines 352&ndash;460): The
+      <code>recv()</code> function returns an HLC strictly greater than
+      both the local high-water mark and the received remote HLC.</li>
+  </ol>
+  <p>
+    These proofs guarantee that the HLC monotonicity invariant holds
+    regardless of wall-clock drift or message reordering. Additional
+    supporting lemmas include <code>recv_none_of_drift</code> (drift
+    rejection), <code>recv_wallMs_monotonic</code> (wall-clock
+    dominance), and <code>compareWithSite_trans_lt</code>
+    (transitivity of the extended comparison).
+  </p>
+</div>
+
+
+<!-- ================================================================ -->
+<!-- 6. WRITE PATH                                                     -->
+<!-- ================================================================ -->
+
+<h2 id="write-path">6. Data Flow: The Write Path</h2>
+
+<p>
+  A write begins as a SQL string and ends as a set of delta objects
+  stored in the replicated log. The path has five stages: parsing,
+  planning, op generation, local application, and push.
+</p>
+
+<div class="diagram-container">
+  <pre class="mermaid">
+sequenceDiagram
+    participant App as Application
+    participant Client as NodeCrdtClient
+    participant Parser as SQL Parser
+    participant OpGen as Op Generator
+    participant HLC as HLC Fence
+    participant Rows as In-Memory Rows
+    participant Pending as Pending Buffer
+    participant Log as ReplicatedLog
+
+    App->>Client: exec("UPDATE tasks SET title='Ship' WHERE id='t1'")
+    Client->>Parser: parseSql(sql)
+    Parser-->>Client: SqlStatement AST
+    Client->>OpGen: generateCrdtOps(statement, schema, context)
+    OpGen->>HLC: nextHlc() [one per column]
+    HLC-->>OpGen: Hlc { wallMs, counter }
+    OpGen-->>Client: EncodedCrdtOp[]
+
+    Note over Client: Ops: [row_exists(true), cell_lww("title", "Ship")]
+
+    loop For each op
+        Client->>Rows: applyCrdtOpToRows(rows, op)
+        Rows-->>Client: merged state
+        Client->>Pending: pendingOps.push(op)
+    end
+
+    Client->>Client: persistStateFiles()
+
+    Note over App,Log: Later, when connectivity permits...
+
+    App->>Client: push()
+    Client->>Log: append({ siteId, hlc, ops })
+    Log-->>Client: seq = 42
+    Client->>Client: clear pending, update sync cursor
+    Client->>Client: persistStateFiles()
+  </pre>
+  <div class="caption">
+    Figure 1.4 &mdash; The write path. SQL is compiled to CRDT ops, applied locally,
+    buffered, and eventually pushed to the replicated log.
+  </div>
+</div>
+
+<h3>6.1 SQL to CRDT Ops</h3>
+
+<p>
+  The <code>generateCrdtOps</code> function in <code>src/core/sql.ts</code>
+  translates each SQL write statement into one or more
+  <code>EncodedCrdtOp</code> values. Every write statement first emits a
+  <code>row_exists</code> op (to ensure the row is marked alive), then
+  per-column ops whose kind depends on the column's CRDT type:
+</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>SQL Statement</th>
+      <th>Emitted Ops</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>INSERT INTO t (pk, c1, c2) VALUES (...)</code></td>
+      <td><code>row_exists(true)</code>, then per-column:
+        <code>cell_lww</code> / <code>cell_counter</code> /
+        <code>cell_or_set_add</code> / <code>cell_mv_register</code></td>
+    </tr>
+    <tr>
+      <td><code>UPDATE t SET c1 = v WHERE pk = k</code></td>
+      <td><code>row_exists(true)</code>, then <code>cell_lww</code> or
+        <code>cell_mv_register</code> per assignment</td>
+    </tr>
+    <tr>
+      <td><code>INC t.c BY n WHERE pk = k</code></td>
+      <td><code>row_exists(true)</code>,
+        <code>cell_counter(d='inc', n)</code></td>
+    </tr>
+    <tr>
+      <td><code>DELETE FROM t WHERE pk = k</code></td>
+      <td><code>row_exists(false)</code> only</td>
+    </tr>
+    <tr>
+      <td><code>CREATE TABLE t (...)</code></td>
+      <td>LWW ops against <code>information_schema.tables</code> and
+        <code>information_schema.columns</code></td>
+    </tr>
+    <tr>
+      <td><code>ALTER TABLE t ADD COLUMN c TYPE</code></td>
+      <td>LWW ops against <code>information_schema.columns</code></td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+  Each column op receives a <em>fresh HLC</em> via the context's
+  <code>nextHlc()</code> function. An <code>INSERT</code> touching five
+  columns thus produces six HLC ticks: one for <code>row_exists</code>
+  and one for each column. This ensures every cell write has a globally
+  unique timestamp.
+</p>
+
+<div class="note">
+  <span class="box-title">Note &mdash; DDL as CRDT Ops</span>
+  <p>
+    DDL statements (<code>CREATE TABLE</code>,
+    <code>ALTER TABLE ADD COLUMN</code>) do not follow a separate
+    execution path. Instead, they generate standard CRDT ops against the
+    <code>information_schema.tables</code> and
+    <code>information_schema.columns</code> virtual tables. These ops
+    flow through the same write path as data ops&mdash;applied locally,
+    buffered in pending, and pushed to the replicated log. Schema changes
+    converge across replicas via LWW merge on each metadata column,
+    with no special coordination protocol.
+  </p>
+</div>
+
+<h3>6.2 Self-Describing Ops</h3>
+
+<p>
+  Every <code>EncodedCrdtOp</code> carries its full routing key:
+  <code>(tbl, key, col, hlc, site)</code>. This is a deliberate design
+  choice: an op can be merged into any replica's state without requiring
+  a schema lookup. The op is self-describing. This property is
+  critical for the compactor, which must merge ops from all sites
+  without necessarily having the schema available at the time of
+  merge.
+</p>
+
+<h3>6.3 Local Application</h3>
+
+<p>
+  After generation, each op is immediately applied to the client's
+  in-memory row map via <code>applyCrdtOpToRows</code>
+  (<code>src/core/sqlEval.ts</code>). This function
+  dispatches on <code>op.kind</code> and invokes the appropriate CRDT
+  merge:
+</p>
+
+<ul>
+  <li><code>row_exists</code> &rarr; <code>mergeLww</code> on the
+    hidden <code>_exists</code> column</li>
+  <li><code>cell_lww</code> &rarr; <code>mergeLww</code> on the named
+    column</li>
+  <li><code>cell_counter</code> &rarr; <code>applyPnCounterDelta</code>
+    (additive, not max)</li>
+  <li><code>cell_or_set_add</code> &rarr; <code>mergeOrSet</code> with
+    a singleton element set</li>
+  <li><code>cell_or_set_remove</code> &rarr; <code>mergeOrSet</code>
+    with tombstone tags</li>
+  <li><code>cell_mv_register</code> &rarr;
+    <code>mergeMvRegister</code> with a singleton value</li>
+</ul>
+
+<p>
+  The result is that the local client sees its own writes immediately,
+  with no round-trip to the replicated log. This is the "offline-first"
+  guarantee: the client never blocks on the network for reads or writes.
+</p>
+
+
+<!-- ================================================================ -->
+<!-- 7. READ PATH                                                      -->
+<!-- ================================================================ -->
+
+<h2 id="read-path">7. Data Flow: The Read Path</h2>
+
+<p>
+  Reads are served entirely from local state. A
+  <code>SELECT</code> query is compiled into a
+  <code>SelectQueryPlan</code>, which specifies the table, filter
+  predicates, and projected columns. The plan is executed against the
+  in-memory row map, materializing CRDT state into plain values.
+</p>
+
+<div class="diagram-container">
+  <pre class="mermaid">
+sequenceDiagram
+    participant App as Application
+    participant Client as NodeCrdtClient
+    participant Log as ReplicatedLog
+    participant Snap as SnapshotStore
+    participant Rows as In-Memory Rows
+    participant Mat as Materializer
+
+    App->>Client: pull()
+    Client->>Snap: getManifest()
+    Snap-->>Client: ManifestFile (version N)
+    alt Newer manifest available
+        Client->>Snap: getSegment(path) [for each segment]
+        Snap-->>Client: SegmentFile bytes
+        Client->>Client: Rebuild rows from segments
+        Client->>Client: Re-apply pending ops (read-your-writes)
+    end
+    Client->>Log: listSites()
+    Log-->>Client: ["site-a", "site-b", "site-c"]
+    loop For each remote site
+        Client->>Log: readSince(siteId, cursor)
+        Log-->>Client: LogEntry[]
+        Client->>Client: takeContiguousEntriesSince(entries, cursor)
+        loop For each contiguous entry
+            Client->>Rows: applyCrdtOpToRows(rows, op)
+        end
+        Client->>Client: Advance cursor
+    end
+    Client->>Client: persistStateFiles()
+
+    Note over App,Mat: Later...
+
+    App->>Client: query("SELECT * FROM tasks WHERE id = 't1'")
+    Client->>Mat: runSelectPlan(rows, plan)
+    Mat->>Mat: Filter deleted rows (_exists = false)
+    Mat->>Mat: Apply WHERE predicates
+    Mat->>Mat: Materialize CRDT state to plain values
+    Mat-->>Client: [{ id: "t1", title: "Ship", points: 42, ... }]
+    Client-->>App: result rows
+  </pre>
+  <div class="caption">
+    Figure 1.5 &mdash; The read path. Pull synchronizes from the replicated
+    log and snapshot store; query materializes from local state.
+  </div>
+</div>
+
+<h3>7.1 Materialization</h3>
+
+<p>
+  Each CRDT type materializes to a plain JavaScript value differently:
+</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>CRDT Type</th>
+      <th>Tag</th>
+      <th>Materialized As</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>LWW Register</td>
+      <td>1</td>
+      <td>The winning value directly</td>
+    </tr>
+    <tr>
+      <td>PN-Counter</td>
+      <td>2</td>
+      <td>\(\sum \mathit{inc}(s) - \sum \mathit{dec}(s)\) over all
+        sites \(s\)</td>
+    </tr>
+    <tr>
+      <td>OR-Set</td>
+      <td>3</td>
+      <td>Array of distinct visible values</td>
+    </tr>
+    <tr>
+      <td>MV-Register</td>
+      <td>4</td>
+      <td>Single value if no conflict; array of concurrent values
+        otherwise</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>7.2 Contiguous Cursor Safety</h3>
+
+<p>
+  When pulling from an eventually-consistent store like S3, listing
+  operations may reveal objects out of order. A newly written
+  <code>seq=5</code> might appear in a listing before
+  <code>seq=4</code> has become visible. The
+  <code>takeContiguousEntriesSince</code> function prevents cursor
+  corruption by advancing the cursor only along a gapless prefix:
+</p>
+
+<span class="file-ref">src/core/replication.ts:30&ndash;48</span>
+<pre><code>export function takeContiguousEntriesSince(
+  entries: readonly LogEntry[],
+  since: LogPosition,
+): LogEntry[] {
+  const ordered = [...entries].sort(
+    (left, right) => left.seq - right.seq
+  );
+  const contiguous: LogEntry[] = [];
+  let expected = since + 1;
+  for (const entry of ordered) {
+    if (entry.seq &lt; expected) continue;
+    if (entry.seq !== expected) break;  // gap &mdash; stop here
+    contiguous.push(entry);
+    expected += 1;
+  }
+  return contiguous;
+}</code></pre>
+
+<div class="note">
+  <span class="box-title">Note &mdash; Why Gaps Are Dangerous</span>
+  <p>
+    If the cursor were allowed to skip past a gap (e.g., advancing from
+    seq=1 to seq=3 when seq=2 is not yet visible), the skipped entry
+    would be <em>permanently lost</em>: the cursor would never revisit
+    it. Contiguous-prefix enforcement ensures that every entry is
+    applied exactly once, in order, for each site.
+  </p>
+</div>
+
+
+<!-- ================================================================ -->
+<!-- 8. COMPACTION PATH                                                -->
+<!-- ================================================================ -->
+
+<h2 id="compaction-path">8. Data Flow: Compaction</h2>
+
+<p>
+  Over time, the replicated log accumulates thousands of delta files.
+  Compaction is the background process that merges deltas into sorted
+  <em>segment files</em>, enabling new clients to bootstrap quickly and
+  reducing the cost of pull operations.
+</p>
+
+<div class="diagram-container">
+  <pre class="mermaid">
+flowchart LR
+    subgraph Input
+        M0["Current Manifest<br/>(version N)"]
+        S1["Segment 1"]
+        S2["Segment 2"]
+        D1["Delta files<br/>(new since last compaction)"]
+    end
+
+    subgraph Process["Compactor"]
+        Load["Load existing<br/>segment rows"]
+        Apply["Apply new delta<br/>ops via CRDT merge"]
+        Prune["Prune expired<br/>tombstones (TTL)"]
+        Partition["Partition rows by<br/>table + partition key"]
+        Build["Build new segments<br/>(sorted rows, bloom filter)"]
+    end
+
+    subgraph Output
+        S3["New Segment 1'"]
+        S4["New Segment 2'"]
+        M1["New Manifest<br/>(version N+1)<br/>CAS write"]
+    end
+
+    M0 --> Load
+    S1 --> Load
+    S2 --> Load
+    D1 --> Apply
+    Load --> Apply --> Prune --> Partition --> Build
+    Build --> S3
+    Build --> S4
+    Build --> M1
+  </pre>
+  <div class="caption">
+    Figure 1.6 &mdash; Compaction data flow. Existing segments and new deltas
+    are merged; expired tombstones are pruned by TTL; new segments are
+    written; the manifest is atomically updated via compare-and-swap.
+  </div>
+</div>
+
+<p>
+  The compaction process, implemented in
+  <code>src/platform/node/compactor.ts</code>, proceeds as follows:
+</p>
+
+<ol>
+  <li><strong>Read the current manifest</strong> (or create an empty
+    one).</li>
+  <li><strong>Load all existing segments</strong> into a merged
+    in-memory row map.</li>
+  <li><strong>Read new deltas</strong> from the replicated log for each
+    site, starting from the last compacted sequence number.</li>
+  <li><strong>Apply all new ops</strong> to the row map via CRDT
+    merge.</li>
+  <li><strong>Prune expired tombstones</strong> using the configurable
+    retention policy. Two kinds of TTL-based pruning are applied:
+    <ul>
+      <li><em>Row tombstones:</em> If a row's <code>_exists</code>
+        register is <code>false</code> and its HLC is older than
+        <code>rowTombstoneTtlMs</code> (default 7&nbsp;days), the
+        entire row is removed from the segment.</li>
+      <li><em>OR-Set tombstones:</em> Within surviving rows, OR-Set
+        tombstones whose HLC is older than
+        <code>orSetTombstoneTtlMs</code> (default 7&nbsp;days) are
+        dropped, and the set is re-canonicalized.</li>
+    </ul>
+  </li>
+  <li><strong>Partition rows</strong> by table and partition key.</li>
+  <li><strong>Build new segment files</strong> with sorted rows, bloom
+    filters, and HLC watermarks.</li>
+  <li><strong>Write segments</strong> to the snapshot store.</li>
+  <li><strong>CAS-write the manifest.</strong> If the CAS fails
+    (another compactor won the race), discard the work. Orphaned
+    segments are harmless.</li>
+</ol>
+
+<div class="note">
+  <span class="box-title">Note &mdash; Compaction Correctness in Lean</span>
+  <p>
+    The Lean model proves that split-fold compaction is equivalent to a
+    full fold over all operations. The central theorem
+    <code>foldPrefixSuffix_eq_foldl</code>
+    (<code>lean/CrdtBase/Compaction/Props.lean:10&ndash;25</code>)
+    establishes that applying a merge function to a prefix (the
+    compacted segment) and then continuing with the suffix (new deltas)
+    yields the same result as applying the merge to the entire operation
+    list. Additional snapshot cutover theorems
+    (<code>snapshot_then_suffix_replay_eq_full_fold</code>,
+    <code>snapshot_cutover_idempotent_without_new_suffix</code>)
+    guarantee that a new node can load a compacted snapshot and replay
+    only the suffix of uncompacted ops, arriving at the same state as a
+    full replay from scratch.
+  </p>
+</div>
+
+
+<!-- ================================================================ -->
+<!-- 9. FORMAL VERIFICATION                                            -->
+<!-- ================================================================ -->
+
+<h2 id="formal-verification">9. The Formal Verification Layer</h2>
+
+<p>
+  CRDTBase maintains a parallel implementation in Lean&nbsp;4 that
+  serves two purposes: (1)&nbsp;as a <em>specification</em>, defining
+  what the system should do, and (2)&nbsp;as a <em>proof artifact</em>,
+  mechanically verifying that the specification satisfies the properties
+  required for convergence.
+</p>
+
+<h3>9.1 Correspondence</h3>
+
+<p>
+  Each TypeScript core module has a corresponding Lean module:
+</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>TypeScript (Runtime)</th>
+      <th>Lean (Specification + Proofs)</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>src/core/hlc.ts</code></td>
+      <td><code>lean/CrdtBase/Hlc/Defs.lean</code> +
+        <code>Props.lean</code></td>
+    </tr>
+    <tr>
+      <td><code>src/core/crdt/lww.ts</code></td>
+      <td><code>lean/CrdtBase/Crdt/Lww/Defs.lean</code> +
+        <code>Props.lean</code></td>
+    </tr>
+    <tr>
+      <td><code>src/core/crdt/pnCounter.ts</code></td>
+      <td><code>lean/CrdtBase/Crdt/PnCounter/Defs.lean</code> +
+        <code>Props.lean</code></td>
+    </tr>
+    <tr>
+      <td><code>src/core/crdt/orSet.ts</code></td>
+      <td><code>lean/CrdtBase/Crdt/OrSet/Defs.lean</code> +
+        <code>Props.lean</code></td>
+    </tr>
+    <tr>
+      <td><code>src/core/crdt/mvRegister.ts</code></td>
+      <td><code>lean/CrdtBase/Crdt/MvRegister/Defs.lean</code> +
+        <code>Props.lean</code></td>
+    </tr>
+    <tr>
+      <td><code>src/core/sqlEval.ts</code></td>
+      <td><code>lean/CrdtBase/Crdt/Table/Defs.lean</code> +
+        <code>Props.lean</code></td>
+    </tr>
+    <tr>
+      <td><code>src/core/compaction.ts</code></td>
+      <td><code>lean/CrdtBase/Compaction/Defs.lean</code> +
+        <code>Props.lean</code></td>
+    </tr>
+    <tr>
+      <td><code>src/core/replication.ts</code></td>
+      <td><code>lean/CrdtBase/Replication/Defs.lean</code> +
+        <code>Props.lean</code></td>
+    </tr>
+    <tr>
+      <td><code>src/core/sql.ts</code> +
+        <code>src/core/sqlEval.ts</code></td>
+      <td><code>lean/CrdtBase/Sql/Defs.lean</code> +
+        <code>Props.lean</code></td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>9.2 Proof Inventory</h3>
+
+<p>
+  The Lean codebase contains approximately 94 proved theorems across
+  eight tiers:
+</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Tier</th>
+      <th>Theorems</th>
+      <th>Key Properties</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>CRDT Semilattice</td>
+      <td>21</td>
+      <td>Commutativity, associativity, idempotence for all four types;
+        event-consistency guards; OR-Set idempotence chain</td>
+    </tr>
+    <tr>
+      <td>HLC Ordering</td>
+      <td>21</td>
+      <td>Total order, monotonicity, drift rejection, bounds proofs,
+        max3 lemmas, <code>compareWithSite</code> transitivity</td>
+    </tr>
+    <tr>
+      <td>Convergence</td>
+      <td>9</td>
+      <td>Permutation invariance of fold over commutative merge;
+        per-type convergence; composite convergence</td>
+    </tr>
+    <tr>
+      <td>Compaction</td>
+      <td>10</td>
+      <td>Split-fold equivalence, per-type preservation, snapshot
+        cutover correctness</td>
+    </tr>
+    <tr>
+      <td>Tombstone</td>
+      <td>3</td>
+      <td>Delete-wins-if-later, write-resurrects-if-later, stability
+        without new writes</td>
+    </tr>
+    <tr>
+      <td>Table Composition</td>
+      <td>16</td>
+      <td>Row and table commutativity, associativity, idempotence
+        under validity predicates; visibility preservation;
+        cross-column commutativity; disjoint-key commutativity</td>
+    </tr>
+    <tr>
+      <td>SQL Soundness</td>
+      <td>10</td>
+      <td>Type soundness of generated ops, syncability, partition
+        routing correctness, filter preservation</td>
+    </tr>
+    <tr>
+      <td>Replication</td>
+      <td>4</td>
+      <td><code>readSince</code> returns entries strictly after cursor;
+        watermark aliasing; compacted prefix exclusion</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>9.3 The Convergence Framework</h3>
+
+<p>
+  The abstract convergence theorem is stated in
+  <code>lean/CrdtBase/Convergence/Props.lean:14&ndash;18</code>. It
+  uses Lean&nbsp;4's <code>List.Perm.foldl_eq</code> lemma: a
+  <code>foldl</code> over a <code>RightCommutative</code> function is
+  invariant under permutation.
+</p>
+
+<span class="file-ref">lean/CrdtBase/Convergence/Props.lean:14&ndash;18</span>
+<pre><code>theorem convergence_of_perm {sigma alpha : Type}
+    (step : sigma -> alpha -> sigma) [RightCommutative step]
+    (init : sigma) {ops1 ops2 : List alpha}
+    (hPerm : List.Perm ops1 ops2) :
+    applyOps step init ops1 = applyOps step init ops2</code></pre>
+
+<p>
+  A bridge theorem, <code>convergence_of_comm_assoc</code>, constructs
+  a <code>RightCommutative</code> instance from raw commutativity and
+  associativity proofs, enabling each CRDT type to plug in its own
+  semilattice proofs:
+</p>
+
+\[
+  \underbrace{m(m(a, b), c) = m(a, m(b, c))}_{\text{associativity}}
+  \;\land\;
+  \underbrace{m(a, b) = m(b, a)}_{\text{commutativity}}
+  \;\implies\;
+  \underbrace{m(m(a, b), c) = m(m(a, c), b)}_{\text{right-commutativity}}
+\]
+
+<h3>9.4 Table Composition</h3>
+
+<p>
+  The Lean table model (<code>lean/CrdtBase/Crdt/Table/</code>) proves
+  that composing the four CRDT types into a single row and lifting to
+  a table preserves the semilattice laws. Key results include:
+</p>
+
+<ul>
+  <li><strong>Row-level semilattice:</strong>
+    <code>mergeTableRow_comm_of_valid</code>,
+    <code>mergeTableRow_assoc_of_valid</code>,
+    <code>mergeTableRow_idem_of_valid</code> under
+    <code>ValidTableRowPair</code>/<code>Triple</code> predicates.</li>
+  <li><strong>Table-level lifting:</strong>
+    <code>mergeTable_comm_of_valid</code>,
+    <code>mergeTable_assoc_of_valid</code>,
+    <code>mergeTable_idem_of_valid</code> via <code>funext</code> over
+    keys.</li>
+  <li><strong>Cross-column commutativity:</strong> Updates to
+    independent columns (e.g., counter and register) commute.</li>
+  <li><strong>Disjoint-key commutativity:</strong>
+    <code>modify_row_at_disjoint_commute</code> proves that updates at
+    different primary keys commute at the whole-table level.</li>
+</ul>
+
+<h3>9.5 Replication Safety</h3>
+
+<p>
+  The Lean replication model
+  (<code>lean/CrdtBase/Replication/Props.lean</code>) proves four
+  theorems that guarantee the contiguous-prefix cursor protocol is
+  sound:
+</p>
+
+<ul>
+  <li><code>readSince_mem_gt_since</code>: Every entry returned by
+    <code>readSince</code> has a sequence number strictly greater than
+    the cursor.</li>
+  <li><code>readSince_compacted_prefix_exclusion</code>: Entries at
+    or below the compaction watermark are never replayed, guaranteeing
+    that compacted ops are not double-applied.</li>
+</ul>
+
+<h3>9.6 Differential Random Testing</h3>
+
+<p>
+  The DRT executable (<code>lean/CrdtBase/DiffTest/Main.lean</code>,
+  910 lines) is a JSON Lines protocol server. The TypeScript test
+  harness generates random inputs&mdash;random CRDT states, random SQL
+  statements, random operation sequences&mdash;and pipes them through
+  both the Lean executable and the TypeScript implementation. Any
+  divergence in output is a bug in one of the two codebases.
+</p>
+
+<p>
+  This follows the Cedar verification methodology: the Lean model is
+  the source of truth for <em>what</em> the system should do, while
+  the TypeScript code is the source of truth for <em>how</em> it runs
+  in production.
+</p>
+
+
+<!-- ================================================================ -->
+<!-- 10. SUMMARY                                                       -->
+<!-- ================================================================ -->
+
+<h2 id="summary">10. Summary</h2>
+
+<p>
+  The CRDTBase architecture can be distilled into five principles:
+</p>
+
+<ol>
+  <li><strong>Every column is a CRDT.</strong> The relational model is
+    preserved for the programmer, but beneath the SQL surface, every
+    non-primary-key column is backed by one of four CRDT types (LWW
+    Register, PN-Counter, OR-Set, MV-Register). Merge semantics are
+    deterministic and require no coordination. Schema metadata is itself
+    stored as CRDT-replicated rows, so DDL propagates through the same
+    pipeline as data.</li>
+
+  <li><strong>The HLC is the universal ordering primitive.</strong> A
+    packed 64-bit hybrid logical clock, backed by a monotonic wall-clock
+    synthesizer and configurable drift rejection, provides a total order
+    on all events across all replicas. Extended with site-ID
+    tiebreaking, every merge decision reduces to comparing HLC
+    values. Both Node and browser clients persist the HLC high-water
+    mark across restarts to guarantee strict monotonicity.</li>
+
+  <li><strong>Two interfaces define the boundary.</strong> The
+    <code>ReplicatedLog</code> carries deltas between replicas; the
+    <code>SnapshotStore</code> carries compacted state and schema. The
+    core depends only on these interfaces, not on any specific storage
+    technology.</li>
+
+  <li><strong>Reads are local, writes are local, sync is
+    asynchronous.</strong> The client applies writes to in-memory state
+    immediately. Pushes flush to the log; pulls merge from the log.
+    Reads never block on the network. The atomic state bundle ensures
+    crash-safe persistence of all local state.</li>
+
+  <li><strong>Formal proofs and random testing close the trust
+    gap.</strong> Ninety-four Lean theorems establish that the merge
+    functions satisfy semilattice laws, that table composition preserves
+    convergence, that compaction is state-preserving, and that
+    replication cursors never skip entries. Differential random testing
+    verifies that the TypeScript implementation agrees with the Lean
+    specification across all CRDT types, SQL compilation, and
+    replication. Together, they provide high assurance of correctness
+    without requiring exhaustive manual testing.</li>
+</ol>
+
+<p>
+  The chapters that follow develop each of these themes in detail.
+  Chapter&nbsp;2 examines the four CRDT types and their proofs.
+  Chapter&nbsp;3 traces the SQL compilation pipeline. Later chapters
+  cover replication, compaction, the stress test infrastructure, and
+  the Lean verification methodology.
+</p>
+
+
+<!-- ================================================================ -->
+<!-- NAVIGATION                                                        -->
+<!-- ================================================================ -->
+
+<nav class="chapter-nav">
+  <a class="prev" href="index.html">Table of Contents</a>
+  <span>Chapter 1</span>
+  <a class="next" href="ch02-crdts.html">CRDTs and Their Proofs</a>
+</nav>
+
+</body>
+</html>

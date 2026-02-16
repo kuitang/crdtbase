@@ -1,0 +1,1647 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Chapter 7: End-to-End: Three Clients Across the Globe &mdash; CRDTBase</title>
+  <link rel="stylesheet" href="style.css">
+
+  <!-- MathJax -->
+  <script>
+    window.MathJax = {
+      tex: {
+        inlineMath: [['\\(','\\)']],
+        displayMath: [['\\[','\\]']],
+      },
+    };
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+
+  <!-- Mermaid -->
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({startOnLoad:true, theme:'neutral'});
+  </script>
+</head>
+<body>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch06-compaction.html">Chapter 6: Compaction</a>
+  <span>Chapter 7</span>
+  <a class="next" href="index.html">Back to Index</a>
+</nav>
+
+<h1>
+  <span class="chapter-num">Chapter 7</span>
+  End-to-End: Three Clients Across the Globe
+</h1>
+
+<div class="toc">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#scenario">The Scenario: Three Regions, One Database</a></li>
+    <li><a href="#tigris">How Tigris S3 Geo-Replication Works</a></li>
+    <li><a href="#walkthrough">Concrete Walkthrough: Insert, Update, Increment</a></li>
+    <li><a href="#push-pull">The Push/Pull Sync Cadence</a></li>
+    <li><a href="#atomic-persistence">Atomic State Persistence</a></li>
+    <li><a href="#snapshot-coverage">Snapshot Coverage Gate</a></li>
+    <li><a href="#stress-test">The Multi-Region Stress Test</a></li>
+    <li><a href="#timing-results">Timing Results (2026-02-15)</a></li>
+    <li><a href="#consistency-headers">Consistency Headers and the Two-Tier Model</a></li>
+    <li><a href="#partition">Network Partition and Offline-First Semantics</a></li>
+    <li><a href="#deployment">Deployment Topology</a></li>
+    <li><a href="#issues">Issue Resolution Summary</a></li>
+    <li><a href="#assessment-final">Correctness Assessment</a></li>
+  </ol>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="scenario">7.1 &ensp; The Scenario: Three Regions, One Database</h2>
+
+<p>
+  Every chapter so far has developed a single piece of the CRDTBase puzzle in
+  isolation: the HLC clock, the CRDT types, the SQL compiler, the replicated log,
+  the compaction layer. In this final chapter we assemble the complete machine and
+  watch it run. Our scenario places three independent clients on three different
+  continents, each performing local reads and writes with no coordination, and
+  then synchronizing through a single shared medium: Tigris, an S3-compatible
+  object store with automatic global geo-replication.
+</p>
+
+<p>
+  The three clients are:
+</p>
+
+<table>
+  <thead>
+    <tr><th>Client</th><th>Site ID</th><th>Fly.io Region</th><th>Location</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Client A</td><td><code>site-a</code></td><td><code>iad</code></td><td>Virginia, USA (US-East)</td></tr>
+    <tr><td>Client B</td><td><code>site-b</code></td><td><code>lhr</code></td><td>London, UK (Europe)</td></tr>
+    <tr><td>Client C</td><td><code>site-c</code></td><td><code>syd</code></td><td>Sydney, Australia (Asia-Pacific)</td></tr>
+  </tbody>
+</table>
+
+<div class="diagram-container">
+  <pre class="mermaid">
+graph LR
+  subgraph "North America"
+    A["Client A<br/><b>site-a</b><br/>IAD (Virginia)"]
+  end
+
+  subgraph "Europe"
+    B["Client B<br/><b>site-b</b><br/>LHR (London)"]
+  end
+
+  subgraph "Asia-Pacific"
+    C["Client C<br/><b>site-c</b><br/>SYD (Sydney)"]
+  end
+
+  subgraph "Tigris Object Storage"
+    T["Global S3 Bucket<br/><i>auto geo-replicated</i>"]
+  end
+
+  A -- "push / pull" --> T
+  B -- "push / pull" --> T
+  C -- "push / pull" --> T
+  T -. "auto-replicate<br/>IAD ↔ LHR ↔ SYD" .-> T
+  </pre>
+  <div class="caption">Figure 7.1 &mdash; Three-continent topology with Tigris geo-replication.</div>
+</div>
+
+<p>
+  The key insight of the architecture: Tigris handles the hard problem of
+  geo-replicating bytes across regions, while CRDTBase handles the hard problem
+  of merging concurrent writes deterministically. Together, they achieve
+  multi-region eventual consistency without any central coordination server.
+</p>
+
+<!-- ================================================================== -->
+<h2 id="tigris">7.2 &ensp; How Tigris S3 Geo-Replication Works</h2>
+
+<div class="definition">
+  <span class="box-title">Definition 7.1 &mdash; Tigris Object Storage</span>
+  <p>
+    Tigris is an S3-compatible object store built specifically for Fly.io.
+    Its distinguishing property is <strong>automatic geo-replication</strong>:
+    when a client PUTs an object from any region, Tigris automatically
+    replicates it to all regions where it has presence. The client does not
+    need to specify a target region; the SDK sends <code>region: 'auto'</code>
+    and Tigris routes the request to the nearest point of presence.
+  </p>
+</div>
+
+<p>
+  From the perspective of CRDTBase, Tigris provides three guarantees:
+</p>
+
+<ol>
+  <li>
+    <strong>S3 API compatibility.</strong> Standard <code>PutObject</code>,
+    <code>GetObject</code>, <code>ListObjectsV2</code>, and conditional
+    headers (<code>IfNoneMatch</code>, <code>IfMatch</code>) work as expected.
+  </li>
+  <li>
+    <strong>Eventual consistency for reads.</strong> After a PUT completes in
+    one region, the object becomes visible in other regions within tens to
+    hundreds of milliseconds (typically 10&ndash;50&thinsp;ms same-continent,
+    50&ndash;200&thinsp;ms cross-continent, 100&ndash;400&thinsp;ms cross-ocean).
+  </li>
+  <li>
+    <strong>Strong consistency on demand.</strong> The
+    <code>X-Tigris-Consistent: true</code> header routes a GET through the
+    global leader, guaranteeing a linearizable read.
+  </li>
+</ol>
+
+<div class="definition">
+  <span class="box-title">Definition 7.2 &mdash; Two-Tier Consistency Model</span>
+  <p>
+    CRDTBase uses a two-tier consistency model against Tigris:
+  </p>
+  <ul>
+    <li>
+      <strong>Deltas</strong> (the replicated log): eventual consistency.
+      Missing a recent delta is harmless because the next pull catches it,
+      and CRDT merge is idempotent.
+    </li>
+    <li>
+      <strong>Manifest</strong> (the compaction coordination point): strong
+      consistency via <code>X-Tigris-Consistent: true</code> on GET and
+      <code>IfMatch</code> ETag conditional on PUT. This prevents concurrent
+      compaction jobs from corrupting each other.
+    </li>
+  </ul>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="walkthrough">7.3 &ensp; Concrete Walkthrough: Insert, Update, Increment</h2>
+
+<p>
+  We now walk through a concrete scenario with three concurrent operations on the
+  same row. All three clients share a <code>tasks</code> table created by:
+</p>
+
+<pre><code>CREATE TABLE tasks (
+  id PRIMARY KEY,
+  title LWW&lt;STRING&gt;,
+  points COUNTER,
+  tags SET&lt;STRING&gt;,
+  status REGISTER&lt;STRING&gt;
+);</code></pre>
+
+<p>
+  In the stress test, this <code>CREATE TABLE</code> is executed by a designated
+  <em>schema owner</em> (determined by seed), which then pushes the schema and
+  seed rows to Tigris. The other workers poll until they receive the seeded
+  rows via pull, exercising the full schema replication path through the
+  distributed system.
+</p>
+
+<span class="file-ref">test/stress/flyWorker.ts:766&ndash;783</span>
+<pre><code>if (config.siteId === schemaOwner) {
+  await client.exec(CREATE_TASKS_TABLE_SQL);
+  for (const rowId of rowIds) {
+    await client.exec(
+      [
+        'INSERT INTO tasks (id, title, points, tags, status) VALUES (',
+        `'${escapeSqlString(rowId)}',`,
+        `'seed-${escapeSqlString(rowId)}',`,
+        '0,',
+        `'seed-${escapeSqlString(rowId)}',`,
+        `'open'`,
+        ');',
+      ].join(' '),
+    );
+  }
+  await client.push();
+}</code></pre>
+
+<h3>Step 1: Client A inserts a task (IAD)</h3>
+
+<pre><code>-- Client A (site-a), IAD
+INSERT INTO tasks (id, title) VALUES ('t1', 'Ship it');</code></pre>
+
+<p>
+  The SQL compiler translates this into two CRDT operations:
+</p>
+
+<span class="file-ref">src/platform/node/nodeClient.ts:120&ndash;144</span>
+<pre><code>// Generated EncodedCrdtOps:
+[
+  { tbl: "tasks", key: "t1", col: "__pk",  kind: "cell_lww",
+    hlc: "0x18e4a2b3c0000001", site: "site-a", val: "t1" },
+  { tbl: "tasks", key: "t1", col: "title", kind: "cell_lww",
+    hlc: "0x18e4a2b3c0000002", site: "site-a", val: "Ship it" }
+]</code></pre>
+
+<p>
+  These ops are applied to local state immediately via
+  <code>applyCrdtOpToRows</code>, then buffered in <code>pendingOps</code>.
+  Client A then calls <code>push()</code>, which serializes them into a
+  MessagePack delta file and PUTs it to Tigris:
+</p>
+
+<pre><code>deltas/site-a/0000000001.delta.bin</code></pre>
+
+<h3>Step 2: Client B updates the title (LHR)</h3>
+
+<pre><code>-- Client B (site-b), LHR
+UPDATE tasks SET title = 'Ship it now' WHERE id = 't1';</code></pre>
+
+<p>
+  Client B generates a single LWW cell operation with a <em>later</em> HLC timestamp
+  (the wall clock in London is 50&thinsp;ms ahead of Virginia in this example):
+</p>
+
+<pre><code>{ tbl: "tasks", key: "t1", col: "title", kind: "cell_lww",
+  hlc: "0x18e4a2b6800000001", site: "site-b", val: "Ship it now" }</code></pre>
+
+<p>
+  After push, this becomes:
+</p>
+
+<pre><code>deltas/site-b/0000000001.delta.bin</code></pre>
+
+<h3>Step 3: Client C increments a counter (SYD)</h3>
+
+<pre><code>-- Client C (site-c), SYD
+INC tasks.points BY 5 WHERE id = 't1';</code></pre>
+
+<p>
+  The counter increment produces a PN-Counter delta. Unlike LWW, counters do not
+  compete &mdash; each site's contribution is tracked independently:
+</p>
+
+<pre><code>{ tbl: "tasks", key: "t1", col: "points", kind: "cell_counter",
+  hlc: "0x18e4a2b4200000001", site: "site-c",
+  direction: "inc", amount: 5 }</code></pre>
+
+<p>After push:</p>
+<pre><code>deltas/site-c/0000000001.delta.bin</code></pre>
+
+<h3>Step 4: Tigris Geo-Replication</h3>
+
+<p>
+  After each PUT succeeds, Tigris automatically replicates the delta object to
+  all regions. Within 50&ndash;200&thinsp;ms, all three delta files are visible
+  from any region.
+</p>
+
+<div class="diagram-container">
+  <pre class="mermaid">
+sequenceDiagram
+    participant A as Client A (IAD)
+    participant T as Tigris S3
+    participant B as Client B (LHR)
+    participant C as Client C (SYD)
+
+    Note over A,C: Phase 1: Concurrent Local Writes
+    A->>A: INSERT title='Ship it'
+    B->>B: UPDATE title='Ship it now'
+    C->>C: INC points BY 5
+
+    Note over A,C: Phase 2: Push to Tigris
+    A->>T: PUT deltas/site-a/0000000001.delta.bin
+    B->>T: PUT deltas/site-b/0000000001.delta.bin
+    C->>T: PUT deltas/site-c/0000000001.delta.bin
+
+    Note over T: Tigris auto-replicates across IAD, LHR, SYD
+
+    Note over A,C: Phase 3: Pull from Tigris
+    A->>T: LIST deltas/ → discovers site-b, site-c
+    T-->>A: GET deltas/site-b/...  GET deltas/site-c/...
+    A->>A: CRDT merge: title='Ship it now', points=5
+
+    B->>T: LIST deltas/ → discovers site-a, site-c
+    T-->>B: GET deltas/site-a/...  GET deltas/site-c/...
+    B->>B: CRDT merge: title='Ship it now', points=5
+
+    C->>T: LIST deltas/ → discovers site-a, site-b
+    T-->>C: GET deltas/site-a/...  GET deltas/site-b/...
+    C->>C: CRDT merge: title='Ship it now', points=5
+
+    Note over A,C: All three converge to identical state
+  </pre>
+  <div class="caption">Figure 7.2 &mdash; Sequence diagram of the complete push/replicate/pull cycle.</div>
+</div>
+
+<h3>Step 5: CRDT Merge Produces Identical Final State</h3>
+
+<p>
+  When each client pulls, it fetches the delta files from the other two sites and
+  applies them through <code>applyCrdtOpToRows</code>. The merge semantics differ
+  by CRDT type:
+</p>
+
+<h4>LWW Register: <code>title</code></h4>
+
+<p>
+  Client A wrote <code>'Ship it'</code> with HLC <code>0x18e4a2b3c0000002</code>.
+  Client B wrote <code>'Ship it now'</code> with HLC <code>0x18e4a2b6800000001</code>.
+  The LWW merge function selects the higher HLC:
+</p>
+
+<span class="file-ref">src/core/crdt/lww.ts:23&ndash;30</span>
+<pre><code>export function mergeLww&lt;T&gt;(a: LwwRegister&lt;T&gt;, b: LwwRegister&lt;T&gt;): LwwRegister&lt;T&gt; {
+  assertLwwEventConsistency(a, b);
+  const cmp = compareWithSite(a.hlc, a.site, b.hlc, b.site);
+  if (cmp >= 0) {
+    return a;   // local wins (higher HLC, or same HLC + higher site ID)
+  }
+  return b;     // remote wins
+}</code></pre>
+
+<p>
+  The comparison is formalized as a total order on (HLC, site) pairs:
+</p>
+
+\[
+  (h_1, s_1) > (h_2, s_2) \iff
+  \mathrm{pack}(h_1) > \mathrm{pack}(h_2)
+  \;\lor\;
+  \bigl(\mathrm{pack}(h_1) = \mathrm{pack}(h_2) \;\land\; s_1 >_{\text{lex}} s_2\bigr)
+\]
+
+<p>
+  where \(\mathrm{pack}(h) = \mathit{wallMs} \ll 16 \;|\; \mathit{counter}\)
+  is the 64-bit packed representation.
+</p>
+
+<span class="file-ref">src/core/hlc.ts:28&ndash;33</span>
+<pre><code>export function compareWithSite(a: Hlc, aSite: string, b: Hlc, bSite: string): number {
+  const hlcCmp = compareHlc(a, b);
+  if (hlcCmp !== 0) return hlcCmp;
+  if (aSite === bSite) return 0;
+  return aSite > bSite ? 1 : -1;
+}</code></pre>
+
+<p>
+  Since <code>0x18e4a2b6800000001 > 0x18e4a2b3c0000002</code>, Client B's
+  value wins. All three clients converge to <code>title = 'Ship it now'</code>.
+</p>
+
+<h4>PN-Counter: <code>points</code></h4>
+
+<p>
+  The counter merge is not a competition &mdash; it is an accumulation. Each site's
+  running total is tracked in a per-site map, and the merge takes the pointwise
+  maximum:
+</p>
+
+<span class="file-ref">src/core/crdt/pnCounter.ts:28&ndash;40</span>
+<pre><code>function mergeSiteCountMaps(a: SiteCountMap, b: SiteCountMap): SiteCountMap {
+  const out: SiteCountMap = {};
+  const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+  for (const key of keys) {
+    const left = a[key] ?? 0;
+    const right = b[key] ?? 0;
+    const merged = Math.max(left, right);
+    if (merged !== 0) {
+      out[key] = merged;
+    }
+  }
+  return out;
+}</code></pre>
+
+<p>
+  Client C's increment produces the state
+  <code>inc: { "site-c": 5 }</code>. Since no other site has incremented,
+  the merged counter value is:
+</p>
+
+\[
+  \mathrm{value} = \sum_s \mathrm{inc}[s] - \sum_s \mathrm{dec}[s] = 5 - 0 = 5
+\]
+
+<p>
+  All three clients converge to <code>points = 5</code>.
+</p>
+
+<h3>Step 6: The Final Converged State</h3>
+
+<div class="diagram-container">
+  <pre class="mermaid">
+graph TB
+    subgraph "After Merge — Identical on All Three Clients"
+        R["<b>tasks row: t1</b><br/>─────────────────<br/>title: 'Ship it now'  (LWW — site-b wins)<br/>points: 5  (Counter — site-c's +5 accumulated)<br/>tags: {}  (OR-Set — empty)<br/>status: []  (MV-Register — empty)"]
+    end
+
+    subgraph "Merge Inputs"
+        OpA["site-a delta:<br/>INSERT title='Ship it'<br/>HLC: 0x18e4a2b3c0..02"]
+        OpB["site-b delta:<br/>UPDATE title='Ship it now'<br/>HLC: 0x18e4a2b680..01"]
+        OpC["site-c delta:<br/>INC points BY 5"]
+    end
+
+    OpA --> R
+    OpB --> R
+    OpC --> R
+  </pre>
+  <div class="caption">Figure 7.3 &mdash; Merge resolution: three concurrent operations produce a single deterministic final state.</div>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="push-pull">7.4 &ensp; The Push/Pull Sync Cadence</h2>
+
+<p>
+  CRDTBase employs an explicit <strong>push-after-write / pull-before-read</strong>
+  cadence rather than a monolithic <code>sync()</code> call. This pattern is
+  enforced throughout the stress test worker loop:
+</p>
+
+<ul>
+  <li>Every <strong>write</strong> is immediately followed by a <code>push()</code>.</li>
+  <li>Every <strong>read</strong> is preceded by a <code>pull()</code>.</li>
+  <li>There is no unnecessary pull after a write (the local state already reflects it).</li>
+</ul>
+
+<span class="file-ref">test/stress/flyWorker.ts:871&ndash;875</span>
+<pre><code>// Push immediately after every write
+if (wrote) {
+  stats.writes += 1;
+  await client.push();
+  stats.pushes += 1;
+}
+
+// Pull before every read
+} else {
+  await client.pull();
+  stats.pulls += 1;
+  const rows = normalizeTaskRows(await client.query(TASK_QUERY_SQL));
+  // ... validate ...
+}</code></pre>
+
+<h3>Push: Flush Local Writes to S3</h3>
+
+<span class="file-ref">src/platform/node/nodeClient.ts:147&ndash;163</span>
+<pre><code>async push(): Promise&lt;void&gt; {
+  await this.waitReady();
+  if (this.pendingOps.length === 0) {
+    return;
+  }
+
+  const ops = [...this.pendingOps];
+  const seq = await this.log.append({
+    siteId: this.siteId,
+    hlc: ops[ops.length - 1]!.hlc,
+    ops,
+  });
+  this.pendingOps = [];
+  this.syncedSeqBySite.set(this.siteId, seq);
+  this.syncedHlcBySite.set(this.siteId, ops[ops.length - 1]!.hlc);
+  await this.persistStateFiles();
+}</code></pre>
+
+<p>
+  Push batches all pending ops into a single delta file and PUTs it to S3. The
+  <code>log.append()</code> call handles sequence number assignment via
+  the <code>IfNoneMatch: '*'</code> conditional PUT: if two processes try to
+  write the same sequence number, only one succeeds, and the loser retries.
+</p>
+
+<h3>Pull: Fetch and Merge Remote Deltas</h3>
+
+<span class="file-ref">src/platform/node/nodeClient.ts:165&ndash;214</span>
+<pre><code>async pull(): Promise&lt;void&gt; {
+  await this.waitReady();
+  await this.refreshFromSnapshotManifest();
+  const sites = await this.log.listSites();
+  for (const siteId of sites) {
+    const since = this.syncedSeqBySite.get(siteId) ?? 0;
+    // ... cursor validation logic ...
+    entries = takeContiguousEntriesSince(probe.slice(1), since);
+
+    for (const entry of entries) {
+      this.lastLocalHlc = this.hlcClock.recv(this.lastLocalHlc, decodeHlcHex(entry.hlc));
+      for (const op of entry.ops) {
+        applyCrdtOpToRows(this.rows, op);  // CRDT merge happens here
+      }
+      this.syncedSeqBySite.set(siteId, entry.seq);
+      this.syncedHlcBySite.set(siteId, entry.hlc);
+    }
+  }
+  await this.persistStateFiles();
+}</code></pre>
+
+<p>
+  Pull iterates through every known site, fetches new entries since the last
+  cursor position, and applies each op to local state via CRDT merge. Both
+  <code>NodeCrdtClient</code> and <code>BrowserCrdtClient</code> now use the
+  unified <code>createHlcClock()</code> factory from <code>src/core/hlc.ts</code>,
+  which provides monotonic wall-clock synthesis, 60-second drift rejection, and
+  explicit local/remote HLC progression:
+</p>
+
+<span class="file-ref">src/core/hlc.ts:172&ndash;186</span>
+<pre><code>export function createHlcClock(options: {
+  nowWallMs?: () => number;
+  driftLimitMs?: number;
+} = {}): HlcClock {
+  const nowWallMs = options.nowWallMs ?? createMonotonicWallClock();
+  const driftLimitMs = normalizeDriftLimitMs(options.driftLimitMs ?? HLC_DRIFT_LIMIT_MS);
+  return {
+    driftLimitMs,
+    nowWallMs,
+    next(previous: Hlc | null): Hlc {
+      return nextMonotonicHlc(previous, nowWallMs(), driftLimitMs);
+    },
+    // ...
+  };
+}</code></pre>
+
+<span class="file-ref">src/platform/node/nodeClient.ts:96</span>
+<pre><code>this.hlcClock = clock ?? createHlcClock();</code></pre>
+
+<h3>Contiguous Cursor Safety</h3>
+
+<p>
+  A critical safety mechanism protects against cursor corruption from
+  eventually-consistent listings:
+</p>
+
+<span class="file-ref">src/core/replication.ts:28&ndash;46</span>
+<pre><code>export function takeContiguousEntriesSince(
+  entries: readonly LogEntry[],
+  since: LogPosition,
+): LogEntry[] {
+  const ordered = [...entries].sort((left, right) => left.seq - right.seq);
+  const contiguous: LogEntry[] = [];
+  let expected = since + 1;
+  for (const entry of ordered) {
+    if (entry.seq &lt; expected) {
+      continue;
+    }
+    if (entry.seq !== expected) {
+      break;        // Gap detected — stop here, do NOT skip ahead
+    }
+    contiguous.push(entry);
+    expected += 1;
+  }
+  return contiguous;
+}</code></pre>
+
+<div class="note">
+  <span class="box-title">Note &mdash; Why Contiguous Cursors Matter</span>
+  <p>
+    Under Tigris eventual consistency, an S3 LIST may return <code>seq=5</code>
+    before <code>seq=4</code> has become visible. If the cursor advanced past
+    the gap, <code>seq=4</code> would be permanently skipped. The contiguous
+    filter prevents this: it stops at the first gap, and the next pull picks
+    up the missing entry.
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="atomic-persistence">7.5 &ensp; Atomic State Persistence</h2>
+
+<p>
+  A critical lesson from early stress testing was the PN-Counter
+  double-application bug (P0-1). Because <code>applyPnCounterDelta</code> is
+  additive rather than idempotent, a crash between writing <code>state.bin</code>
+  and <code>sync.bin</code> would replay counter ops on restart, permanently
+  inflating the counter. The fix: local persistence now uses an atomic bundle
+  commit pattern.
+</p>
+
+<span class="file-ref">src/platform/node/nodeClient.ts:335&ndash;351</span>
+<pre><code>const atomicBundle: AtomicStateBundleFile = {
+  v: 1,
+  state: stateFile,
+  pending: pendingFile,
+  sync: syncFile,
+};
+
+// Commit the authoritative local state as one atomically-renamed bundle.
+await this.writeFileAtomically(this.atomicStateBundlePath, encodeBin(atomicBundle));
+
+// Legacy split files remain for backwards compatibility and tooling.
+await Promise.all([
+  this.writeFileAtomically(this.schemaPath, encodeBin(this.schema)),
+  this.writeFileAtomically(this.statePath, encodeBin(stateFile)),
+  this.writeFileAtomically(this.pendingPath, encodeBin(pendingFile)),
+  this.writeFileAtomically(this.syncPath, encodeBin(syncFile)),
+]);</code></pre>
+
+<p>
+  The <code>writeFileAtomically</code> method uses temp-file + <code>rename</code>
+  to guarantee that a crash at any point leaves either the old complete bundle
+  or the new complete bundle on disk &mdash; never a half-written state:
+</p>
+
+<span class="file-ref">src/platform/node/nodeClient.ts:367&ndash;377</span>
+<pre><code>private async writeFileAtomically(path: string, bytes: Uint8Array): Promise&lt;void&gt; {
+  const tempPath = `${path}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(tempPath, bytes);
+  try {
+    await rename(tempPath, path);
+  } catch (error) {
+    await rm(tempPath, { force: true });
+    throw error;
+  }
+}</code></pre>
+
+<!-- ================================================================== -->
+<h2 id="snapshot-coverage">7.6 &ensp; Snapshot Coverage Gate</h2>
+
+<p>
+  A critical bug was discovered during stress testing: clients were applying
+  snapshot manifests that did not cover all previously-synced sites. When a
+  compaction job ran before it had seen deltas from every site, the resulting
+  manifest omitted those sites from <code>sites_compacted</code>. If a client
+  that had already synced the missing site loaded this manifest, it would:
+</p>
+
+<ol>
+  <li>Replace its row state with the snapshot (which lacked the missing site's data).</li>
+  <li>Keep its sync cursor advanced past entries that the snapshot had missed.</li>
+  <li>Permanently skip the required log replay for the missing site.</li>
+</ol>
+
+<p>
+  The result was silent row loss and convergence failure. This was the root cause
+  of the <code>run-20260215223738-1-3540465964</code> stress test failure.
+</p>
+
+<p>
+  The fix adds a <code>manifestCoversKnownSites</code> gate in both
+  <code>NodeCrdtClient</code> and <code>BrowserCrdtClient</code>:
+</p>
+
+<span class="file-ref">src/platform/node/nodeClient.ts:388&ndash;392</span>
+<pre><code>if (!this.manifestCoversKnownSites(manifest)) {
+  // Reject incomplete manifests for sites we already track; otherwise we may
+  // replace rows with a partial snapshot and skip required log replay.
+  return;
+}</code></pre>
+
+<p>
+  The coverage check iterates every site the client has already synced and
+  verifies the manifest includes a compaction watermark for it:
+</p>
+
+<span class="file-ref">src/platform/node/nodeClient.ts:434&ndash;444</span>
+<pre><code>private manifestCoversKnownSites(manifest: ManifestFile): boolean {
+  for (const [siteId, seq] of this.syncedSeqBySite.entries()) {
+    if (seq &lt;= 0) {
+      continue;
+    }
+    if (!(siteId in manifest.sites_compacted)) {
+      return false;
+    }
+  }
+  return true;
+}</code></pre>
+
+<div class="note">
+  <span class="box-title">Note &mdash; Browser Client Parity</span>
+  <p>
+    The same coverage gate appears in <code>BrowserCrdtClient</code> at
+    lines 283/321. Without this gate, a race between compaction (which may
+    not have seen the latest site) and a client pull (which has already synced
+    that site) silently drops rows.
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="stress-test">7.7 &ensp; The Multi-Region Stress Test</h2>
+
+<p>
+  The stress test is the most thorough validation of the entire replication
+  pipeline. It runs three workers in real Fly.io regions against real Tigris,
+  performing concurrent operations with integrated compaction and verifying
+  convergence at periodic hard barriers.
+</p>
+
+<h3>Architecture</h3>
+
+<div class="diagram-container">
+  <pre class="mermaid">
+graph TB
+    subgraph "Local Machine"
+        CO["<b>Coordinator</b><br/>fly-coordinator.ts<br/>─────────────────<br/>- Creates fresh Tigris bucket<br/>- Launches 3 Fly Machines<br/>- Orchestrates barriers via S3<br/>- Validates convergence"]
+    end
+
+    subgraph "Fly Machines (real geo-distributed)"
+        W1["<b>Worker A</b><br/>flyWorker.ts<br/>region: iad<br/>site-a<br/><i>[compactor?]</i>"]
+        W2["<b>Worker B</b><br/>flyWorker.ts<br/>region: lhr<br/>site-b"]
+        W3["<b>Worker C</b><br/>flyWorker.ts<br/>region: syd<br/>site-c"]
+    end
+
+    subgraph "Storage"
+        S3["<b>Tigris S3 Bucket</b><br/>(auto geo-replicated)<br/>─────────────────<br/>deltas/site-a/*.delta.bin<br/>deltas/site-b/*.delta.bin<br/>deltas/site-c/*.delta.bin<br/>snapshots/manifest.bin<br/>snapshots/segments/...<br/>control/*/barrier-*.json"]
+    end
+
+    CO -- "Fly Machines REST API" --> W1
+    CO -- "Fly Machines REST API" --> W2
+    CO -- "Fly Machines REST API" --> W3
+
+    W1 -- "push/pull + compaction" --> S3
+    W2 -- "push/pull" --> S3
+    W3 -- "push/pull" --> S3
+    CO -- "barrier commands" --> S3
+  </pre>
+  <div class="caption">Figure 7.4 &mdash; Stress test topology: coordinator orchestrates three geo-distributed workers via S3 control objects. One worker is designated as the compactor.</div>
+</div>
+
+<h3>Configuration</h3>
+
+<p>
+  The stress test configuration is environment-driven. For the latest validation
+  batch (2026-02-15), the run shape uses tighter parameters for faster feedback
+  with all barriers hard:
+</p>
+
+<span class="file-ref">test/stress/flyWorker.ts:339&ndash;391</span>
+<pre><code>const opsPerClient = parsePositiveIntEnv('STRESS_OPS_PER_CLIENT', 30_000);
+const barrierEveryOps = parsePositiveIntEnv('STRESS_BARRIER_EVERY_OPS', 3_000);
+const hardBarrierEvery = parsePositiveIntEnv('STRESS_HARD_BARRIER_EVERY', 2);
+const compactorSiteId = parseOptionalSiteId(process.env.STRESS_COMPACTOR_SITE);
+const compactionEveryOps = parsePositiveIntEnv('STRESS_COMPACTION_EVERY_OPS', 3_000);
+const rowCount = parsePositiveIntEnv('STRESS_ROW_COUNT', 64);
+const drainRounds = parsePositiveIntEnv('STRESS_DRAIN_ROUNDS', 8);
+const drainQuiescenceRounds = parsePositiveIntEnv('STRESS_DRAIN_QUIESCENCE_ROUNDS', 2);
+const drainMaxExtraRounds = parsePositiveIntEnv('STRESS_DRAIN_MAX_EXTRA_ROUNDS', 200);</code></pre>
+
+<table>
+  <thead>
+    <tr><th>Parameter</th><th>Validation Value</th><th>Default</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>STRESS_OPS_PER_CLIENT</code></td><td>120</td><td>30,000</td></tr>
+    <tr><td><code>STRESS_BARRIER_EVERY_OPS</code></td><td>30</td><td>3,000</td></tr>
+    <tr><td><code>STRESS_HARD_BARRIER_EVERY</code></td><td>1 (every barrier is hard)</td><td>2</td></tr>
+    <tr><td><code>STRESS_COMPACTION_EVERY_OPS</code></td><td>30</td><td>3,000</td></tr>
+    <tr><td>Regions</td><td><code>iad</code>, <code>lhr</code>, <code>syd</code></td><td>same</td></tr>
+    <tr><td>Compactor placement</td><td>per-run random (<code>runSeed % 3</code>)</td><td>&mdash;</td></tr>
+  </tbody>
+</table>
+
+<h3>Compaction in the Worker Loop</h3>
+
+<p>
+  One worker is designated as the compactor per run (random assignment via
+  <code>runSeed % 3</code>). This worker runs
+  <code>compactReplicatedLog()</code> at multiple points, exercising the full
+  snapshot/compaction pipeline under real distributed conditions:
+</p>
+
+<ol>
+  <li><strong>Startup compaction</strong> after initial seed data is available.</li>
+  <li><strong>Periodic compaction</strong> every <code>STRESS_COMPACTION_EVERY_OPS</code> operations during the main loop.</li>
+  <li><strong>Barrier-entry compaction</strong> at the start of hard barrier drain phases.</li>
+  <li><strong>Barrier-drained compaction</strong> after drain convergence, before publishing the drained report.</li>
+  <li><strong>Final compaction</strong> after all operations complete.</li>
+</ol>
+
+<span class="file-ref">test/stress/flyWorker.ts:562&ndash;585</span>
+<pre><code>const runCompaction = async (trigger: string): Promise&lt;void&gt; => {
+  if (!snapshots) {
+    return;
+  }
+  if (!snapshotSchemaPublished) {
+    await snapshots.putSchema(TASKS_SCHEMA);
+    snapshotSchemaPublished = true;
+  }
+  const result = await compactReplicatedLog({
+    log,
+    snapshots,
+    schema: TASKS_SCHEMA,
+  });
+  logLine(
+    config.siteId,
+    config.runId,
+    'compaction trigger=' + trigger +
+      ' applied=' + String(result.applied ? 1 : 0) +
+      ' opsRead=' + String(result.opsRead) +
+      ' manifestVersion=' + String(result.manifest.version) +
+      ' segments=' + String(result.manifest.segments.length),
+  );
+};</code></pre>
+
+<span class="file-ref">src/platform/node/compactor.ts:62&ndash;143</span>
+<pre><code>export async function compactReplicatedLog(
+  options: SnapshotCompactorOptions,
+): Promise&lt;NodeCompactionResult&gt; {
+  const schema = options.schema ?? (await options.snapshots.getSchema());
+  const priorManifest = (await options.snapshots.getManifest()) ?? makeEmptyManifest();
+  const rows = await loadRowsFromManifest(options.snapshots, priorManifest);
+  const sitesCompacted: Record&lt;string, number&gt; = { ...priorManifest.sites_compacted };
+
+  let compactionHlc = priorManifest.compaction_hlc;
+  let opsRead = 0;
+
+  const sites = await options.log.listSites();
+  sites.sort();
+
+  for (const siteId of sites) {
+    const since = normalizeSeq(sitesCompacted[siteId] ?? 0);
+    const readEntries = await options.log.readSince(siteId, since);
+    const entries = takeContiguousEntriesSince(readEntries, since);
+    let nextHead = since;
+    for (const entry of entries) {
+      nextHead = Math.max(nextHead, normalizeSeq(entry.seq));
+      compactionHlc = maxHlcHex(compactionHlc, entry.hlc);
+      applyOpsToRuntimeRows(rows, entry.ops);
+      opsRead += entry.ops.length;
+    }
+    sitesCompacted[siteId] = nextHead;
+  }
+
+  pruneRuntimeRowsForCompaction(rows, {
+    nowMs: (options.now ?? (() =&gt; Date.now()))(),
+    orSetTombstoneTtlMs: options.orSetTombstoneTtlMs ?? DEFAULT_OR_SET_TOMBSTONE_TTL_MS,
+    rowTombstoneTtlMs: options.rowTombstoneTtlMs ?? DEFAULT_ROW_TOMBSTONE_TTL_MS,
+  });
+
+  const builtSegments = buildSegmentsFromRows({ schema, rows, defaultHlcMax: compactionHlc });
+  // ... write segments, CAS manifest ...
+
+  const applied = await options.snapshots.putManifest(nextManifest, priorManifest.version);
+}</code></pre>
+
+<p>
+  The barrier drain phases verify that all workers converge to the same
+  state hash even after compaction has rewritten the snapshot manifests and
+  segments. This validates that compaction preserves correctness in a real
+  distributed setting.
+</p>
+
+<h3>Worker Operation Loop</h3>
+
+<p>
+  Each worker executes a configurable number of operations
+  with a randomized mix designed to maximize contention:
+</p>
+
+<span class="file-ref">test/stress/flyWorker.ts:822&ndash;893</span>
+<pre><code>for (let opIndex = 1; opIndex &lt;= config.opsPerClient; opIndex += 1) {
+  const rowId = pickRowId(rng, rowIds);
+  const opRoll = rng();
+
+  if (opRoll &lt; 0.5) {
+    // 50%: Counter increment
+    await client.exec(`INC tasks.points BY ${amount} WHERE id = '${rowId}';`);
+    await client.push();
+  } else if (opRoll &lt; 0.82) {
+    // 32%: Set add (unique tag)
+    await client.exec(`ADD '${tag}' TO tasks.tags WHERE id = '${rowId}';`);
+    await client.push();
+  } else if (opRoll &lt; 0.92) {
+    // 10%: LWW title update
+    await client.exec(`UPDATE tasks SET title = '${title}' WHERE id = '${rowId}';`);
+    await client.push();
+  } else if (opRoll &lt; 0.97) {
+    // 5%: MV-Register status update
+    await client.exec(`UPDATE tasks SET status = '${status}' WHERE id = '${rowId}';`);
+    await client.push();
+  } else {
+    // 3%: Read (pull first)
+    await client.pull();
+    const rows = await client.query(TASK_QUERY_SQL);
+  }
+
+  if (isCompactor &amp;&amp; opIndex % config.compactionEveryOps === 0) {
+    await runCompaction(`op-${opIndex}`);
+  }
+}</code></pre>
+
+<table>
+  <thead>
+    <tr><th>Operation</th><th>Frequency</th><th>CRDT Type</th><th>Contention Pattern</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Counter increment</td><td>50%</td><td>PN-Counter</td><td>Naturally additive</td></tr>
+    <tr><td>Set add</td><td>32%</td><td>OR-Set</td><td>All adds preserved</td></tr>
+    <tr><td>Title update</td><td>10%</td><td>LWW Register</td><td>Last writer wins</td></tr>
+    <tr><td>Status update</td><td>5%</td><td>MV-Register</td><td>Concurrent values coexist</td></tr>
+    <tr><td>Read</td><td>3%</td><td>&mdash;</td><td>Pull before read</td></tr>
+  </tbody>
+</table>
+
+<p>
+  A critical design choice is <strong>hot-row contention</strong>: 72% of
+  operations target the first 8 rows out of 64, creating heavy write contention
+  on a small key space:
+</p>
+
+<span class="file-ref">test/stress/flyWorker.ts:374&ndash;380</span>
+<pre><code>function pickRowId(rng: () =&gt; number, rowIds: readonly string[]): string {
+  const hotSetSize = Math.min(8, rowIds.length);
+  if (rng() &lt; 0.72 &amp;&amp; hotSetSize &gt; 0) {
+    return rowIds[rngInt(rng, 0, hotSetSize - 1)]!;
+  }
+  return rowIds[rngInt(rng, 0, rowIds.length - 1)]!;
+}</code></pre>
+
+<h3>The Barrier Protocol</h3>
+
+<p>
+  Workers and coordinator rendezvous using S3 control objects. With
+  <code>STRESS_HARD_BARRIER_EVERY=1</code>, every barrier is a hard barrier
+  that drains to full convergence:
+</p>
+
+<ol>
+  <li>Workers push all pending ops, then pull to refresh remote cursors.</li>
+  <li>Workers publish a &ldquo;pre&rdquo; report with state hash, synced heads, and
+      local invariant validation results.</li>
+  <li>Coordinator computes <code>targetHeads</code> from all pre-reports (the union of
+      all site heads across all workers).</li>
+  <li>Coordinator publishes &ldquo;drain&rdquo; command with target heads.</li>
+  <li>Compactor worker runs compaction at barrier entry.</li>
+  <li>Workers perform multiple push/pull rounds until local synced heads
+      meet or exceed target heads and the state hash is stable for 2
+      consecutive rounds (quiescence).</li>
+  <li>Compactor worker runs compaction after drain convergence.</li>
+  <li>Workers publish &ldquo;drained&rdquo; report.</li>
+  <li><strong>Coordinator validates convergence: all three state hashes must be identical.</strong></li>
+  <li>Coordinator publishes &ldquo;release&rdquo; command.</li>
+  <li>Workers resume.</li>
+</ol>
+
+<p>
+  The drain loop implements target head tracking:
+</p>
+
+<span class="file-ref">test/stress/flyWorker.ts:690&ndash;724</span>
+<pre><code>while (
+  (roundsPerformed &lt; requestedRounds ||
+    stableRounds &lt; config.drainQuiescenceRounds ||
+    !reachedTarget) &amp;&amp;
+  roundsPerformed &lt; hardRoundLimit
+) {
+  await client.push();
+  stats.pushes += 1;
+  await client.pull();
+  stats.pulls += 1;
+  roundsPerformed += 1;
+  const syncedHeads = client.getSyncedHeads();
+  const targetCheck = compareHeadsToTarget(syncedHeads, targetHeads);
+  reachedTarget = targetCheck.reached;
+  missingTarget = targetCheck.missing;
+  const rows = normalizeTaskRows(await client.query(TASK_QUERY_SQL));
+  const currentHash = hashRows(rows);
+  if (lastHash === currentHash) {
+    stableRounds += 1;
+  } else {
+    stableRounds = 0;
+  }
+  lastHash = currentHash;
+}</code></pre>
+
+<p>
+  The <code>compareHeadsToTarget</code> function verifies that every site's
+  local synced cursor is at or past the coordinator-provided target:
+</p>
+
+<span class="file-ref">test/stress/flyWorker.ts:414&ndash;430</span>
+<pre><code>function compareHeadsToTarget(
+  syncedHeads: Record&lt;string, number&gt;,
+  targetHeads: Record&lt;string, number&gt;,
+): { reached: boolean; missing: string[] } {
+  const missing: string[] = [];
+  for (const [siteId, target] of Object.entries(targetHeads)) {
+    const targetSeq = Number.isFinite(target) ? target : 0;
+    const actualSeq = syncedHeads[siteId] ?? 0;
+    if (actualSeq &lt; targetSeq) {
+      missing.push(`${siteId}:${actualSeq}&lt;${targetSeq}`);
+    }
+  }
+  return { reached: missing.length === 0, missing };
+}</code></pre>
+
+<h3>Invariant Validation</h3>
+
+<p>
+  Workers track local expectations for monotonic CRDT types and validate
+  that they are never violated:
+</p>
+
+<span class="file-ref">test/stress/flyWorker.ts:237&ndash;275</span>
+<pre><code>function validateLocalInvariants(params: {
+  rows: NormalizedTaskRow[];
+  expectations: MutableExpectations;
+}): { ok: boolean; errors: string[] } {
+  for (const [rowId, expectedPoints] of params.expectations.points.entries()) {
+    const row = byId.get(rowId);
+    if (row.points &lt; expectedPoints) {
+      errors.push(`row '${rowId}' points regressed below local expectation`);
+    }
+  }
+
+  for (const [rowId, expectedTags] of params.expectations.tags.entries()) {
+    const actual = new Set(row.tags);
+    for (const tag of expectedTags) {
+      if (!actual.has(tag)) {
+        errors.push(`row '${rowId}' missing local tag '${tag}'`);
+      }
+    }
+  }
+}</code></pre>
+
+<p>
+  This validates two key CRDT properties:
+</p>
+
+<ol>
+  <li>
+    <strong>Counter monotonicity:</strong> After convergence, the counter value
+    must be at least as large as the local expectation (because other sites may
+    have also incremented, making it larger).
+    \(\forall s.\; \mathrm{points}_{\mathrm{converged}} \geq \mathrm{points}_{\mathrm{expected}}^{(s)}\)
+  </li>
+  <li>
+    <strong>Set completeness:</strong> After convergence, all locally added tags
+    must be present (OR-Set add is irrevocable unless explicitly removed).
+    \(\forall s.\; \mathrm{tags}_{\mathrm{expected}}^{(s)} \subseteq \mathrm{tags}_{\mathrm{converged}}\)
+  </li>
+</ol>
+
+<!-- ================================================================== -->
+<h2 id="timing-results">7.8 &ensp; Timing Results (2026-02-15)</h2>
+
+<p>
+  The latest 3-run validation batch ran with the snapshot-coverage-gate fix
+  and compactor-enabled workers. All three runs passed with full convergence
+  at every hard barrier.
+</p>
+
+<h3>Run-Level Totals</h3>
+
+<table>
+  <thead>
+    <tr><th>Run ID</th><th>Result</th><th>Wall Time (s)</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>run-20260215224530-1-4067962528</code></td><td>PASS</td><td>238.4</td></tr>
+    <tr><td><code>run-20260215224933-2-3422796657</code></td><td>PASS</td><td>271.0</td></tr>
+    <tr><td><code>run-20260215225408-3-2298453710</code></td><td>PASS</td><td>341.4</td></tr>
+  </tbody>
+</table>
+
+<p>
+  <strong>Average run wall time: 283.6&thinsp;s</strong> (down 8.6% from the
+  310.3&thinsp;s baseline on 2026-02-14).
+</p>
+
+<h3>Barrier Timing Breakdown</h3>
+
+<table>
+  <thead>
+    <tr><th>Run ID</th><th>Barrier</th><th>Pre (s)</th><th>Drained (s)</th><th>Total (s)</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>run-...-1-4067962528</code></td><td>1</td><td>29</td><td>19</td><td>48</td></tr>
+    <tr><td><code>run-...-1-4067962528</code></td><td>2</td><td>36</td><td>19</td><td>56</td></tr>
+    <tr><td><code>run-...-1-4067962528</code></td><td>3</td><td>29</td><td>19</td><td>48</td></tr>
+    <tr><td><code>run-...-1-4067962528</code></td><td>4</td><td>28</td><td>19</td><td>47</td></tr>
+    <tr><td><code>run-...-2-3422796657</code></td><td>1</td><td>53</td><td>21</td><td>74</td></tr>
+    <tr><td><code>run-...-2-3422796657</code></td><td>2</td><td>54</td><td>19</td><td>74</td></tr>
+    <tr><td><code>run-...-2-3422796657</code></td><td>3</td><td>32</td><td>19</td><td>51</td></tr>
+    <tr><td><code>run-...-2-3422796657</code></td><td>4</td><td>26</td><td>19</td><td>46</td></tr>
+    <tr><td><code>run-...-3-2298453710</code></td><td>1</td><td>58</td><td>21</td><td>79</td></tr>
+    <tr><td><code>run-...-3-2298453710</code></td><td>2</td><td>55</td><td>21</td><td>76</td></tr>
+    <tr><td><code>run-...-3-2298453710</code></td><td>3</td><td>56</td><td>21</td><td>77</td></tr>
+    <tr><td><code>run-...-3-2298453710</code></td><td>4</td><td>56</td><td>21</td><td>77</td></tr>
+  </tbody>
+</table>
+
+<h3>Cross-Run Averages</h3>
+
+<table>
+  <thead>
+    <tr><th>Phase</th><th>Time (s)</th><th>vs. 2026-02-14 Baseline</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Pre phase</td><td>42.67</td><td>&minus;6.75&thinsp;s (&minus;13.7%)</td></tr>
+    <tr><td>Drained phase</td><td>19.83</td><td>+0.08&thinsp;s (+0.4%)</td></tr>
+    <tr><td>Full barrier</td><td>62.75</td><td>&minus;7.00&thinsp;s (&minus;10.0%)</td></tr>
+    <tr><td>Coordinator batch</td><td>864.38</td><td>&minus;80.30&thinsp;s (&minus;8.5%)</td></tr>
+  </tbody>
+</table>
+
+<p>
+  The pre-phase improvement reflects the push-after-write cadence reducing the
+  number of stale deltas that need to be replicated before barrier entry. The
+  drained phase is essentially unchanged, which is expected: it is dominated by
+  cross-continent Tigris replication latency (IAD&ndash;LHR&ndash;SYD) rather
+  than local processing.
+</p>
+
+<h3>Failed Run Analysis</h3>
+
+<p>
+  One run failed before the coverage gate fix was applied:
+</p>
+
+<ul>
+  <li>
+    <code>run-20260215223738-1-3540465964</code>: snapshot cutover regression
+    when manifest omitted a previously-synced site watermark. Clients replaced
+    rows from an incomplete snapshot and skipped required log replay, causing
+    convergence failure. Root cause: the <code>refreshFromSnapshotManifest</code>
+    method accepted any manifest with a higher version number without verifying
+    site coverage. <strong>Fixed</strong> by adding
+    <code>manifestCoversKnownSites</code> in both <code>nodeClient.ts</code>
+    and <code>browserClient.ts</code> (see <a href="#snapshot-coverage">Section 7.6</a>).
+  </li>
+</ul>
+
+<!-- ================================================================== -->
+<h2 id="consistency-headers">7.9 &ensp; Consistency Headers: X-Tigris-Consistent</h2>
+
+<p>
+  The <code>X-Tigris-Consistent: true</code> header instructs Tigris to route
+  a GET request through the global metadata leader rather than reading from the
+  local cache. CRDTBase uses this header in exactly one place: reading the
+  compaction manifest.
+</p>
+
+<div class="definition">
+  <span class="box-title">Definition 7.3 &mdash; Manifest CAS Protocol</span>
+  <p>
+    The manifest is the single coordination point for compaction. It uses a
+    Compare-and-Swap (CAS) protocol via HTTP ETags:
+  </p>
+  <ol>
+    <li>Read the manifest with <code>X-Tigris-Consistent: true</code>, capturing the ETag.</li>
+    <li>Perform compaction (merge deltas into segments).</li>
+    <li>Write the new manifest with <code>IfMatch: &lt;captured-ETag&gt;</code>.</li>
+    <li>If the ETag has changed (another compactor ran concurrently), the PUT fails with 412. Retry from step 1.</li>
+  </ol>
+</div>
+
+<span class="file-ref">src/backend/tigrisSnapshotStore.ts (putManifest)</span>
+<pre><code>const putInput: PutObjectCommandInput = { /* ... */ };
+if (current === null) {
+  putInput.IfNoneMatch = '*';       // First manifest ever
+} else if (currentEtag !== null) {
+  putInput.IfMatch = currentEtag;   // CAS: only write if ETag matches
+}
+
+try {
+  await this.client.send(new PutObjectCommand(putInput));
+  return true;
+} catch (error) {
+  if (isCasConflictError(error)) {
+    return false;   // Another compactor won the race
+  }
+  throw error;
+}</code></pre>
+
+<p>
+  The elegance of the two-tier model is that strong consistency is used only
+  where it is strictly necessary (the manifest CAS), while the high-volume
+  delta traffic uses eventual consistency at full speed. This avoids the latency
+  penalty of global coordination for the common case.
+</p>
+
+<!-- ================================================================== -->
+<h2 id="partition">7.10 &ensp; Network Partition and Offline-First Semantics</h2>
+
+<p>
+  CRDTBase is designed as an offline-first system. Network partitions are not
+  exceptional failure modes &mdash; they are a fundamental part of the operating
+  model. Here is what happens when connectivity is lost:
+</p>
+
+<h3>During Partition</h3>
+
+<ol>
+  <li>
+    <strong>Reads continue to work.</strong> The local in-memory state
+    (<code>this.rows</code>) is always available. Queries execute against it
+    without any network call.
+  </li>
+  <li>
+    <strong>Writes continue to work.</strong> Operations are applied to local
+    state immediately and buffered in <code>pendingOps</code>. The pending ops
+    are persisted to disk in the atomic <code>state_bundle.bin</code>, so they
+    survive process restarts.
+  </li>
+  <li>
+    <strong>Push fails gracefully.</strong> The S3 PUT call will timeout or
+    error. The ops remain in <code>pendingOps</code> for the next attempt.
+  </li>
+  <li>
+    <strong>Pull fails gracefully.</strong> The LIST/GET calls will timeout or
+    error. The cursor positions remain unchanged, so no data is lost or skipped.
+  </li>
+</ol>
+
+<h3>On Reconnect</h3>
+
+<ol>
+  <li>
+    <strong>Push flushes the backlog.</strong> All locally accumulated ops are
+    serialized into one (or more) delta files and pushed to Tigris.
+  </li>
+  <li>
+    <strong>Pull merges remote changes.</strong> The contiguous cursor filter
+    ensures that entries are applied in order, even if the remote log has grown
+    significantly during the partition.
+  </li>
+  <li>
+    <strong>CRDT merge resolves all conflicts deterministically.</strong> No matter
+    how long the partition lasted or how many concurrent writes accumulated on
+    each side, the merge functions produce the same result regardless of the
+    order operations arrive.
+  </li>
+</ol>
+
+<div class="diagram-container">
+  <pre class="mermaid">
+timeline
+    title Network Partition Timeline
+    section Client A (IAD) — Online
+        t0 : INSERT title='Ship it'
+           : push → deltas/site-a/1
+        t1 : UPDATE title='Ship it v2'
+           : push → deltas/site-a/2
+    section Client B (LHR) — Partitioned
+        t0 : UPDATE title='Ship it now'
+           : pendingOps=[op1] (push fails)
+        t1 : INC points BY 3
+           : pendingOps=[op1, op2] (queued)
+        t2 : INC points BY 7
+           : pendingOps=[op1, op2, op3] (queued)
+    section Reconnect
+        t3 : Client B push → deltas/site-b/1
+           : Client B pull → merge site-a/1, site-a/2
+           : Both converge to same final state
+  </pre>
+  <div class="caption">Figure 7.5 &mdash; Timeline of a network partition: Client B queues operations locally and merges on reconnect.</div>
+</div>
+
+<div class="note">
+  <span class="box-title">Note &mdash; Persistence Across Restarts</span>
+  <p>
+    All client state is persisted atomically after every operation via the
+    <code>state_bundle.bin</code> pattern (see
+    <a href="#atomic-persistence">Section 7.5</a>). The bundle contains
+    CRDT row state, unflushed ops, and cursor positions per site. If the
+    process crashes during a partition, it can resume exactly where it left
+    off with no data loss. The atomic temp-file + <code>rename</code>
+    strategy ensures that a crash never produces a half-written state file.
+  </p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="deployment">7.11 &ensp; Deployment Topology</h2>
+
+<p>
+  The stress test workers are deployed as Fly Machines &mdash; ephemeral VMs
+  launched via the Fly.io Machines REST API. Each worker is a minimal Docker
+  container containing only the Node.js runtime and a single bundled JavaScript
+  file.
+</p>
+
+<h3>Worker Docker Image</h3>
+
+<span class="file-ref">Dockerfile.stress</span>
+<pre><code>FROM node:20.19.2-slim AS build
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --ignore-scripts
+COPY src ./src
+COPY test/stress ./test/stress
+RUN npx esbuild test/stress/flyWorker.ts \
+  --bundle --platform=node --format=esm --target=node20 \
+  --banner:js="import { createRequire } from \"module\"; ..." \
+  --outfile=/out/flyWorker.mjs
+
+FROM node:20.19.2-slim AS runtime
+WORKDIR /app
+COPY --from=build /out/flyWorker.mjs /app/flyWorker.mjs
+ENTRYPOINT ["node", "/app/flyWorker.mjs"]</code></pre>
+
+<div class="note">
+  <span class="box-title">Note &mdash; Multi-Stage Build</span>
+  <p>
+    The two-stage build uses esbuild to bundle all TypeScript source and
+    dependencies into a single ESM file. The runtime image contains only
+    the Node.js slim base and one <code>.mjs</code> file, keeping the
+    container size minimal and startup time fast. No <code>node_modules</code>
+    directory is present in the runtime image.
+  </p>
+</div>
+
+<h3>Machine Launch via REST API</h3>
+
+<p>
+  The coordinator launches each worker using the Fly Machines REST API,
+  specifying the target region, the container image, and all required
+  environment variables (Tigris credentials, run ID, site ID, stress
+  parameters):
+</p>
+
+<span class="file-ref">scripts/stress/fly-coordinator.ts:379&ndash;396</span>
+<pre><code>const requestBody: CreateMachineRequest = {
+  name: machineName,
+  region,
+  config: {
+    image: params.image,
+    env,
+    metadata: {
+      crdtbase_role: 'stress-worker',
+      crdtbase_run_id: params.runId,
+      crdtbase_site_id: siteId,
+    },
+    restart: { policy: 'no' },
+    auto_destroy: true,
+  },
+  skip_service_registration: true,
+};</code></pre>
+
+<div class="note">
+  <span class="box-title">Note &mdash; Machine Lifecycle</span>
+  <p>
+    Each machine is configured with <code>restart: { policy: 'no' }</code>
+    and <code>auto_destroy: true</code>. This means the machine runs once,
+    completes the stress test workload, and is automatically cleaned up. The
+    coordinator also performs explicit cleanup in a <code>finally</code> block
+    as a safety net.
+  </p>
+</div>
+
+<h3>Running the Stress Test</h3>
+
+<pre><code># Build and push the worker image
+docker build -f Dockerfile.stress -t registry.fly.io/YOUR_APP:stress .
+docker push registry.fly.io/YOUR_APP:stress
+
+# Run the coordinator (launches 3 Fly Machines, orchestrates barriers)
+FLY_APP=your-app \
+FLY_WORKER_IMAGE=registry.fly.io/YOUR_APP:stress \
+FLY_REGIONS=iad,lhr,syd \
+AWS_ENDPOINT_URL_S3=https://fly.storage.tigris.dev \
+AWS_ACCESS_KEY_ID=... \
+AWS_SECRET_ACCESS_KEY=... \
+STRESS_COMPACTOR_SITE=site-a \
+STRESS_COMPACTION_EVERY_OPS=30 \
+npm run stress:fly:coordinator</code></pre>
+
+<p>
+  The coordinator creates a fresh Tigris bucket per run, launches three
+  machines in the specified regions, orchestrates all barriers (all hard with
+  <code>STRESS_HARD_BARRIER_EVERY=1</code>), checks final convergence, and
+  cleans up machines and bucket.
+</p>
+
+<!-- ================================================================== -->
+<h2 id="issues">7.12 &ensp; Issue Resolution Summary</h2>
+
+<p>
+  The system has undergone systematic hardening through stress testing and
+  formal verification. All P0 (critical) and P1 (high) issues are now resolved.
+</p>
+
+<h3>P0 (Critical) &mdash; All FIXED</h3>
+
+<table>
+  <thead>
+    <tr><th>Issue</th><th>Problem</th><th>Fix</th><th>Verified By</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>P0-1</td>
+      <td>PN-Counter double-application on crash</td>
+      <td>Atomic <code>state_bundle.bin</code> (temp + rename)</td>
+      <td>Stress test convergence</td>
+    </tr>
+    <tr>
+      <td>P0-2</td>
+      <td>Non-atomic <code>state.bin</code>/<code>pending.bin</code>/<code>sync.bin</code></td>
+      <td>Atomic bundle commit first, legacy files second</td>
+      <td>Crash-restart prop test</td>
+    </tr>
+    <tr>
+      <td>P0-3</td>
+      <td><code>FsSnapshotStore</code> CAS race</td>
+      <td>Filesystem lock + atomic rename</td>
+      <td>MinIO E2E compaction test</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>P1 (High) &mdash; All FIXED</h3>
+
+<table>
+  <thead>
+    <tr><th>Issue</th><th>Problem</th><th>Fix</th><th>Verified By</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>P1-1</td>
+      <td>Browser HLC not persisted</td>
+      <td><code>localStorage</code> persistence + HLC restore on open</td>
+      <td>Browser E2E test</td>
+    </tr>
+    <tr>
+      <td>P1-2</td>
+      <td>Table composition not directly proved</td>
+      <td><code>mergeTableRow_comm/assoc/idem_of_valid</code> in Lean</td>
+      <td><code>lean/CrdtBase/Crdt/Table/Props.lean</code></td>
+    </tr>
+    <tr>
+      <td>P1-3</td>
+      <td>OR-Set idempotence precondition gap</td>
+      <td><code>or_set_merge_canonicalized</code> + <code>or_set_merge_idem_general</code></td>
+      <td><code>lean/CrdtBase/Crdt/OrSet/Props.lean</code></td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>P2 (Medium) &mdash; 4 of 8 FIXED</h3>
+
+<table>
+  <thead>
+    <tr><th>Issue</th><th>Status</th><th>Fix</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>P2-1: OR-Set tombstone growth</td><td>FIXED</td><td>TTL pruning in compaction (default 7 days)</td></tr>
+    <tr><td>P2-2: MV-Register stale values</td><td>FIXED</td><td><code>canonicalizeMvRegister</code> prunes dominated values</td></tr>
+    <tr><td>P2-3: Row tombstone TTL</td><td>FIXED</td><td>Compaction drops rows past configured TTL</td></tr>
+    <tr><td>P2-4: TS/Lean equivalence</td><td>MITIGATED</td><td>Unified SQL-script DRT entrypoint</td></tr>
+    <tr><td>P2-5: Network assumptions</td><td>Open</td><td>&mdash;</td></tr>
+    <tr><td>P2-6: HLC real-time accuracy</td><td>FIXED</td><td><code>createHlcClock()</code> with monotonic wall-clock + 60&thinsp;s drift rejection</td></tr>
+    <tr><td>P2-7: Orphaned segment cleanup</td><td>Open</td><td>&mdash;</td></tr>
+    <tr><td>P2-8: Old delta cleanup</td><td>Open</td><td>&mdash;</td></tr>
+  </tbody>
+</table>
+
+<!-- ================================================================== -->
+<h2 id="assessment-final">7.13 &ensp; Correctness Assessment</h2>
+
+<div class="assessment">
+  <span class="box-title">Assessment 7.1 &mdash; Convergence Guarantee</span>
+  <p>
+    <strong>Claim:</strong> If all three clients eventually receive all delta
+    files from all sites (i.e., Tigris replication completes), they will
+    converge to identical state.
+  </p>
+  <p>
+    <strong>Argument:</strong> Each CRDT type used in the system satisfies the
+    requirements of a state-based CRDT (join-semilattice):
+  </p>
+  <ul>
+    <li>
+      <strong>LWW Register:</strong> The merge selects the value with the
+      highest (HLC, site) pair. This is a total order, so
+      \(\mathrm{merge}(a, b) = \mathrm{merge}(b, a)\) (commutativity) and
+      \(\mathrm{merge}(a, \mathrm{merge}(b, c)) = \mathrm{merge}(\mathrm{merge}(a, b), c)\)
+      (associativity). The function is idempotent by definition.
+    </li>
+    <li>
+      <strong>PN-Counter:</strong> Per-site pointwise maximum is commutative,
+      associative, and idempotent. Concurrent increments from different sites
+      are naturally additive.
+    </li>
+    <li>
+      <strong>OR-Set:</strong> Union of elements and union of tombstones.
+      Commutative, associative, and idempotent. The OR-Set idempotence chain
+      is now proved in Lean via <code>or_set_merge_idem_general</code>,
+      closing the P1-3 precondition gap.
+    </li>
+    <li>
+      <strong>MV-Register:</strong> Preserves all concurrent values. The set
+      of concurrent values is a join-semilattice under set union.
+    </li>
+    <li>
+      <strong>Table composition:</strong> Cross-column and disjoint-key
+      commutativity are now directly proved in Lean via
+      <code>mergeTableRow_comm/assoc/idem_of_valid</code> (P1-2 resolved).
+    </li>
+  </ul>
+  <p>
+    <strong>Empirical validation:</strong> The stress test verifies this
+    property at every hard barrier by draining all sites to common head
+    positions and asserting that all three SHA-256 state hashes are
+    byte-identical. With compaction running concurrently on a designated
+    worker (every 30 ops), the system has passed 3/3 runs across three
+    continents (IAD, LHR, SYD) with 120 operations per client and 72%
+    hot-row contention.
+  </p>
+</div>
+
+<div class="assessment">
+  <span class="box-title">Assessment 7.2 &mdash; Per-Site Log Linearizability</span>
+  <p>
+    <strong>Claim:</strong> Each site's delta log is linearizable (no gaps,
+    no duplicates, no overwrites).
+  </p>
+  <p>
+    <strong>Mechanism:</strong> The <code>IfNoneMatch: '*'</code> conditional
+    PUT on <code>append()</code> ensures create-only semantics. If two writers
+    race for the same sequence number, only one succeeds (HTTP 200); the other
+    receives 409/412 and retries with the next sequence number. This provides
+    per-site linearizability without any external lock or coordination service.
+  </p>
+</div>
+
+<div class="assessment">
+  <span class="box-title">Assessment 7.3 &mdash; Cursor Safety Under Eventual Consistency</span>
+  <p>
+    <strong>Claim:</strong> The pull cursor never skips a delta entry, even
+    under Tigris eventual consistency.
+  </p>
+  <p>
+    <strong>Mechanism:</strong> <code>takeContiguousEntriesSince</code> accepts
+    only entries that form a contiguous sequence starting from
+    \(\mathrm{cursor} + 1\). Any gap in the listing causes the function to
+    stop, preserving the cursor at the last contiguous position. Additionally,
+    pull validates that the entry at the current cursor position still exists
+    and has the expected HLC, detecting history rewrites or corruption.
+  </p>
+</div>
+
+<div class="assessment">
+  <span class="box-title">Assessment 7.4 &mdash; Offline Durability</span>
+  <p>
+    <strong>Claim:</strong> No data is lost during a network partition of
+    arbitrary duration.
+  </p>
+  <p>
+    <strong>Mechanism:</strong> Writes are applied to local state and appended
+    to <code>pendingOps</code>, which is persisted atomically via the
+    <code>state_bundle.bin</code> pattern (temp-file + <code>rename</code>)
+    after every operation. On reconnect, <code>push()</code> flushes the
+    entire backlog. Cursor positions in the same atomic bundle ensure pull
+    resumes from the exact point of disconnection. Since CRDT merge is
+    commutative, associative, and idempotent, the order in which partitioned
+    writes are discovered does not affect the final converged state. The
+    atomic bundle pattern (P0-1/P0-2 fix) prevents the PN-Counter
+    double-application bug that previously threatened durability on crash.
+  </p>
+</div>
+
+<div class="assessment">
+  <span class="box-title">Assessment 7.5 &mdash; Compaction Preserves Convergence</span>
+  <p>
+    <strong>Claim:</strong> Running compaction concurrently with normal
+    push/pull operations does not break convergence.
+  </p>
+  <p>
+    <strong>Mechanism:</strong> The compactor reads the prior manifest, loads
+    existing segments, replays new deltas via CRDT merge, prunes tombstones,
+    builds fresh segments, and performs a CAS manifest update. The snapshot
+    coverage gate (<code>manifestCoversKnownSites</code>) ensures clients
+    never adopt a manifest that would cause them to drop rows from
+    already-synced sites. The stress test validates this by running compaction
+    at barrier entry, after drain convergence, periodically during the op
+    loop, and at final cleanup &mdash; and asserting identical state hashes
+    across all three workers at every hard barrier.
+  </p>
+</div>
+
+<div class="assessment">
+  <span class="box-title">Assessment 7.6 &mdash; End-to-End Architecture Summary</span>
+  <p>
+    The CRDTBase + Tigris architecture achieves multi-region eventual
+    consistency through a clean separation of concerns:
+  </p>
+  <ol>
+    <li><strong>Tigris handles bytes</strong> &mdash; stores objects and
+        automatically replicates them across regions.</li>
+    <li><strong>CRDTs handle semantics</strong> &mdash; merge functions ensure
+        deterministic, order-independent convergence.</li>
+    <li><strong>The replicated log handles ordering</strong> &mdash; per-site
+        sequence numbers and contiguous cursors guarantee exactly-once,
+        in-order application within each site's log.</li>
+    <li><strong>Compaction handles efficiency</strong> &mdash; segment files
+        collapse delta history into compact snapshots for fast bootstrap,
+        with tombstone TTL pruning for OR-Set and row tombstones.</li>
+    <li><strong>Atomic persistence handles durability</strong> &mdash; the
+        atomic <code>state_bundle.bin</code> pattern prevents the PN-Counter
+        double-application bug and ensures crash recovery is always
+        consistent.</li>
+    <li><strong>Snapshot coverage gates handle safety</strong> &mdash; the
+        <code>manifestCoversKnownSites</code> check prevents clients from
+        applying partial snapshots that would drop rows and skip required
+        log replay.</li>
+    <li><strong>The barrier protocol handles verification</strong> &mdash;
+        empirical proof of convergence under real multi-region conditions
+        with high contention and concurrent compaction, validated at 283.6s
+        average across 3 runs spanning IAD, LHR, and SYD.</li>
+  </ol>
+  <p>
+    The fundamental insight is that Tigris's eventual consistency is
+    &ldquo;good enough&rdquo; for the delta log. CRDTs tolerate replication
+    delay because merge is commutative, associative, and idempotent. The only
+    place strong consistency is needed is the manifest CAS, which happens
+    infrequently during compaction. With all P0 and P1 issues resolved, the
+    system is validated across three continents with compaction running
+    concurrently alongside the stress workload.
+  </p>
+</div>
+
+<nav class="chapter-nav">
+  <a class="prev" href="ch06-compaction.html">Chapter 6: Compaction</a>
+  <span>Chapter 7</span>
+  <a class="next" href="index.html">Back to Index</a>
+</nav>
+
+</body>
+</html>
