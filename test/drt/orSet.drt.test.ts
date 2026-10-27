@@ -69,9 +69,7 @@ describe('DRT: OR-Set via SQL script pipeline', () => {
     client?.close();
   });
 
-  drt
-    .prop([arbOrSetSqlCase], { numRuns: drtRuns })
-    ('set-focused SQL scripts match Lean and TypeScript', async (input) => {
+  async function assertScriptParity(input: { steps: Array<{ kind: 'add' | 'remove'; value: string }>; site: string }) {
       const sqlStatements = input.steps.map((step) => {
         const literal = renderStringLiteral(step.value);
         return step.kind === 'add'
@@ -110,5 +108,17 @@ describe('DRT: OR-Set via SQL script pipeline', () => {
       const normalizedLean = normalizeJsonObject(normalizeScriptExecution(leanExecution));
       const normalizedTs = normalizeJsonObject(normalizeScriptExecution(tsExecution));
       expect(normalizedLean).toEqual(normalizedTs);
-    }, drtTimeoutMs);
+  }
+
+  drt.prop([arbOrSetSqlCase], { numRuns: drtRuns })(
+    'set-focused SQL scripts match Lean and TypeScript', assertScriptParity, drtTimeoutMs,
+  );
+
+  drt('removes every observed event across a hexadecimal digit boundary', async () => {
+    await assertScriptParity({
+      steps: [...Array.from({ length: 5 }, () => ({ kind: 'add' as const, value: '' })),
+        { kind: 'remove', value: '' }],
+      site: '00000000',
+    });
+  }, drtTimeoutMs);
 });

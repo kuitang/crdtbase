@@ -163,6 +163,23 @@ export function normalizeState(state: SqlEvalState): SqlEvalState {
 }
 
 export function normalizeResult(result: SqlEvalOutcome['result']): SqlEvalOutcome['result'] {
+  if (result.kind === 'write') {
+    return {
+      ...result,
+      ops: result.ops.map((op) => op.kind === 'cell_or_set_remove' ? {
+        ...op,
+        // Removal tags denote a set of observed events. Lean and TypeScript
+        // enumerate that set differently at hexadecimal digit boundaries.
+        // Preserve every tag and the operation sequence, normalizing only
+        // this semantically unordered list (as for set-valued state below).
+        tags: [...op.tags].sort((left, right) => {
+          const a = JSON.stringify([left.hlc, left.site]);
+          const b = JSON.stringify([right.hlc, right.site]);
+          return a < b ? -1 : a > b ? 1 : 0;
+        }),
+      } : op),
+    };
+  }
   if (result.kind !== 'read') {
     return result;
   }
