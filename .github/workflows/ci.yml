@@ -28,11 +28,23 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24.22.1'
           cache: npm
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Setup Go for the source-only MinIO test fixture
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.10'
+          cache: false
+
+      - name: Build pinned MinIO test fixture
+        run: |
+          mkdir -p "$RUNNER_TEMP/crdtbase-minio-bin"
+          GOBIN="$RUNNER_TEMP/crdtbase-minio-bin" go install github.com/minio/minio@v0.0.0-20260212201848-7aac2a2c5b7c
+          echo "MINIO_BINARY=$RUNNER_TEMP/crdtbase-minio-bin/minio" >> "$GITHUB_ENV"
 
       - name: Build Lean proofs and DRT oracle
         uses: leanprover/lean-action@v1

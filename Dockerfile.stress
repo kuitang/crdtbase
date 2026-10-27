@@ -1,4 +1,4 @@
-FROM node:20.19.2-slim AS build
+FROM node:24.22.1-trixie-slim AS build
 
 WORKDIR /app
 
@@ -14,11 +14,13 @@ RUN npx esbuild test/stress/flyWorker.ts \
   --bundle \
   --platform=node \
   --format=esm \
-  --target=node20 \
+  --target=node24 \
   --banner:js="import { createRequire } from \"module\"; const require = createRequire(import.meta.url);" \
   --outfile=/out/flyWorker.mjs
 
-FROM node:20.19.2-slim AS runtime
+FROM gcr.io/distroless/cc-debian13:nonroot AS runtime
+
+COPY --from=build /usr/local/bin/node /usr/local/bin/node
 
 WORKDIR /app
 

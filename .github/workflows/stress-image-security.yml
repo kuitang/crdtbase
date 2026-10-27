@@ -1,0 +1,45 @@
+name: Stress image security
+
+on:
+  pull_request:
+    paths:
+      - Dockerfile.stress
+      - package.json
+      - package-lock.json
+      - src/**
+      - test/stress/**
+      - test/shared/**
+      - .github/workflows/stress-image-security.yml
+  push:
+    branches: [main]
+  schedule:
+    - cron: '21 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rebuild stress image with current base layers
+        run: docker build --pull -f Dockerfile.stress -t crdtbase-stress:scan .
+      - name: Verify runtime and bundle without contacting services
+        run: |
+          docker run --rm --network none --entrypoint node crdtbase-stress:scan --version
+          docker run --rm --network none --entrypoint node crdtbase-stress:scan --check /app/flyWorker.mjs
+          docker image inspect crdtbase-stress:scan > image-provenance.json
+          docker save crdtbase-stress:scan -o image.tar
+      - name: Inventory the exact image and scan vulnerabilities
+        run: |
+          docker run --rm -v "$PWD:/work" aquasec/trivy:0.76.1 image --input /work/image.tar --format cyclonedx --output /work/sbom.cdx.json
+          docker run --rm -v "$PWD:/work" aquasec/trivy:0.76.1 image --input /work/image.tar --scanners vuln --format json --output /work/vulnerabilities.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stress-image-security
+          path: |
+            image-provenance.json
+            sbom.cdx.json
+            vulnerabilities.json
