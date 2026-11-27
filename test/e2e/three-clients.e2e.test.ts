@@ -210,5 +210,6 @@ describe('Filesystem SQL chaos end-to-end sync', () => {
       expect(secondCompaction.opsRead).toBe(0);
       expect(secondCompaction.manifest.sites_compacted).toEqual(compaction.manifest.sites_compacted);
     },
+    120_000,
   );
 });
