@@ -37,6 +37,13 @@ async function downloadMinioBinary(path: string): Promise<void> {
 }
 
 async function ensureMinioBinary(cacheDir: string): Promise<string> {
+  // MinIO no longer distributes binaries at dl.min.io. CI builds the pinned
+  // upstream source and supplies its executable explicitly.
+  const configuredBinary = process.env.MINIO_BINARY;
+  if (configuredBinary) {
+    await access(configuredBinary);
+    return configuredBinary;
+  }
   await mkdir(cacheDir, { recursive: true });
   const binaryPath = join(cacheDir, 'minio');
   try {
